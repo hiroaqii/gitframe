@@ -5575,28 +5575,6 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         .result = .{ .failed_static = "pre-mutation result" },
     } };
 
-    const assistance: app_actions.PendingAction = .{
-        .generation = 6,
-        .kind = .assist_commit_message,
-    };
-    try std.testing.expect(!testActionFence(&page).closeForAcceptedMutation(allocator, assistance));
-    try std.testing.expect(page.repository_read_authority.epoch.eql(old_epoch));
-    try std.testing.expect(page.changes_projection.pending != null);
-    try std.testing.expect(page.changes_projection.syntax_pending != null);
-    try std.testing.expect(page.deferred_projection_apply != null);
-    try std.testing.expect(page.auto_reload.acceptsCycle(cycle_id));
-    try expectMutationFenceRetainedReadOwners(
-        &page,
-        source_command.generation,
-        old_epoch,
-        cycle_id,
-        anchor_path_ptr,
-        status_pending,
-        branch_pending,
-        cache_len,
-        cache_retained_bytes,
-    );
-
     const mutation: app_actions.PendingAction = .{
         .generation = 7,
         .kind = .stage_hunk,
@@ -5804,7 +5782,7 @@ test "mutation read fence terminal reopens exact owner and queues active revalid
 
     try std.testing.expect(!testActionFence(&page).reopenForExactTerminal(.{
         .generation = 20,
-        .kind = .assist_commit_message,
+        .kind = .fetch,
     }));
     try std.testing.expect(page.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(page.activation.revalidation_requested == null);

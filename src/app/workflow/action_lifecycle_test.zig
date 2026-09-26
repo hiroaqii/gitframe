@@ -48,7 +48,6 @@ test "action terminal coordinator accepts every exact launched action once" {
         .unstage_hunk,
         .discard_file,
         .commit,
-        .assist_commit_message,
         .amend,
         .push,
         .pull,

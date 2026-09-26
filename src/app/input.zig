@@ -57,7 +57,6 @@ pub const KeyContext = struct {
 const Action = enum {
     cancel_commit_panel,
     submit_commit_panel,
-    assist_commit_message,
     copy_commit_message,
     commit_panel_tab,
     commit_panel_enter,
@@ -440,7 +439,6 @@ fn remoteErrorKeyToMsg(key: chasen.Key, interactive: bool) ?app_message.Msg {
 
 fn commitPanelKeyToMsg(key: chasen.Key) ?app_message.Msg {
     if (key.matches(chasen.Key.escape, .{})) return actionToMsg(.cancel_commit_panel);
-    if (key.matches('g', .{ .ctrl = true })) return actionToMsg(.assist_commit_message);
     if (key.matches('y', .{ .ctrl = true })) return actionToMsg(.copy_commit_message);
     if (key.matches(chasen.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) return actionToMsg(.submit_commit_panel);
     if (key.matches(chasen.Key.tab, .{})) return actionToMsg(.commit_panel_tab);
@@ -502,7 +500,6 @@ fn actionToMsg(action: Action) app_message.Msg {
     return switch (action) {
         .cancel_commit_panel => app_message.Msg.cancel_commit_panel,
         .submit_commit_panel => app_message.Msg.submit_commit_panel,
-        .assist_commit_message => app_message.Msg.assist_commit_message,
         .copy_commit_message => app_message.Msg.copy_commit_message,
         .commit_panel_tab => app_message.Msg.commit_panel_tab,
         .commit_panel_enter => app_message.Msg.commit_panel_enter,
@@ -1177,7 +1174,7 @@ test "keyToMsg maps commit panel command and routes panel input" {
     try std.testing.expectEqual(app_message.Msg.cancel_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.escape }).?);
     try std.testing.expectEqual(app_message.Msg.submit_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter, .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(app_message.Msg.submit_commit_panel, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 's', .mods = .{ .ctrl = true } }).?);
-    try std.testing.expectEqual(app_message.Msg.assist_commit_message, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'g', .mods = .{ .ctrl = true } }).?);
+    try std.testing.expectEqual(@as(?app_message.Msg, null), keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'g', .mods = .{ .ctrl = true } }));
     try std.testing.expectEqual(app_message.Msg.copy_commit_message, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = 'y', .mods = .{ .ctrl = true } }).?);
     try std.testing.expectEqual(app_message.Msg.commit_panel_tab, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.tab }).?);
     try std.testing.expectEqual(app_message.Msg.commit_panel_enter, keyToMsg(.{ .commit_panel_mode = true }, .{ .codepoint = chasen.Key.enter }).?);

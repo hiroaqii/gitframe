@@ -189,16 +189,6 @@ pub const Controller = struct {
         _ = self.fence.clearMatchingActionCursor(allocator, generation_value);
     }
 
-    /// Closing the commit panel cancels only a matching message-assist owner.
-    /// Its eventual task terminal becomes stale and cannot affect a later panel.
-    pub fn cancelAcceptedCommitAssist(self: Controller) bool {
-        const pending_owner = self.runtime.pending orelse return false;
-        if (pending_owner.token.kind != .assist_commit_message) return false;
-        if (pending_owner.phase != .accepted) @panic("commit assist cancellation requires an accepted owner");
-        self.runtime.pending = null;
-        return true;
-    }
-
     /// Returns true when an idle tick should suppress redraw.
     pub fn tick(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) bool {
         if (self.runtime.pending) |owner| {
@@ -291,7 +281,7 @@ const UnitHarness = if (builtin.is_test) struct {
 
 test "ActionState tracks current pending action" {
     var harness: UnitHarness = .{};
-    const prepared = harness.controller().prepare(.assist_commit_message);
+    const prepared = harness.controller().prepare(.fetch);
     try std.testing.expect(harness.runtime.view().isCurrent(prepared.pending));
     try std.testing.expect(!harness.runtime.view().isAccepted(prepared.pending));
 

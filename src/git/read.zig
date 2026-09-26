@@ -13,7 +13,6 @@ pub const max_status_bytes = 8 * 1024 * 1024;
 pub const max_repository_manifest_bytes = 16 * 1024 * 1024;
 pub const tracked_numstat_stdout_limit = max_diff_bytes;
 pub const tracked_numstat_stderr_limit = 256 * 1024;
-pub const staged_diff_capture_limit = 4 * 1024 * 1024;
 
 pub const LoadResult = union(enum) {
     ok: []u8,
@@ -119,22 +118,6 @@ pub const TrackedNumstatResult = union(enum) {
         switch (self) {
             .ok => |bytes| allocator.free(bytes),
             .unavailable => {},
-        }
-    }
-};
-
-pub const StagedDiffRequest = struct {
-    context: git_command.DirectoryContext,
-};
-
-pub const StagedDiffResult = union(enum) {
-    ok: []u8,
-    failed_static: []const u8,
-
-    pub fn deinit(self: StagedDiffResult, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .ok => |bytes| allocator.free(bytes),
-            .failed_static => {},
         }
     }
 };
@@ -601,24 +584,6 @@ fn filterNumstat(allocator: std.mem.Allocator, bytes: []const u8, paths: []const
         offset = end + 1;
     }
     return selected.toOwnedSlice(allocator);
-}
-
-pub fn loadStagedDiff(allocator: std.mem.Allocator, io: std.Io, request: StagedDiffRequest) git_command.Error!StagedDiffResult {
-    const argv = [_][]const u8{ "git", "diff", "--cached", "--no-ext-diff", "--no-color" };
-    const result = try git_command.runCaptured(allocator, io, request.context, .{
-        .argv = &argv,
-        .stdout_limit = .limited(staged_diff_capture_limit),
-        .stderr_limit = .limited(64 * 1024),
-    });
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            allocator.free(result.stderr);
-            return .{ .ok = result.stdout };
-        },
-        else => {},
-    }
-    result.deinit(allocator);
-    return .{ .failed_static = "staged diff failed" };
 }
 
 fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, argv: []const []const u8) git_command.Error!LoadResult {

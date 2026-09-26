@@ -230,60 +230,6 @@ pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.P
     try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
 }
 
-pub const CommitMessageAssistRequest = struct {
-    repo_root: []u8,
-    action_id: []u8,
-    argv: [][]u8,
-    launch_revision: u64,
-    mode: actions.CommitMessageAssistMode,
-
-    pub fn deinit(self: *CommitMessageAssistRequest, allocator: std.mem.Allocator) void {
-        if (self.repo_root.len > 0) allocator.free(self.repo_root);
-        if (self.action_id.len > 0) allocator.free(self.action_id);
-        for (self.argv) |arg| allocator.free(arg);
-        if (self.argv.len > 0) allocator.free(self.argv);
-        self.mode.deinit(allocator);
-        self.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{}, .launch_revision = 0, .mode = .generate };
-    }
-};
-
-pub fn startCommitMessageAssist(
-    comptime Msg: type,
-    ctx: *chasen.Ctx(Msg),
-    pending: actions.PendingAction,
-    request: *CommitMessageAssistRequest,
-    root: *const root_capability.RootCapability,
-    parent_environment: ?*const std.process.Environ.Map,
-) !void {
-    defer request.deinit(ctx.allocator());
-    requireKind(pending, .assist_commit_message);
-
-    var owned_root = try root.duplicate();
-    var root_consumed = false;
-    defer if (!root_consumed) owned_root.deinit();
-    var environment = try git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), parent_environment);
-    var environment_consumed = false;
-    defer if (!environment_consumed) environment.deinit();
-    const Task = actions.CommitMessageAssistTask(Msg);
-    const task = try ctx.allocator().create(Task);
-    task.* = .{
-        .pending = pending,
-        .repo_root = request.repo_root,
-        .action_id = request.action_id,
-        .argv = request.argv,
-        .root = owned_root,
-        .environment = environment,
-        .launch_revision = request.launch_revision,
-        .mode = request.mode,
-    };
-    request.* = .{ .repo_root = &.{}, .action_id = &.{}, .argv = &.{}, .launch_revision = 0, .mode = .generate };
-    root_consumed = true;
-    environment_consumed = true;
-    errdefer actions.destroyCommitMessageAssistTask(Task, ctx.allocator(), task);
-
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
-}
-
 pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, confirmation: *app_state.AmendConfirmation, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     defer consumeAmendConfirmation(ctx.allocator(), confirmation);
     requireKind(pending, .amend);

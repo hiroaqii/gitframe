@@ -153,25 +153,8 @@ fn configForStartup(
                     "gitframe: cannot load config {s}: invalid TOML\n",
                     .{display_path},
                 ),
-                .invalid_action_config => try stderr.print(
-                    "gitframe: cannot load config {s}: invalid external action configuration\n",
-                    .{display_path},
-                ),
-                .missing_action_input => try stderr.print(
-                    "gitframe: cannot load config {s}: external action is missing required stdin\n",
-                    .{display_path},
-                ),
-                .duplicate_action_input => try stderr.print(
-                    "gitframe: cannot load config {s}: multiple external actions use the same stdin\n",
-                    .{display_path},
-                ),
                 .unsupported_schema_version => try stderr.print(
                     "gitframe: cannot load config {s}: unsupported schema version\n",
-                    .{display_path},
-                ),
-                .unsupported_action_schema => try stderr.print(
-                    "gitframe: cannot load config {s}: unsupported external action schema;\n" ++
-                        "only id, argv, and stdin = \"staged_diff\" or \"commit_message_context\" are supported\n",
                     .{display_path},
                 ),
             }
@@ -321,11 +304,7 @@ test "config startup rejects every failure reason before runtime setup" {
         .{ .failure = .read_is_directory, .reason = "path is a directory" },
         .{ .failure = .read_too_large, .reason = "file is too large" },
         .{ .failure = .invalid_toml, .reason = "invalid TOML" },
-        .{ .failure = .invalid_action_config, .reason = "invalid external action configuration" },
-        .{ .failure = .missing_action_input, .reason = "external action is missing required stdin" },
-        .{ .failure = .duplicate_action_input, .reason = "multiple external actions use the same stdin" },
         .{ .failure = .unsupported_schema_version, .reason = "unsupported schema version" },
-        .{ .failure = .unsupported_action_schema, .reason = "unsupported external action schema" },
     };
 
     for (cases) |case| {
@@ -343,74 +322,13 @@ test "config startup rejects every failure reason before runtime setup" {
     }
 }
 
-test "config startup rejects each unsupported external action fixture" {
-    const allocator = std.testing.allocator;
-    const path = "zig-cache/tmp/gitframe-startup-unsupported-action.toml";
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-cache/tmp");
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
-
-    const fixtures = [_][]const u8{
-        \\[[actions]]
-        \\id = "tool"
-        \\argv = ["tool"]
-        \\stdin = "selection_context"
-        \\
-        ,
-        \\[[actions]]
-        \\id = "tool"
-        \\argv = ["tool"]
-        \\stdin = "staged_diff"
-        \\label = "removed"
-        \\
-        ,
-        \\[[actions]]
-        \\id = "tool"
-        \\argv = ["tool"]
-        \\stdin = "staged_diff"
-        \\scope = "commit"
-        \\
-        ,
-        \\[[actions]]
-        \\id = "tool"
-        \\argv = ["tool"]
-        \\stdin = "staged_diff"
-        \\output = "commit_message"
-        \\
-        ,
-    };
-    const expected =
-        "gitframe: cannot load config " ++ path ++ ": unsupported external action schema;\n" ++
-        "only id, argv, and stdin = \"staged_diff\" or \"commit_message_context\" are supported\n";
-
-    for (fixtures) |contents| {
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = contents });
-        var result = gitframe.config.loadConfig(allocator, std.testing.io, path);
-        defer result.deinit();
-        switch (result) {
-            .failure => |failure| try std.testing.expectEqual(
-                gitframe.config.ConfigLoadFailure.unsupported_action_schema,
-                failure,
-            ),
-            .success => return error.ExpectedConfigFailure,
-        }
-
-        var stderr: std.Io.Writer.Allocating = .init(allocator);
-        defer stderr.deinit();
-        try std.testing.expectError(
-            error.InvalidConfig,
-            configForStartup(&result, path, &stderr.writer),
-        );
-        try std.testing.expectEqualStrings(expected, stderr.written());
-    }
-}
-
 test "config startup diagnostic survives a later error terminal in a regular file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "stderr.log", .{ .read = true });
     defer file.close(std.testing.io);
 
-    var result: gitframe.config.LoadConfigResult = .{ .failure = .unsupported_action_schema };
+    var result: gitframe.config.LoadConfigResult = .{ .failure = .invalid_toml };
     defer result.deinit();
     var diagnostic_buffer: [512]u8 = undefined;
     try std.testing.expectError(
@@ -434,8 +352,7 @@ test "config startup diagnostic survives a later error terminal in a regular fil
     var contents: [512]u8 = undefined;
     const len = try file.readPositionalAll(std.testing.io, &contents, 0);
     try std.testing.expectEqualStrings(
-        "gitframe: cannot load config /tmp/config.toml: unsupported external action schema;\n" ++
-            "only id, argv, and stdin = \"staged_diff\" or \"commit_message_context\" are supported\n" ++
+        "gitframe: cannot load config /tmp/config.toml: invalid TOML\n" ++
             "error: InvalidConfig\n",
         contents[0..len],
     );

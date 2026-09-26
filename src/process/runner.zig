@@ -265,7 +265,7 @@ pub fn runCapturedBounded(
 
 /// Run a child process with structured argv and captured stdout/stderr.
 ///
-/// This is shared by Git commands and ExternalAction so process ownership,
+/// Git commands use this runner so process ownership,
 /// stdin handling, output caps, and child cleanup stay in one place.
 pub fn runWithStdin(allocator: std.mem.Allocator, io: std.Io, options: Options) Error!Result {
     const detailed = try runWithStdinDetailed(allocator, io, options);

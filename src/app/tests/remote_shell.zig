@@ -876,7 +876,9 @@ test "copyCommitMessage queues formatted commit message text" {
     defer ctx.runtimeClearPendingEffectCopies();
 
     app.local_workflow.commit_panel.open(.commit);
-    app.local_workflow.commit_panel.replaceDraft("  subject  ", "  body\n\nline two  ");
+    app.local_workflow.commit_panel.paste("  subject  ");
+    app.local_workflow.commit_panel.toggleField();
+    app.local_workflow.commit_panel.paste("  body\n\nline two  ");
 
     try app.update(.copy_commit_message, &ctx);
 
@@ -898,7 +900,7 @@ test "copyCommitMessage uses same commit panel state for amend mode" {
     defer ctx.runtimeClearPendingEffectCopies();
 
     app.local_workflow.commit_panel.open(.amend);
-    app.local_workflow.commit_panel.replaceDraft("amend subject", null);
+    app.local_workflow.commit_panel.paste("amend subject");
 
     try app.update(.copy_commit_message, &ctx);
 
@@ -916,7 +918,8 @@ test "copyCommitMessage preserves body-only formatMessage shape" {
     defer ctx.runtimeClearPendingEffectCopies();
 
     app.local_workflow.commit_panel.open(.commit);
-    app.local_workflow.commit_panel.replaceDraft("", "body");
+    app.local_workflow.commit_panel.toggleField();
+    app.local_workflow.commit_panel.paste("body");
 
     try app.update(.copy_commit_message, &ctx);
 

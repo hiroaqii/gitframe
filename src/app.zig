@@ -381,7 +381,6 @@ pub const App = struct {
             .repo = self.repoSessionView(),
             .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
-            .user_config = &self.user_config,
             .status = &self.pages.changes.status,
             .overlay = &self.overlay,
         };
@@ -663,7 +662,6 @@ pub const App = struct {
                 }
                 try self.localWorkflow().submitCommitPanel(ctx);
             },
-            .assist_commit_message => try self.localWorkflow().assistCommitMessage(ctx),
             .copy_commit_message => self.copyCommitMessage(ctx),
             .commit_panel_tab => self.localWorkflow().toggleCommitPanelField(),
             .commit_panel_enter => self.localWorkflow().commitPanelEnter(),
@@ -1181,7 +1179,6 @@ pub const App = struct {
             .unstage_hunk => |result| try self.applyLocalActionIntent(ctx, self.localWorkflow().finishUnstageHunk(ctx.allocator(), result)),
             .discard_file => |result| try self.applyLocalActionIntent(ctx, self.localWorkflow().finishDiscardFile(ctx.allocator(), result)),
             .commit => |result| try self.applyLocalActionIntent(ctx, self.localWorkflow().finishCommit(ctx.allocator(), result)),
-            .assist_commit_message => |result| self.localWorkflow().finishCommitMessageAssist(ctx.allocator(), result),
             .amend => |result| try self.applyLocalActionIntent(ctx, self.localWorkflow().finishAmend(ctx.allocator(), result)),
             .push => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPush(ctx.allocator(), result)),
             .pull => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPull(ctx.allocator(), result)),

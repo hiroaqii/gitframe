@@ -109,14 +109,3 @@ test "repository read authority closes and reopens only for the exact mutation" 
     try std.testing.expect(!authority.acceptsRead(original_epoch));
     try std.testing.expect(!authority.reopenForMutation(owner));
 }
-
-test "non-mutating assistance cannot close repository read authority" {
-    var authority: ChangesRepositoryReadAuthority = .{};
-    const epoch = authority.epoch;
-    try std.testing.expect(!authority.closeForMutation(.{
-        .generation = 3,
-        .kind = .assist_commit_message,
-    }));
-    try std.testing.expect(authority.mayStartRepositoryRead());
-    try std.testing.expect(authority.epoch.eql(epoch));
-}

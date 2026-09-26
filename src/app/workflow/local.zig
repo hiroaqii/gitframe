@@ -18,7 +18,6 @@ const changes_action_fence = @import("../pages/changes/action_fence.zig");
 const changes_operations = @import("../pages/changes/operations.zig");
 const repo_session = @import("../repo_session.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
-const config_mod = @import("../../config.zig");
 const git_ops = @import("../git_ops.zig");
 
 pub const LocalState = struct {
@@ -79,7 +78,6 @@ pub const Controller = struct {
     repo: repo_session.View,
     current_changes_root: ?[]const u8,
     env_map: ?*const std.process.Environ.Map,
-    user_config: *const config_mod.Config,
     status: *app_state.StatusMessage,
     overlay: *app_state.OverlayState,
 
@@ -623,7 +621,6 @@ pub const Controller = struct {
     }
 
     pub fn closeCommitPanel(self: Controller) void {
-        _ = self.lifecycle.cancelAcceptedCommitAssist();
         self.state.commit_panel.close();
     }
 
@@ -704,162 +701,6 @@ pub const Controller = struct {
         }
 
         try self.startCommitTask(ctx, repo_root);
-    }
-
-    pub fn assistCommitMessage(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        const panel = &self.state.commit_panel;
-        if (self.lifecycle.view().hasPending()) {
-            panel.commit_error = .action_pending;
-            self.setStatus("finish current git action before assisting commit message", .{});
-            return;
-        }
-        if (!panel.is_open or panel.mode != .commit) {
-            self.setStatus("commit message assist is only available in commit mode", .{});
-            return;
-        }
-        switch (self.stagedSummary()) {
-            .ready => |ready| if (ready.count == 0) {
-                panel.commit_error = .no_staged_changes;
-                return;
-            },
-            .loading_or_stale => {
-                panel.commit_error = .status_loading;
-                return;
-            },
-            .unavailable => {
-                panel.commit_error = .status_unavailable;
-                return;
-            },
-        }
-
-        const repo_root = self.repo.activeRoot() orelse {
-            panel.commit_error = .status_unavailable;
-            return;
-        };
-        const capability = self.repo.activeCapability() orelse {
-            panel.commit_error = .status_unavailable;
-            return;
-        };
-        const identity = self.repo.activeIdentity() orelse {
-            panel.commit_error = .status_unavailable;
-            return;
-        };
-        if (!capability.identity.eql(identity)) {
-            panel.commit_error = .status_unavailable;
-            return;
-        }
-
-        const draft_empty = panel.draftIsEmpty();
-        const action = if (draft_empty)
-            self.resolveGenerateCommitMessageAction() catch |err| {
-                self.setStatus("{s}", .{commitMessageActionResolveMessage(.generate, err)});
-                return;
-            }
-        else
-            self.resolveImproveCommitMessageAction() catch |err| {
-                self.setStatus("{s}", .{commitMessageActionResolveMessage(.improve, err)});
-                return;
-            };
-
-        const mode = if (draft_empty)
-            app_actions.CommitMessageAssistMode.generate
-        else
-            app_actions.CommitMessageAssistMode{ .improve = self.buildDraftSnapshot(ctx.allocator()) catch |err| {
-                panel.commit_error = .input_allocation_failed;
-                self.setStatus("could not snapshot commit message draft: {s}", .{@errorName(err)});
-                return err;
-            } };
-
-        var request = self.buildCommitMessageAssistRequest(ctx.allocator(), repo_root, action, mode) catch |err| {
-            panel.commit_error = .input_allocation_failed;
-            self.setStatus("could not prepare commit message action: {s}", .{@errorName(err)});
-            return err;
-        };
-
-        const prepared = self.lifecycle.prepare(.assist_commit_message);
-        app_git_requests.startCommitMessageAssist(
-            app_message.Msg,
-            ctx,
-            prepared.pending,
-            &request,
-            capability,
-            self.env_map,
-        ) catch |err| {
-            self.lifecycle.rejectSpawn(prepared);
-            panel.commit_error = .assist_failed;
-            self.setStatus("could not start commit message action", .{});
-            return err;
-        };
-        _ = self.lifecycle.acceptSpawn(ctx.allocator(), prepared);
-
-        if (draft_empty) {
-            self.setStatus("generating commit message...", .{});
-        } else {
-            self.setStatus("improving commit message...", .{});
-        }
-    }
-
-    fn resolveGenerateCommitMessageAction(self: Controller) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
-        var found: ?config_mod.ExternalActionConfig = null;
-        for (self.user_config.actions.slice()) |action| {
-            if (action.stdin == .staged_diff) {
-                if (found != null) return error.Multiple;
-                found = action;
-            }
-        }
-        return found orelse error.Missing;
-    }
-
-    fn resolveImproveCommitMessageAction(self: Controller) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
-        var found: ?config_mod.ExternalActionConfig = null;
-        for (self.user_config.actions.slice()) |action| {
-            if (action.stdin == .commit_message_context) {
-                if (found != null) return error.Multiple;
-                found = action;
-            }
-        }
-        return found orelse error.Missing;
-    }
-
-    fn buildDraftSnapshot(self: Controller, allocator: std.mem.Allocator) !app_actions.DraftSnapshot {
-        var parts = try self.state.commit_panel.formatMessageParts(allocator);
-        errdefer parts.deinit(allocator);
-        const body = if (parts.body) |body_text| body_text else try allocator.dupe(u8, "");
-        parts.body = null;
-        return .{ .subject = parts.subject, .body = body };
-    }
-
-    fn buildCommitMessageAssistRequest(
-        self: Controller,
-        allocator: std.mem.Allocator,
-        repo_root: []const u8,
-        action: config_mod.ExternalActionConfig,
-        mode: app_actions.CommitMessageAssistMode,
-    ) !app_git_requests.CommitMessageAssistRequest {
-        var owned_mode = mode;
-        errdefer owned_mode.deinit(allocator);
-        const owned_root = try allocator.dupe(u8, repo_root);
-        errdefer allocator.free(owned_root);
-        const owned_id = try allocator.dupe(u8, action.id);
-        errdefer allocator.free(owned_id);
-
-        const argv_src = action.argvSlice();
-        var argv = try allocator.alloc([]u8, argv_src.len);
-        errdefer allocator.free(argv);
-        var owned_count: usize = 0;
-        errdefer for (argv[0..owned_count]) |arg| allocator.free(arg);
-        for (argv_src, 0..) |arg, index| {
-            argv[index] = try expandCommitActionArgv(allocator, arg, repo_root);
-            owned_count += 1;
-        }
-
-        return .{
-            .repo_root = owned_root,
-            .action_id = owned_id,
-            .argv = argv,
-            .launch_revision = self.state.commit_panel.draft_revision,
-            .mode = owned_mode,
-        };
     }
 
     fn startCommitTask(self: Controller, ctx: *chasen.Ctx(app_message.Msg), repo_root: []const u8) !void {
@@ -1120,55 +961,6 @@ pub const Controller = struct {
         }
     }
 
-    pub fn finishCommitMessageAssist(
-        self: Controller,
-        allocator: std.mem.Allocator,
-        finished: app_actions.CommitMessageAssistFinished,
-    ) void {
-        var result = finished;
-        defer result.deinit(allocator);
-
-        if (self.acceptTerminal(allocator, result.pending, result.repo_root) == null) return;
-        const panel = &self.state.commit_panel;
-        if (!panel.is_open or panel.mode != .commit) return;
-        if (!self.repo.activeRootMatches(result.repo_root)) return;
-
-        switch (result.result) {
-            .ok => |message| {
-                if (panel.draft_revision != result.launch_revision) {
-                    switch (result.mode) {
-                        .generate => self.setStatus("generated commit message ignored; draft changed", .{}),
-                        .improve => self.setStatus("improved commit message ignored; draft changed", .{}),
-                    }
-                    return;
-                }
-                panel.replaceDraft(message.subject, message.body);
-                if (panel.commit_error) |_| {
-                    self.setStatus("commit message could not be inserted", .{});
-                    return;
-                }
-                switch (result.mode) {
-                    .generate => if (message.truncated)
-                        self.setStatus("generated commit message from truncated staged diff", .{})
-                    else
-                        self.setStatus("generated commit message", .{}),
-                    .improve => if (message.truncated)
-                        self.setStatus("improved commit message from truncated staged diff", .{})
-                    else
-                        self.setStatus("improved commit message", .{}),
-                }
-            },
-            .failed => |message| {
-                panel.commit_error = .assist_failed;
-                self.setStatus("{s}", .{message});
-            },
-            .failed_static => |message| {
-                panel.commit_error = .assist_failed;
-                self.setStatus("{s}", .{message});
-            },
-        }
-    }
-
     pub fn finishAmend(
         self: Controller,
         allocator: std.mem.Allocator,
@@ -1261,52 +1053,6 @@ pub const Controller = struct {
     }
 };
 
-const CommitMessageActionResolveError = error{
-    Missing,
-    Multiple,
-};
-
-const CommitMessageAssistResolveMode = enum { generate, improve };
-
-fn commitMessageActionResolveMessage(
-    mode: CommitMessageAssistResolveMode,
-    err: CommitMessageActionResolveError,
-) []const u8 {
-    return switch (err) {
-        error.Missing => switch (mode) {
-            .generate => "commit message action is not configured",
-            .improve => "commit message improve action is not configured",
-        },
-        error.Multiple => switch (mode) {
-            .generate => "multiple commit message actions configured",
-            .improve => "multiple commit message improve actions configured",
-        },
-    };
-}
-
-fn expandCommitActionArgv(
-    allocator: std.mem.Allocator,
-    template: []const u8,
-    repo_root: []const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-
-    var cursor: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, template, cursor, '{')) |open| {
-        try out.writer.writeAll(template[cursor..open]);
-        const close = std.mem.indexOfScalarPos(u8, template, open + 1, '}') orelse
-            return error.UnknownPlaceholder;
-        const placeholder = template[open .. close + 1];
-        if (!std.mem.eql(u8, placeholder, "{repo_root}")) return error.UnknownPlaceholder;
-        try out.writer.writeAll(repo_root);
-        cursor = close + 1;
-    }
-    if (std.mem.indexOfScalarPos(u8, template, cursor, '}') != null) return error.UnknownPlaceholder;
-    try out.writer.writeAll(template[cursor..]);
-    return try out.toOwnedSlice();
-}
-
 fn actionCursorKind(kind: git_ops.TargetKind) @import("../pages/changes/action_cursor.zig").TargetKind {
     return switch (kind) {
         .repository => .repository_root,
@@ -1328,24 +1074,5 @@ pub const testing = if (builtin.is_test) struct {
         repo_root: []const u8,
     ) !void {
         try controller.openAmendConfirmation(allocator, repo_root);
-    }
-
-    pub fn buildDraftSnapshot(
-        controller: Controller,
-        allocator: std.mem.Allocator,
-    ) !app_actions.DraftSnapshot {
-        return controller.buildDraftSnapshot(allocator);
-    }
-
-    pub fn resolveGenerateCommitMessageAction(
-        controller: Controller,
-    ) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
-        return controller.resolveGenerateCommitMessageAction();
-    }
-
-    pub fn resolveImproveCommitMessageAction(
-        controller: Controller,
-    ) CommitMessageActionResolveError!config_mod.ExternalActionConfig {
-        return controller.resolveImproveCommitMessageAction();
     }
 } else struct {};

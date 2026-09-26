@@ -99,7 +99,6 @@ test {
     _ = @import("diff/selection.zig");
     _ = @import("diff/syntax_view.zig");
     _ = @import("editor.zig");
-    _ = @import("external/action.zig");
     _ = @import("fs/capability.zig");
     _ = @import("fs/durable.zig");
     _ = @import("git/remote.zig");

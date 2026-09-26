@@ -104,7 +104,7 @@ pub const Selection = union(enum) {
     status_only: StatusOnlySelection,
 };
 
-/// External-action context for the current app selection.
+/// Exportable context for the current app selection.
 ///
 /// The slices are borrowed from the active app state / loaded diff. Clone this
 /// context before sending it to async work.

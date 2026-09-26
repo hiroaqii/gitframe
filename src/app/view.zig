@@ -917,7 +917,6 @@ fn pendingActionFallbackLabel(kind: app_actions.ActionKind) []const u8 {
         .unstage_hunk => "hunk unstage",
         .discard_file => "discard",
         .commit => "commit",
-        .assist_commit_message => "assist",
         .amend => "amend",
         .push => "push",
         .pull => "pull",
@@ -1220,7 +1219,7 @@ fn drawCommitCounter(surface: *chasen.Surface, row: u16, len: usize, max: ?usize
 }
 
 fn commitHelpRows(width: u16) u16 {
-    const single_line = "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+y: copy  Ctrl+s/Ctrl+Enter: validate  Esc: close";
+    const single_line = "Tab: field  Enter: newline  Ctrl+y: copy  Ctrl+s/Ctrl+Enter: validate  Esc: close";
     return if (chasen.text.displayWidth(single_line) <= width) 1 else 2;
 }
 
@@ -1231,12 +1230,12 @@ fn viewCommitHelp(app: Context, surface: *chasen.Surface, start_row: u16, rows: 
     const style: chasen.TextStyle = app.theme.style(.muted);
     const submit_label = app.commit_panel.submitLabel();
     if (rows <= 1) {
-        const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+y: copy  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
+        const text = try std.fmt.allocPrint(surface.frameAllocator(), "Tab: field  Enter: newline  Ctrl+y: copy  Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
         try draw.copyClippedTextAt(surface, 0, start_row, text, style);
         return;
     }
 
-    try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+g: generate  Ctrl+y: copy", style);
+    try draw.copyClippedTextAt(surface, 0, start_row, "Tab: field  Enter: newline  Ctrl+y: copy", style);
     if (start_row + 1 < size.height) {
         const line2 = try std.fmt.allocPrint(surface.frameAllocator(), "Ctrl+s/Ctrl+Enter: {s}  Esc: close", .{submit_label});
         try draw.copyClippedTextAt(surface, 0, start_row + 1, line2, style);
@@ -4111,7 +4110,6 @@ test "commit input renders maximum drafts and logical lines beyond u16" {
         harness.commit_panel.paste(bytes);
         try std.testing.expectEqualStrings(bytes, harness.commit_panel.body.slice());
         try std.testing.expect(harness.commit_panel.commit_error == null);
-        const revision = harness.commit_panel.draft_revision;
 
         var panel: chasen.testing.TestSurface = undefined;
         try panel.init(80, 24);
@@ -4136,7 +4134,6 @@ test "commit input renders maximum drafts and logical lines beyond u16" {
             try std.testing.expect(body_surface.screen.cursor_vis);
             try std.testing.expect(body_surface.screen.cursor.col < width and body_surface.screen.cursor.row < 24);
         }
-        try std.testing.expectEqual(revision, harness.commit_panel.draft_revision);
     }
 }
 

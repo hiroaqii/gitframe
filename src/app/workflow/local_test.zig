@@ -29,7 +29,6 @@ const changes_reload = @import("../pages/changes/reload.zig");
 const action_lifecycle = @import("action_lifecycle.zig");
 const workflow_local = @import("local.zig");
 
-const config_mod = @import("../../config.zig");
 const content_fingerprint = @import("../../content_fingerprint.zig");
 const diff_hunk_projection = @import("../../diff/hunk_projection.zig");
 const diff_presentation_identity = @import("../../diff/presentation_identity.zig");
@@ -43,7 +42,6 @@ const StageFileFinished = app_actions.StageFileFinished;
 const StageHunkFinished = app_actions.StageHunkFinished;
 const UnstageFileFinished = app_actions.UnstageFileFinished;
 const UnstageHunkFinished = app_actions.UnstageHunkFinished;
-const CommitMessageAssistFinished = app_actions.CommitMessageAssistFinished;
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
 const StatusLoadTask = app_load.StatusLoadTask(app_message.Msg);
 const BranchStatusLoadTask = app_load.BranchStatusLoadTask(app_message.Msg);
@@ -117,7 +115,6 @@ const LocalHarness = struct {
     repo_session: repo_session.State = .{},
     pages: LocalPages = .{},
     config: LocalConfig = .{},
-    user_config: config_mod.Config = .{},
     allocator: ?std.mem.Allocator = std.testing.allocator,
     terminal_size: chasen.Size = .{ .width = 100, .height = 20 },
     redraw_plan: RedrawPlan = .{},
@@ -212,7 +209,6 @@ const LocalHarness = struct {
             .repo = self.repoSessionView(),
             .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
-            .user_config = &self.user_config,
             .status = &self.pages.changes.status,
             .overlay = &self.overlay,
         };
@@ -427,37 +423,6 @@ fn initStageHunkLaunchLocalHarness(
     try app.pages.changes.git_status.replace(repo_root, &status);
     acceptTestSource(&app);
     return app;
-}
-
-fn testLocalHarnessWithCommitPanel() LocalHarness {
-    return .{
-        .local_workflow = .{ .commit_panel = app_commit_panel.State.init(std.testing.allocator) },
-        .repo_session = .{ .repo_state = .{ .discovery = .{ .single_repo = .{
-            .label = "repo",
-            .display_path = "/repo",
-            .canonical_root = "/repo",
-        } } } },
-    };
-}
-
-fn commitMessageAssistFinished(
-    allocator: std.mem.Allocator,
-    pending: app_actions.PendingAction,
-    launch_revision: u64,
-    mode: app_actions.CommitMessageAssistMode,
-    result: app_actions.CommitMessageActionResult,
-) !CommitMessageAssistFinished {
-    const repo_root = try allocator.dupe(u8, "/repo");
-    errdefer allocator.free(repo_root);
-    const action_id = try allocator.dupe(u8, "commit-message");
-    return .{
-        .pending = pending,
-        .repo_root = repo_root,
-        .action_id = action_id,
-        .launch_revision = launch_revision,
-        .mode = mode,
-        .result = result,
-    };
 }
 
 fn currentTestSessionHunkMarkKey(
@@ -802,275 +767,6 @@ test "staged summary distinguishes pending missing and ready status snapshots" {
     try app.pages.changes.git_status.replace("/repo", &status_bundle);
 
     try std.testing.expectEqual(app_commit_panel.StagedSummary{ .ready = .{ .count = 1 } }, app.localWorkflow().stagedSummary());
-}
-
-test "finishCommitMessageAssist inserts generated editable draft and truncated warning" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
-        .body = try std.testing.allocator.dupe(u8, "Generated body"),
-        .truncated = true,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("Generated subject", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("Generated body", app.local_workflow.commit_panel.body.slice());
-    try std.testing.expectEqualStrings("generated commit message from truncated staged diff", app.pages.changes.status.text());
-}
-
-test "finishCommitMessageAssist ignores stale result after popup close" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    app.local_workflow.commit_panel.close();
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
-        .body = null,
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(!app.local_workflow.commit_panel.is_open);
-    try std.testing.expectEqualStrings("", app.local_workflow.commit_panel.subject.slice());
-}
-
-test "finishCommitMessageAssist ignores generated draft after user edit" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    app.local_workflow.commit_panel.insert('x');
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
-        .body = null,
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("x", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.changes.status.text());
-}
-
-test "finishCommitMessageAssist failure keeps draft unchanged" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{
-        .failed = try std.testing.allocator.dupe(u8, "commit-message: failed"),
-    });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqual(app_commit_panel.CommitError.assist_failed, app.local_workflow.commit_panel.commit_error.?);
-    try std.testing.expectEqualStrings("", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("commit-message: failed", app.pages.changes.status.text());
-}
-
-test "finishCommitMessageAssist rejects long subject without mutating draft" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    var long_subject: [app_commit_panel.max_subject_chars + 1]u8 = undefined;
-    @memset(&long_subject, 'a');
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, &long_subject),
-        .body = null,
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqual(app_commit_panel.CommitError.subject_too_long, app.local_workflow.commit_panel.commit_error.?);
-    try std.testing.expectEqualStrings("", app.local_workflow.commit_panel.subject.slice());
-}
-
-test "finishCommitMessageAssist replaces unchanged improved draft" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    app.local_workflow.commit_panel.paste("Draft subject");
-    const snapshot = try workflow_local.testing.buildDraftSnapshot(app.localWorkflow(), std.testing.allocator);
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
-        .body = try std.testing.allocator.dupe(u8, "Improved body"),
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("Improved subject", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("Improved body", app.local_workflow.commit_panel.body.slice());
-    try std.testing.expectEqualStrings("improved commit message", app.pages.changes.status.text());
-}
-
-test "finishCommitMessageAssist ignores improved draft after user edit" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    app.local_workflow.commit_panel.paste("Draft subject");
-    const snapshot = try workflow_local.testing.buildDraftSnapshot(app.localWorkflow(), std.testing.allocator);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    app.local_workflow.commit_panel.paste(" edited");
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
-        .body = null,
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("Draft subject edited", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.changes.status.text());
-}
-
-test "finishCommitMessageAssist ignores generated draft after edit then clear" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    app.local_workflow.commit_panel.insert('x');
-    app.local_workflow.commit_panel.backspace();
-    try std.testing.expect(app.local_workflow.commit_panel.draftIsEmpty());
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .generate, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Generated subject"),
-        .body = null,
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("generated commit message ignored; draft changed", app.pages.changes.status.text());
-}
-
-test "finishCommitMessageAssist ignores improved draft after edit then restore" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    app.local_workflow.commit_panel.paste("Draft subject");
-    const snapshot = try workflow_local.testing.buildDraftSnapshot(app.localWorkflow(), std.testing.allocator);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    app.local_workflow.commit_panel.insert('x');
-    app.local_workflow.commit_panel.backspace();
-    try std.testing.expectEqualStrings("Draft subject", app.local_workflow.commit_panel.subject.slice());
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
-        .body = null,
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("Draft subject", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.changes.status.text());
-}
-
-test "finishCommitMessageAssist ignores improved draft after close and reopen" {
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    var app = testLocalHarnessWithCommitPanel();
-    defer app.local_workflow.commit_panel.deinit();
-
-    app.local_workflow.commit_panel.open(.commit);
-    app.local_workflow.commit_panel.paste("Draft subject");
-    const snapshot = try workflow_local.testing.buildDraftSnapshot(app.localWorkflow(), std.testing.allocator);
-    const launch_revision = app.local_workflow.commit_panel.draft_revision;
-    const pending = beginAcceptedTestAction(&app, .assist_commit_message);
-    app.local_workflow.commit_panel.close();
-    app.local_workflow.commit_panel.open(.commit);
-    app.local_workflow.commit_panel.paste("Draft subject");
-    const finished = try commitMessageAssistFinished(std.testing.allocator, pending, launch_revision, .{ .improve = snapshot }, .{ .ok = .{
-        .subject = try std.testing.allocator.dupe(u8, "Improved subject"),
-        .body = null,
-        .truncated = false,
-    } });
-
-    app.localWorkflow().finishCommitMessageAssist(ctx.allocator(), finished);
-
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqualStrings("Draft subject", app.local_workflow.commit_panel.subject.slice());
-    try std.testing.expectEqualStrings("improved commit message ignored; draft changed", app.pages.changes.status.text());
-}
-
-test "resolveCommitMessageAction resolves minimal configs and reports missing or multiple" {
-    var missing = testLocalHarnessWithCommitPanel();
-    defer missing.local_workflow.commit_panel.deinit();
-    try std.testing.expectError(error.Missing, workflow_local.testing.resolveGenerateCommitMessageAction(missing.localWorkflow()));
-    try std.testing.expectError(error.Missing, workflow_local.testing.resolveImproveCommitMessageAction(missing.localWorkflow()));
-
-    var multiple = testLocalHarnessWithCommitPanel();
-    defer multiple.local_workflow.commit_panel.deinit();
-    var action: config_mod.ExternalActionConfig = .{};
-    action.id = "commit-message-a";
-    action.argv[0] = "helper";
-    action.argv_len = 1;
-    action.stdin = .staged_diff;
-    var other = action;
-    other.id = "commit-message-b";
-    multiple.user_config.actions.items[0] = action;
-    multiple.user_config.actions.len = 1;
-    try std.testing.expectEqualStrings(
-        "commit-message-a",
-        (try workflow_local.testing.resolveGenerateCommitMessageAction(multiple.localWorkflow())).id,
-    );
-
-    multiple.user_config.actions.items[1] = other;
-    multiple.user_config.actions.len = 2;
-    try std.testing.expectError(error.Multiple, workflow_local.testing.resolveGenerateCommitMessageAction(multiple.localWorkflow()));
-
-    multiple.user_config.actions.items[0].stdin = .commit_message_context;
-    multiple.user_config.actions.items[1].stdin = .commit_message_context;
-    try std.testing.expectError(error.Multiple, workflow_local.testing.resolveImproveCommitMessageAction(multiple.localWorkflow()));
-    multiple.user_config.actions.len = 1;
-    try std.testing.expectEqualStrings(
-        "commit-message-a",
-        (try workflow_local.testing.resolveImproveCommitMessageAction(multiple.localWorkflow())).id,
-    );
 }
 
 test "selectedSidebarActionTarget resolves status-only path without loaded diff" {
@@ -1680,119 +1376,6 @@ test "fresh status-only targets fail closed without accepted source" {
     try std.testing.expectEqual(git_ops.StageTargetResult.stale_source, app.changesOperations().stageTarget());
     try std.testing.expectEqual(git_ops.UnstageTargetResult.stale_source, app.changesOperations().unstageTarget());
     try std.testing.expectEqual(git_ops.DiscardTargetResult.stale_source, app.changesOperations().discardTarget());
-}
-
-test "queued commit-message assist retains staged diff and external cwd across path replacement" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(io, "slot", .default_dir);
-    try tmp.dir.createDir(io, "replacement", .default_dir);
-    var accepted = try tmp.dir.openDir(io, "slot", .{});
-    defer accepted.close(io);
-    var replacement = try tmp.dir.openDir(io, "replacement", .{});
-    defer replacement.close(io);
-
-    try runLocalTestGit(io, accepted, &.{ "git", "init", "--initial-branch=main" });
-    try accepted.writeFile(io, .{ .sub_path = "base.txt", .data = "base\n" });
-    try runLocalTestGit(io, accepted, &.{ "git", "add", "base.txt" });
-    try runLocalTestGit(io, accepted, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
-    try accepted.writeFile(io, .{ .sub_path = "a-staged.txt", .data = "A_STAGED\n" });
-    try runLocalTestGit(io, accepted, &.{ "git", "add", "a-staged.txt" });
-
-    try runLocalTestGit(io, replacement, &.{ "git", "init", "--initial-branch=main" });
-    try replacement.writeFile(io, .{ .sub_path = "base.txt", .data = "base\n" });
-    try runLocalTestGit(io, replacement, &.{ "git", "add", "base.txt" });
-    try runLocalTestGit(io, replacement, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
-    try replacement.writeFile(io, .{ .sub_path = "b-staged.txt", .data = "B_STAGED\n" });
-    try runLocalTestGit(io, replacement, &.{ "git", "add", "b-staged.txt" });
-    const b_index_before = try localTestGitOutput(io, replacement, &.{ "git", "diff", "--cached", "--name-only" });
-    defer allocator.free(b_index_before);
-
-    const slot_path = try tmp.dir.realPathFileAlloc(io, "slot", allocator);
-    defer allocator.free(slot_path);
-    const slot_git_dir = try std.fs.path.join(allocator, &.{ slot_path, ".git" });
-    defer allocator.free(slot_git_dir);
-    var parent_environment = try std.testing.environ.createMap(allocator);
-    defer parent_environment.deinit();
-    try parent_environment.put("GIT_DIR", slot_git_dir);
-    try parent_environment.put("GIT_WORK_TREE", slot_path);
-
-    var app: LocalHarness = .{
-        .allocator = allocator,
-        .env_map = &parent_environment,
-        .repo_session = .{ .repo_state = .{
-            .discovery = try testSingleRepoDiscovery(allocator, slot_path),
-            .root = try repo_root_capability.RootCapability.openCanonical(slot_path),
-        } },
-        .local_workflow = workflow_local.LocalState.init(allocator),
-    };
-    defer app.repo_session.repo_state.deinit(allocator);
-    defer app.pages.changes.deinit(allocator);
-    defer app.local_workflow.deinit(allocator);
-    var status_bundle = try git_status.StatusBundle.parseOwned(allocator, "A  a-staged.txt\x00");
-    try app.pages.changes.git_status.replace(slot_path, &status_bundle);
-    app.pages.changes.status_load.markSuccess();
-    app.pages.changes.branch_status_load.markSuccess();
-    acceptTestSource(&app);
-    app.local_workflow.commit_panel.open(.commit);
-
-    var action: config_mod.ExternalActionConfig = .{};
-    action.id = "commit-message";
-    action.argv[0] = "sh";
-    action.argv[1] = "-c";
-    action.argv[2] = "pwd > child-cwd; printf '%s' \"$1\" > display-root; cat > stdin.json; printf marker > cwd-marker; printf 'Generated from A\\n'";
-    action.argv[3] = "helper";
-    action.argv[4] = "{repo_root}";
-    action.argv_len = 5;
-    action.stdin = .staged_diff;
-    app.user_config.actions.items[0] = action;
-    app.user_config.actions.len = 1;
-
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._io = io };
-    try app.localWorkflow().assistCommitMessage(&ctx);
-    const queued = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), queued.len);
-
-    try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
-    try tmp.dir.rename("replacement", tmp.dir, "slot", io);
-    const physical_a_path = try tmp.dir.realPathFileAlloc(io, "physical-a", allocator);
-    defer allocator.free(physical_a_path);
-
-    const message = queued[0].run(queued[0].ctx, allocator, io);
-    switch (message) {
-        .action_finished => |finished| switch (finished) {
-            .assist_commit_message => |result| app.localWorkflow().finishCommitMessageAssist(allocator, result),
-            else => return error.ExpectedCommitMessageAssist,
-        },
-        else => return error.ExpectedCommitMessageAssist,
-    }
-
-    const captured_json = try tmp.dir.readFileAlloc(io, "physical-a/stdin.json", allocator, .limited(1024 * 1024));
-    defer allocator.free(captured_json);
-    try std.testing.expect(std.mem.indexOf(u8, captured_json, "A_STAGED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, captured_json, "B_STAGED") == null);
-    try std.testing.expect(std.mem.indexOf(u8, captured_json, slot_path) != null);
-    const display_root = try tmp.dir.readFileAlloc(io, "physical-a/display-root", allocator, .limited(4096));
-    defer allocator.free(display_root);
-    try std.testing.expectEqualStrings(slot_path, display_root);
-    const child_cwd = try tmp.dir.readFileAlloc(io, "physical-a/child-cwd", allocator, .limited(4096));
-    defer allocator.free(child_cwd);
-    try std.testing.expectEqualStrings(physical_a_path, std.mem.trim(u8, child_cwd, "\r\n"));
-    try tmp.dir.access(io, "physical-a/cwd-marker", .{});
-
-    inline for (.{ "stdin.json", "display-root", "child-cwd", "cwd-marker" }) |name| {
-        try std.testing.expectError(error.FileNotFound, replacement.access(io, name, .{}));
-    }
-    const b_index_after = try localTestGitOutput(io, replacement, &.{ "git", "diff", "--cached", "--name-only" });
-    defer allocator.free(b_index_after);
-    try std.testing.expectEqualStrings(b_index_before, b_index_after);
-    const b_contents = try replacement.readFileAlloc(io, "b-staged.txt", allocator, .limited(4096));
-    defer allocator.free(b_contents);
-    try std.testing.expectEqualStrings("B_STAGED\n", b_contents);
-    try std.testing.expectEqualStrings("Generated from A", app.local_workflow.commit_panel.subject.slice());
 }
 
 test "queued local Git mutation retains the accepted root across path replacement" {
