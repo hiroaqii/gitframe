@@ -204,7 +204,7 @@ fn resolveRepoRootInDir(
 
     switch (result.term) {
         .exited => |code| if (code == 0 and result.stdout.len > 0) {
-            return trimAndDupe(allocator, result.stdout);
+            return rootRecordAndDupe(allocator, result.stdout);
         },
         else => {},
     }
@@ -248,9 +248,11 @@ fn realPathAbsoluteAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const
     return allocator.dupe(u8, path_z);
 }
 
-fn trimAndDupe(allocator: std.mem.Allocator, bytes: []u8) ![]u8 {
+fn rootRecordAndDupe(allocator: std.mem.Allocator, bytes: []u8) ![]u8 {
     defer allocator.free(bytes);
-    return allocator.dupe(u8, std.mem.trim(u8, bytes, " \t\r\n"));
+    // Git emits one LF record terminator; every preceding byte belongs to the path.
+    const end = bytes.len - @intFromBool(std.mem.endsWith(u8, bytes, "\n"));
+    return allocator.dupe(u8, bytes[0..end]);
 }
 
 fn isDotEntry(name: []const u8) bool {
@@ -294,11 +296,13 @@ test "repoLabel uses final path component" {
     try std.testing.expectEqualStrings("gitframe", label);
 }
 
-test "trimAndDupe trims git output and owns result" {
-    const raw = try std.testing.allocator.dupe(u8, "/tmp/repo\n");
-    const trimmed = try trimAndDupe(std.testing.allocator, raw);
-    defer std.testing.allocator.free(trimmed);
-    try std.testing.expectEqualStrings("/tmp/repo", trimmed);
+test "rootRecordAndDupe strips only the Git record terminator" {
+    for ([_][]const u8{ "/tmp/repo", "/tmp/repo ", "/tmp/repo\t", "/tmp/repo\r", "/tmp/repo\n" }) |path| {
+        const raw = try std.fmt.allocPrint(std.testing.allocator, "{s}\n", .{path});
+        const parsed = try rootRecordAndDupe(std.testing.allocator, raw);
+        defer std.testing.allocator.free(parsed);
+        try std.testing.expectEqualStrings(path, parsed);
+    }
 }
 
 test "DiscoveryResult deinit releases none state" {
@@ -509,4 +513,31 @@ fn gitInitOrSkip(path: []const u8) !void {
         else => {},
     }
     return error.SkipZigTest;
+}
+
+test "discoverRoot preserves whitespace and pins the matching sibling" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var environment = try testEnvironment(allocator);
+    defer environment.deinit();
+    for ([_][]const u8{ "repo", "repo ", "repo\t", "repo\r", "repo\n" }) |name| {
+        try tmp.dir.createDir(io, name, .default_dir);
+        const expected_path = try tmp.dir.realPathFileAlloc(io, name, allocator);
+        defer allocator.free(expected_path);
+        try gitInitOrSkip(expected_path);
+        var dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "marker", .data = name });
+        var result = try discoverRoot(allocator, io, expected_path, &environment);
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .single_repo);
+        try std.testing.expectEqualStrings(expected_path, result.single_repo.canonical_root);
+        var pinned = try root_capability.RootCapability.openCanonical(result.single_repo.canonical_root);
+        defer pinned.deinit();
+        const marker = try pinned.dir().readFileAlloc(io, "marker", allocator, .limited(1024));
+        defer allocator.free(marker);
+        try std.testing.expectEqualStrings(name, marker);
+    }
 }

@@ -10,7 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const root_capability = @import("../repo/root_capability.zig");
-const repository_path = @import("path.zig");
+const file_access = @import("file_access.zig");
 
 pub const max_text_mib: usize = 2;
 pub const max_text_bytes: usize = max_text_mib * 1024 * 1024;
@@ -107,26 +107,12 @@ fn loadWithHooks(
     hooks: LoadHooks,
 ) Snapshot {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return withoutMetadata(.unsupported_platform);
-    repository_path.validate(raw_path) catch return withoutMetadata(.missing_or_changed);
+    var opened_parent = file_access.openParent(root.dir(), raw_path, io) catch return withoutMetadata(.missing_or_changed);
+    defer opened_parent.deinit(io);
+    const parent = opened_parent.dir;
+    const parent_handle = parent.handle;
+    const final_name = opened_parent.name;
 
-    const split = std.mem.lastIndexOfScalar(u8, raw_path, '/');
-    const parent_path = if (split) |index| raw_path[0..index] else "";
-    const final_name = if (split) |index| raw_path[index + 1 ..] else raw_path;
-
-    var parent_handle = root.handle;
-    var owns_parent = false;
-    defer if (owns_parent) closeRaw(parent_handle);
-    if (parent_path.len > 0) {
-        var components = std.mem.splitScalar(u8, parent_path, '/');
-        while (components.next()) |component| {
-            const child = std.posix.openat(parent_handle, component, directoryFlags(), 0) catch return withoutMetadata(.missing_or_changed);
-            if (owns_parent) closeRaw(parent_handle);
-            parent_handle = child;
-            owns_parent = true;
-        }
-    }
-
-    const parent: std.Io.Dir = .{ .handle = parent_handle };
     const before = parent.statFile(io, final_name, .{ .follow_symlinks = false }) catch |err| {
         return withoutMetadata(mapStatFailure(err));
     };
@@ -178,8 +164,7 @@ fn loadRegular(
     io: std.Io,
     before_final_stat_hook: ?MutationHook,
 ) Snapshot {
-    const handle = std.posix.openat(parent_handle, name, regularFlags(), 0) catch |err| return withoutMetadata(mapOpenFailure(err));
-    const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
+    const file = file_access.openLeaf(.{ .handle = parent_handle }, name) catch |err| return withoutMetadata(mapOpenFailure(err));
     defer file.close(io);
 
     const before = file.stat(io) catch return withoutMetadata(.unreadable);
@@ -294,31 +279,6 @@ fn mapOpenFailure(err: anyerror) Value {
         error.AccessDenied, error.PermissionDenied => .unreadable,
         else => .unreadable,
     };
-}
-
-fn directoryFlags() std.posix.O {
-    return .{
-        .ACCMODE = .RDONLY,
-        .DIRECTORY = true,
-        .CLOEXEC = true,
-        .NOFOLLOW = true,
-        .NONBLOCK = true,
-        .NOCTTY = true,
-    };
-}
-
-fn regularFlags() std.posix.O {
-    return .{
-        .ACCMODE = .RDONLY,
-        .CLOEXEC = true,
-        .NOFOLLOW = true,
-        .NONBLOCK = true,
-        .NOCTTY = true,
-    };
-}
-
-fn closeRaw(handle: std.posix.fd_t) void {
-    _ = std.posix.system.close(handle);
 }
 
 fn createFifoForTest(dir: std.Io.Dir, name: []const u8) !void {

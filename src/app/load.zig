@@ -2633,37 +2633,7 @@ fn generatedStatusBody(allocator: std.mem.Allocator, path: []const u8, message: 
 /// Best-effort untracked line-count read rooted at the task-owned repository
 /// descriptor. Changes preview bytes use `repository/document.zig` instead.
 fn readRepoFileLimited(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, path_key: []const u8, limit: usize) ![]u8 {
-    try validateRepoRelativePath(path_key);
-
-    var current_dir = root;
-    var current_dir_owned = false;
-    defer if (current_dir_owned) current_dir.close(io);
-
-    var components = std.mem.splitScalar(u8, path_key, '/');
-    var component = components.next() orelse return error.InvalidPath;
-    while (true) {
-        const next = components.next();
-        const stat = try current_dir.statFile(io, component, .{ .follow_symlinks = false });
-        if (next == null) {
-            if (stat.kind != .file) return error.InvalidPath;
-            return try current_dir.readFileAlloc(io, component, allocator, .limited(limit));
-        }
-
-        if (stat.kind != .directory) return error.InvalidPath;
-        const child_dir = try current_dir.openDir(io, component, .{});
-        if (current_dir_owned) current_dir.close(io);
-        current_dir = child_dir;
-        current_dir_owned = true;
-        component = next.?;
-    }
-}
-
-fn validateRepoRelativePath(path: []const u8) !void {
-    if (path.len == 0 or std.fs.path.isAbsolute(path)) return error.InvalidPath;
-    var components = std.mem.splitScalar(u8, path, '/');
-    while (components.next()) |component| {
-        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidPath;
-    }
+    return @import("../repository/file_access.zig").readRegularAlloc(allocator, io, root, path_key, limit);
 }
 
 /// Test helper for callers that only have diff bytes. Production load paths
@@ -3389,7 +3359,8 @@ test "expected raw fingerprint returns unchanged before diff parsing" {
     }
 }
 
-test "stats-only repository read rejects stable symlink components" {
+test "stats-only repository read rejects symlinks and FIFO and retains byte limits" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3406,6 +3377,24 @@ test "stats-only repository read rejects stable symlink components" {
 
     try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, tmp.dir, "linked.txt", untracked_line_stats_per_file_bytes));
     try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, tmp.dir, "linked-dir/inside.txt", untracked_line_stats_per_file_bytes));
+    try std.testing.expectError(error.StreamTooLong, readRepoFileLimited(std.testing.allocator, io, tmp.dir, "inside.txt", 5));
+    const exact = try readRepoFileLimited(std.testing.allocator, io, tmp.dir, "inside.txt", 6);
+    defer std.testing.allocator.free(exact);
+    try std.testing.expectEqualStrings("inside", exact);
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty", .data = "" });
+    const empty = try readRepoFileLimited(std.testing.allocator, io, tmp.dir, "empty", 0);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    const result = try std.process.run(std.testing.allocator, io, .{
+        .argv = &.{ "mkfifo", "pipe" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectError(error.InvalidPath, readRepoFileLimited(std.testing.allocator, io, tmp.dir, "pipe", 1024));
 }
 
 test "generated projection uses pinned safe source snapshot" {
@@ -4537,4 +4526,67 @@ test "external patch bundle rejects overflowing coordinates and deep paths" {
     const patch = try std.fmt.allocPrint(std.testing.allocator, "--- a/{s}\n+++ b/{s}\n@@ -1 +1 @@\n-old\n+new\n", .{ path, path });
     defer std.testing.allocator.free(patch);
     try std.testing.expectError(error.TreeTooDeep, buildLoadedBundle(std.testing.allocator, patch));
+}
+
+test "stats-only repository read pins descriptors across leaf and directory substitution" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Hook = struct {
+        var root: std.Io.Dir = undefined;
+        var outside: []const u8 = "";
+        var replace_directory = false;
+        var replaced = false;
+
+        fn replace() void {
+            if (replaced) return;
+            replaced = true;
+            const base = std.testing.io;
+            if (replace_directory) {
+                root.rename("nested", root, "pinned", base) catch @panic("fixture rename failed");
+                root.symLink(base, outside, "nested", .{ .is_directory = true }) catch @panic("fixture symlink failed");
+            } else {
+                root.deleteFile(base, "selected") catch @panic("fixture unlink failed");
+                root.symLink(base, outside, "selected", .{}) catch @panic("fixture symlink failed");
+            }
+        }
+
+        fn dirStat(userdata: ?*anyopaque, dir: std.Io.Dir, name: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+            const observed = try std.testing.io.vtable.dirStatFile(userdata, dir, name, options);
+            replace();
+            return observed;
+        }
+        fn fileStat(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            const observed = try std.testing.io.vtable.fileStat(userdata, file);
+            replace();
+            return observed;
+        }
+    };
+    for ([_]bool{ false, true }) |directory| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(io, "repo", .default_dir);
+        try tmp.dir.createDir(io, "outside", .default_dir);
+        var repo = try tmp.dir.openDir(io, "repo", .{});
+        defer repo.close(io);
+        try repo.createDir(io, "nested", .default_dir);
+        const selected = if (directory) "nested/selected" else "selected";
+        try repo.writeFile(io, .{ .sub_path = selected, .data = "inside\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "outside/selected", .data = "OUTSIDE\n" });
+        const external = try tmp.dir.realPathFileAlloc(io, if (directory) "outside" else "outside/selected", allocator);
+        defer allocator.free(external);
+        Hook.root = repo;
+        Hook.outside = external;
+        Hook.replace_directory = directory;
+        Hook.replaced = false;
+        var vtable = io.vtable.*;
+        vtable.dirStatFile = Hook.dirStat;
+        vtable.fileStat = Hook.fileStat;
+        const wrapped: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        const bytes = try readRepoFileLimited(allocator, wrapped, repo, selected, 1024);
+        defer allocator.free(bytes);
+        try std.testing.expect(Hook.replaced);
+        try std.testing.expectEqualStrings("inside\n", bytes);
+        try std.testing.expectError(error.InvalidPath, readRepoFileLimited(allocator, io, repo, selected, 1024));
+    }
 }
