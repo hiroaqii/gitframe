@@ -777,7 +777,7 @@ pub const RepositoryPageState = struct {
         self.needs_change_map_request = false;
         self.needs_revalidation = false;
         self.freshness = .validating;
-        if (self.bundle != null) self.status.set("Validating repository...", .{});
+        if (self.bundle != null or self.status.provenance == .repository_read) self.setReadStatus(.manifest, "Validating repository...", .{});
         if (self.bundle == null) self.load_state = .loading;
         return .{
             .identity = .{ .origin = .repository, .repo_epoch = self.repo_epoch, .activation_id = self.activation_id },
@@ -957,7 +957,7 @@ pub const RepositoryPageState = struct {
             );
             std.debug.assert(bound);
         }
-        if (self.displayed_document != null) self.status.set("Validating selected file...", .{});
+        if (self.displayed_document != null or self.status.provenance == .repository_read) self.setReadStatus(.document, "Validating selected file...", .{});
         return .{
             .identity = .{ .origin = .repository, .repo_epoch = self.repo_epoch, .activation_id = self.activation_id },
             .generation = self.document_generation,
@@ -1040,7 +1040,7 @@ pub const RepositoryPageState = struct {
         self.pending_generation = null;
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
-        self.status.set("Could not start repository manifest task", .{});
+        self.setReadStatus(.manifest, "Could not start repository manifest task", .{});
         _ = self.terminalizeIncoming(.request_failed);
     }
 
@@ -1048,7 +1048,7 @@ pub const RepositoryPageState = struct {
         if (!self.clearPendingDocumentAuthorityIfGeneration(generation)) return;
         self.invalidateDisplayedDocumentAuthority();
         _ = self.file_search_source_focus.clearGeneration(generation);
-        self.status.set("Could not start selected file task", .{});
+        self.setReadStatus(.document, "Could not start selected file task", .{});
         const pending = self.incoming.documentIntent() orelse return;
         if (pending.document_generation == generation) {
             _ = self.terminalizeIncoming(.request_failed);
@@ -1098,7 +1098,7 @@ pub const RepositoryPageState = struct {
             self.needs_revalidation = false;
             self.freshness = .unavailable;
             self.load_state = .no_repository;
-            self.status.set("Repository required", .{});
+            self.setReadStatus(.manifest, "Repository required", .{});
             _ = self.terminalizeIncoming(.request_failed);
             return;
         }
@@ -1136,7 +1136,7 @@ pub const RepositoryPageState = struct {
     pub fn markRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
-        self.status.set("Could not prepare repository manifest: {s}", .{@errorName(err)});
+        self.setReadStatus(.manifest, "Could not prepare repository manifest: {s}", .{@errorName(err)});
         // This attempt has no descriptor, but manual reload may have left the
         // current predecessor task acceptable. Retain the destination while
         // that exact generation can still advance it.
@@ -1150,7 +1150,7 @@ pub const RepositoryPageState = struct {
     pub fn markDocumentRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
         self.file_search_source_focus.clear();
         self.invalidateDisplayedDocumentAuthority();
-        self.status.set("Could not prepare selected file: {s}", .{@errorName(err)});
+        self.setReadStatus(.document, "Could not prepare selected file: {s}", .{@errorName(err)});
         _ = self.terminalizeIncoming(.request_failed);
     }
 
@@ -1162,7 +1162,7 @@ pub const RepositoryPageState = struct {
         // a bounded destination-page terminal.
         if (self.incoming.documentIntent() == null) return;
         self.needs_document_revalidation = false;
-        self.status.set("Repository root changed", .{});
+        self.setReadStatus(.document, "Repository root changed", .{});
         // App orchestration reaches this only after the page committed a
         // destination but the root capability vanished before task creation.
         _ = self.terminalizeIncoming(.request_failed);
@@ -1184,7 +1184,7 @@ pub const RepositoryPageState = struct {
     pub fn repositoryCommitFailed(self: *RepositoryPageState) void {
         if (self.bundle == null) self.load_state = .failed;
         self.freshness = .failed;
-        self.status.set("Repository root could not be opened safely", .{});
+        self.setReadStatus(.manifest, "Repository root could not be opened safely", .{});
     }
 
     pub fn applyFinished(
@@ -1219,10 +1219,10 @@ pub const RepositoryPageState = struct {
                 self.freshness = if (self.active) .fresh else .validating;
                 self.requireDocumentRevalidation();
                 self.path_history.invalidate(allocator, self.selected_path != null);
-                self.status.clear();
+                const status_cleared = self.clearReadStatus(.manifest);
                 return self.applyIncomingManifestResolution(
                     allocator,
-                    if (changed_status_message) .changed else .unchanged,
+                    if (changed_status_message or status_cleared) .changed else .unchanged,
                     body_size,
                 );
             },
@@ -1232,8 +1232,8 @@ pub const RepositoryPageState = struct {
                     // manifest. Treat an impossible orphan as optional loss;
                     // its owned payload remains with `finished.deinit`.
                     self.freshness = if (self.active) .fresh else .validating;
-                    self.status.clear();
-                    return self.applyIncomingManifestResolution(allocator, .unchanged, body_size);
+                    const status_cleared = self.clearReadStatus(.manifest);
+                    return self.applyIncomingManifestResolution(allocator, if (status_cleared) .changed else .unchanged, body_size);
                 };
                 const previous_selected = self.selected_path;
                 const previous_status_available = bundle.status_available;
@@ -1266,13 +1266,13 @@ pub const RepositoryPageState = struct {
                 } else self.requireDocumentRevalidation();
                 if (!selection_changed) self.path_history.invalidate(allocator, self.selected_path != null);
                 self.freshness = if (self.active) .fresh else .validating;
-                self.status.clear();
+                const status_cleared = self.clearReadStatus(.manifest);
                 const status_availability_changed = self.file_visibility == .changed and
                     previous_status_available != bundle.status_available;
                 const changed_status_message = self.file_visibility == .changed and !bundle.status_available;
                 return self.applyIncomingManifestResolution(
                     allocator,
-                    if (visible_changed or selection_changed or status_availability_changed or changed_status_message) .changed else .unchanged,
+                    if (visible_changed or selection_changed or status_availability_changed or changed_status_message or status_cleared) .changed else .unchanged,
                     body_size,
                 );
             },
@@ -1294,7 +1294,7 @@ pub const RepositoryPageState = struct {
                 if (self.displayed_document) |*document| document.deinit(allocator);
                 self.displayed_document = null;
                 self.freshness = if (self.active) .fresh else .validating;
-                self.status.clear();
+                _ = self.clearReadStatus(.manifest);
                 return self.applyIncomingManifestResolution(allocator, .changed, body_size);
             },
             .failed_static => |message| {
@@ -1332,7 +1332,7 @@ pub const RepositoryPageState = struct {
         };
         if (!expected_root.eql(finished.root_identity)) {
             _ = self.file_search_source_focus.clearGeneration(finished.generation);
-            self.status.set("Repository root changed", .{});
+            self.setReadStatus(.document, "Repository root changed", .{});
             _ = self.terminalizeIncomingOwnerWithoutSuccessor();
             return .failed;
         }
@@ -1390,7 +1390,7 @@ pub const RepositoryPageState = struct {
         self.source_search.clear();
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
         self.needs_change_map_request = self.currentSource() != null;
-        self.status.clear();
+        _ = self.clearReadStatus(.document);
         self.resolveFileSearchSourceFocus(finished.generation);
         _ = self.resolveIncomingDocument(allocator, finished.generation);
         // A completion may be valid for the ordinary selected source while an
@@ -1435,7 +1435,10 @@ pub const RepositoryPageState = struct {
             .source => |*source| source,
             .inert => return .discarded,
         };
-        if (!source.fingerprint.eql(finished.fingerprint)) return .discarded;
+        if (!source.fingerprint.eql(finished.fingerprint)) {
+            self.requireDocumentRevalidation();
+            return .discarded;
+        }
         switch (finished.result) {
             .loaded => |spans| {
                 displayed.syntax_spans.deinit(allocator);
@@ -1652,7 +1655,35 @@ pub const RepositoryPageState = struct {
     fn acceptFailure(self: *RepositoryPageState, message: []const u8) void {
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
-        self.status.set("{s}", .{message});
+        self.setReadStatus(.manifest, "{s}", .{message});
+    }
+
+    fn readStatusOwner(self: *const RepositoryPageState, owner: app_state.RepositoryReadStatus.Owner) app_state.RepositoryReadStatus {
+        return .{
+            .owner = owner,
+            .generation = switch (owner) {
+                .manifest => self.generation,
+                .document => self.document_generation,
+            },
+        };
+    }
+
+    /// Background reads may replace their loading/error message, but a newer
+    /// clipboard/search/action notification keeps the shared status slot.
+    fn setReadStatus(self: *RepositoryPageState, owner: app_state.RepositoryReadStatus.Owner, comptime fmt: []const u8, args: anytype) void {
+        if (self.status.text().len > 0 and self.status.provenance != .repository_read) return;
+        self.status.set(fmt, args);
+        self.status.provenance = .{ .repository_read = self.readStatusOwner(owner) };
+    }
+
+    fn clearReadStatus(self: *RepositoryPageState, owner: app_state.RepositoryReadStatus.Owner) bool {
+        const current = switch (self.status.provenance) {
+            .repository_read => |read| read,
+            else => return false,
+        };
+        if (!std.meta.eql(current, self.readStatusOwner(owner))) return false;
+        self.status.clear();
+        return true;
     }
 
     fn reconcileLiveSelectionForMessage(
@@ -3622,7 +3653,7 @@ test "repository explicit reload restores typed root and directory across outcom
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer unchanged.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &unchanged, test_body_size));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unchanged, test_body_size));
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
@@ -6102,7 +6133,7 @@ test "repository page accepts active and inactive matching manifest completions"
         .result = .{ .unchanged = retained_bundle.document.fingerprint },
     };
     defer unchanged.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(std.testing.allocator, &unchanged, test_body_size));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &unchanged, test_body_size));
     try std.testing.expectEqual(retained_bundle, &state.bundle.?);
 
     state.needs_revalidation = true;
@@ -8480,7 +8511,7 @@ fn expectReactivatedIncomingDocumentForTest(
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer manifest_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.unchanged, state.applyFinished(allocator, &manifest_finished, test_body_size));
+    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished, test_body_size));
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expect(state.needs_document_revalidation);
 
@@ -9387,4 +9418,142 @@ test "repository page owns reload state transitions" {
     state.markRequestPreparationFailed(error.OutOfMemory);
     try std.testing.expectEqual(LoadState.failed, state.load_state);
     try std.testing.expect(std.mem.indexOf(u8, state.status.text(), "OutOfMemory") != null);
+}
+
+test "repository newer syntax snapshot revalidates only the current document in either completion order" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    try root.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "new\n" });
+    for ([_]bool{ false, true }) |map_first| {
+        var state = try selectionStateForTest("main.zig\x00", "old\n");
+        defer state.deinit(allocator);
+        state.root_identity = root.capability.identity;
+        state.syntax_generation = 8;
+        state.pending_syntax_generation = 8;
+        state.change_map_generation = 9;
+        state.pending_change_map_generation = 9;
+        var syntax = repository_tasks.SyntaxFinished{
+            .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
+            .root_identity = root.capability.identity,
+            .generation = 8,
+            .manifest_revision = state.manifest_revision,
+            .source_revision = state.source_revision,
+            .path = try allocator.dupe(u8, "main.zig"),
+            .fingerprint = .init("new\n"),
+            .result = .unavailable,
+        };
+        defer syntax.deinit(allocator);
+        // Every rejected identity must leave the accepted source authoritative.
+        for (0..6) |mismatch| {
+            var stale = syntax;
+            switch (mismatch) {
+                0 => stale.generation += 1,
+                1 => stale.identity.repo_epoch += 1,
+                2 => stale.root_identity.inode += 1,
+                3 => stale.path = @constCast("other.zig"),
+                4 => stale.source_revision += 1,
+                5 => stale.manifest_revision += 1,
+                else => unreachable,
+            }
+            state.pending_syntax_generation = 8;
+            try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &stale));
+            try std.testing.expect(!state.needs_document_revalidation);
+            try std.testing.expectEqual(DisplayedDocument.Authority.accepted, state.displayed_document.?.authority);
+        }
+        state.pending_syntax_generation = 8;
+        var change_map = repository_tasks.ChangeMapFinished{
+            .identity = syntax.identity,
+            .root_identity = syntax.root_identity,
+            .generation = 9,
+            .manifest_revision = syntax.manifest_revision,
+            .source_revision = syntax.source_revision,
+            .path = try allocator.dupe(u8, "main.zig"),
+            .fingerprint = state.currentSource().?.fingerprint,
+            .content_line_count = state.currentSource().?.contentLineCount(),
+            .result = .unavailable,
+        };
+        defer change_map.deinit(allocator);
+        if (map_first) _ = state.applyChangeMapFinished(allocator, &change_map);
+        try std.testing.expectEqual(ApplyOutcome.discarded, state.applySyntaxFinished(allocator, &syntax));
+        if (!map_first) _ = state.applyChangeMapFinished(allocator, &change_map);
+        try std.testing.expect(state.wantsDocumentRequest());
+        try std.testing.expectEqual(DisplayedDocument.Authority.revalidation_required, state.displayed_document.?.authority);
+        var request = try state.prepareDocumentRequest(allocator, &root.capability);
+        defer request.deinit(allocator);
+        var snapshot = selected_document.load(request.root, request.path, allocator, std.testing.io);
+        defer snapshot.deinit(allocator);
+        var finished = repository_tasks.DocumentFinished{
+            .identity = request.identity,
+            .root_identity = request.root.identity,
+            .generation = request.generation,
+            .manifest_revision = request.manifest_revision,
+            .path = try allocator.dupe(u8, request.path),
+            .value = repository_tasks.DocumentValue.fromLoaded(allocator, &snapshot.value),
+            .metadata = snapshot.metadata,
+        };
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
+        defer finished.deinit(allocator);
+        try std.testing.expectEqualStrings("new\n", state.currentSource().?.bytes);
+        try std.testing.expectEqual(DisplayedDocument.Authority.accepted, state.displayed_document.?.authority);
+        try std.testing.expect(!state.needs_document_revalidation);
+    }
+}
+
+test "repository read completions clear only owned status and preserve newer operation messages" {
+    const allocator = std.testing.allocator;
+    var root = try TestRoot.init();
+    defer root.deinit();
+    const Completion = enum { unchanged, status_changed, loaded, failed };
+    for (std.enums.values(Completion)) |completion| {
+        for ([_]bool{ false, true }) |newer_message| {
+            var state = try selectionStateForTest("main.zig\x00", "old\n");
+            defer state.deinit(allocator);
+            state.root_identity = root.capability.identity;
+            var request = try state.prepareRequest(allocator, root.path, &root.capability);
+            defer request.deinit(allocator);
+            try std.testing.expect(state.status.provenance == .repository_read);
+            if (newer_message) state.status.set("Clipboard failed", .{});
+            var finished = repository_tasks.ManifestFinished{
+                .identity = request.identity,
+                .root_identity = request.root.identity,
+                .generation = request.generation,
+                .result = switch (completion) {
+                    .unchanged => .{ .unchanged = state.bundle.?.document.fingerprint },
+                    .status_changed => .{ .status_changed = .unavailable },
+                    .loaded => .{ .loaded = try bundleForTest("main.zig\x00") },
+                    .failed => .{ .failed_static = "Read failed" },
+                },
+            };
+            defer finished.deinit(allocator);
+            _ = state.applyFinished(allocator, &finished, test_body_size);
+            try std.testing.expectEqualStrings(if (newer_message) "Clipboard failed" else if (completion == .failed) "Read failed" else "", state.status.text());
+            if (completion == .failed) {
+                var retry = try state.prepareRequest(allocator, root.path, &root.capability);
+                defer retry.deinit(allocator);
+                finished.generation = retry.generation;
+                finished.result = .{ .unchanged = state.bundle.?.document.fingerprint };
+                _ = state.applyFinished(allocator, &finished, test_body_size);
+                try std.testing.expectEqualStrings(if (newer_message) "Clipboard failed" else "", state.status.text());
+            }
+            var document_request = try state.prepareDocumentRequest(allocator, &root.capability);
+            defer document_request.deinit(allocator);
+            if (newer_message) try std.testing.expectEqualStrings("Clipboard failed", state.status.text());
+            state.rejectDocumentSpawn(document_request.generation);
+            if (!newer_message) try std.testing.expect(std.mem.indexOf(u8, state.status.text(), "Could not start") != null);
+            var retry = try state.prepareDocumentRequest(allocator, &root.capability);
+            defer retry.deinit(allocator);
+            var document = repository_tasks.DocumentFinished{
+                .identity = retry.identity,
+                .root_identity = retry.root.identity,
+                .generation = retry.generation,
+                .manifest_revision = retry.manifest_revision,
+                .path = try allocator.dupe(u8, retry.path),
+                .value = .{ .inert = .missing_or_changed },
+            };
+            defer document.deinit(allocator);
+            _ = state.applyDocumentFinished(allocator, &document);
+            try std.testing.expectEqualStrings(if (newer_message) "Clipboard failed" else "", state.status.text());
+        }
+    }
 }

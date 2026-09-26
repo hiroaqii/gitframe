@@ -393,9 +393,16 @@ pub const PushRetryTarget = struct {
 ///
 /// Store the length instead of a slice into `buf`. That keeps the value
 /// self-contained even if App state is copied in tests or future snapshots.
+pub const RepositoryReadStatus = struct {
+    pub const Owner = enum { manifest, document };
+    owner: Owner,
+    generation: u64,
+};
+
 pub const StatusProvenance = union(enum) {
     general,
     source_reload_failure: [32]u8,
+    repository_read: RepositoryReadStatus,
 };
 
 pub const StatusMessage = struct {
@@ -439,7 +446,7 @@ pub const StatusMessage = struct {
     /// the source read is in flight and must not be erased by source recovery.
     pub fn clearSourceReloadFailure(self: *StatusMessage, identity: [32]u8) bool {
         switch (self.provenance) {
-            .general => return false,
+            .general, .repository_read => return false,
             .source_reload_failure => |current| {
                 if (!std.mem.eql(u8, &current, &identity)) return false;
             },
