@@ -1,5 +1,4 @@
 const std = @import("std");
-const path_key = @import("../path_key.zig");
 const diff_parser = @import("parser.zig");
 const diff_view_model = @import("view_model.zig");
 
@@ -258,7 +257,7 @@ fn lessThanCandidate(_: void, lhs: Candidate, rhs: Candidate) bool {
 fn sameRepoPath(old_path: ?[]const u8, new_path: ?[]const u8) bool {
     const old = old_path orelse return false;
     const new = new_path orelse return false;
-    return std.mem.eql(u8, path_key.stripGitSidePrefix(old), path_key.stripGitSidePrefix(new));
+    return std.mem.eql(u8, old, new);
 }
 
 const CoordinateTransformError = error{
@@ -1592,8 +1591,8 @@ test "hunk projection rejects pure context hunks defensively" {
     };
     const file = diff_parser.FileDiff{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{hunk},
     };

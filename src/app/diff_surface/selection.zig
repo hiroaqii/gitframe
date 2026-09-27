@@ -12,7 +12,6 @@ const diff_parser = @import("../../diff/parser.zig");
 const diff_presentation_identity = @import("../../diff/presentation_identity.zig");
 const diff_selection = @import("../../diff/selection.zig");
 const diff_source = @import("../../diff/source.zig");
-const path_key = @import("../../path_key.zig");
 const repository_source = @import("../../repository/source.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const text_projection = @import("chasen_ui").text_projection;
@@ -233,8 +232,8 @@ pub fn buildParsedFolded(
     selection: diff_selection.DragSelection,
 ) !CompletedSelection {
     const canonical = diff_file.canonicalPathKey(file) orelse return error.NoPath;
-    const old_path = normalizedOptionalPath(file.old_path);
-    const new_path = normalizedOptionalPath(file.new_path);
+    const old_path = file.old_path;
+    const new_path = file.new_path;
     const canonical_owned = try allocator.dupe(u8, canonical);
     errdefer allocator.free(canonical_owned);
     const old_owned = try dupeOptional(allocator, old_path);
@@ -394,12 +393,6 @@ fn buildGeneratedUnified(
     return .{ .text = text, .points = owned_points, .line_count = owned_points.len };
 }
 
-fn normalizedOptionalPath(path: ?[]const u8) ?[]const u8 {
-    const value = path orelse return null;
-    if (std.mem.eql(u8, value, "/dev/null")) return null;
-    return path_key.stripGitSidePrefix(value);
-}
-
 fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
 }
@@ -515,8 +508,8 @@ test "parsed candidate retains exact cross-hunk range and character bytes" {
     const allocator = std.testing.allocator;
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{
             .{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{.{ .kind = .context, .text = "abc", .old_line = 1, .new_line = 1 }} },
@@ -555,8 +548,8 @@ test "parsed candidate owns byte-exact rename paths for the selected side" {
     }};
     const file: diff_parser.FileDiff = .{
         .header = "rename with raw path bytes",
-        .old_path = "a/old-\xff.zig",
-        .new_path = "b/new-\xfe.zig",
+        .old_path = "old-\xff.zig",
+        .new_path = "new-\xfe.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,

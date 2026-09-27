@@ -1176,15 +1176,15 @@ fn syncTestActivation(app: *App) void {
 const repository_incoming_viewport_changes_files = [_]diff_parser.FileDiff{
     .{
         .header = "diff --git a/src/app.zig b/src/app.zig",
-        .old_path = "a/src/app.zig",
-        .new_path = "b/src/app.zig",
+        .old_path = "src/app.zig",
+        .new_path = "src/app.zig",
         .metadata = &.{"index 1..2 100644"},
         .hunks = &.{},
     },
     .{
         .header = "diff --git a/src/app/pages/repository.zig b/src/app/pages/repository.zig",
-        .old_path = "a/src/app/pages/repository.zig",
-        .new_path = "b/src/app/pages/repository.zig",
+        .old_path = "src/app/pages/repository.zig",
+        .new_path = "src/app/pages/repository.zig",
         .metadata = &.{"index 1..2 100644"},
         .hunks = &.{},
     },

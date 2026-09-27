@@ -723,8 +723,8 @@ fn lineNumberForSide(line: diff_parser.DiffLine, side: Side) ?u32 {
 test "copyText preserves side-specific lines and whitespace" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -867,8 +867,8 @@ test "semantic line distance counts selected side across holes and hunk boundari
 test "character fragments copy exact forward and reverse multi-line bytes" {
     const file: diff_parser.FileDiff = .{
         .header = "diff",
-        .old_path = "a/example",
-        .new_path = "b/example",
+        .old_path = "example",
+        .new_path = "example",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -923,8 +923,8 @@ test "character selection from the first token to its leading boundary keeps the
         }};
         const file: diff_parser.FileDiff = .{
             .header = "diff --git a/a b/a",
-            .old_path = "a/a",
-            .new_path = "b/a",
+            .old_path = "a",
+            .new_path = "a",
             .metadata = &.{},
             .hunks = &.{.{
                 .old_start = 1,
@@ -977,8 +977,8 @@ test "cross-hunk character fragments use one glue LF and no trailing LF" {
 test "copyText does not add trailing newline for one selected line" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,

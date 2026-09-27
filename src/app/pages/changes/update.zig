@@ -886,8 +886,8 @@ test "Changes side-by-side keyboard selection chooses and switches one semantic 
         };
         const files = [_]diff_parser.FileDiff{.{
             .header = "diff --git a/one b/one",
-            .old_path = "a/one",
-            .new_path = "b/one",
+            .old_path = "one",
+            .new_path = "one",
             .metadata = &.{ "--- a/one", "+++ b/one" },
             .hunks = &hunks,
         }};
@@ -1043,8 +1043,8 @@ test "Changes unified keyboard selection omits a folded hunk from count and copy
         };
         const files = [_]diff_parser.FileDiff{.{
             .header = "diff --git a/a b/a",
-            .old_path = "a/a",
-            .new_path = "b/a",
+            .old_path = "a",
+            .new_path = "a",
             .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
             .hunks = &hunks,
         }};

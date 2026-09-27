@@ -2892,8 +2892,8 @@ test "unified body always selects complete marker-prefixed diff rows" {
     };
     const files = [_]diff_parser.FileDiff{.{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,

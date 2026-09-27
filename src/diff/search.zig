@@ -342,8 +342,8 @@ fn expectRenderedOffset(
 fn bridgeProbeFile() diff_parser.FileDiff {
     return .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{ "index 1..2", "old mode QQ" },
         .hunks = &.{
             .{
@@ -389,8 +389,8 @@ fn expectMatch(expected: diff_view_model.BodyCoordinate, actual: ?Match) !void {
 fn testFileWithHunks() diff_parser.FileDiff {
     return .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
         .hunks = &.{
             .{

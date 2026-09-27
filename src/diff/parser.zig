@@ -2,11 +2,11 @@ const std = @import("std");
 
 /// Parsed, normalized representation of a unified diff.
 ///
-/// String fields are slices into the caller-owned raw diff text. The array
-/// fields are allocated with the allocator passed to `parse` and can be freed
-/// with `deinit`.
+/// Patch text and unquoted paths borrow the input. Decoded quoted paths and
+/// arrays belong to this document and are freed with `deinit`.
 pub const DiffDocument = struct {
     files: []const FileDiff,
+    owned_paths: []const []u8 = &.{},
 
     pub fn totalHunks(self: DiffDocument) usize {
         var count: usize = 0;
@@ -14,11 +14,7 @@ pub const DiffDocument = struct {
         return count;
     }
 
-    /// Free parser-allocated arrays.
-    ///
-    /// This does not free any string data: headers, paths, metadata line text,
-    /// hunk sections, and diff line text all borrow from the input passed to
-    /// `parse`.
+    /// Free parser allocations; the caller still owns the original diff text.
     pub fn deinit(self: DiffDocument, allocator: std.mem.Allocator) void {
         for (self.files) |file| {
             for (file.hunks) |hunk| allocator.free(hunk.lines);
@@ -26,6 +22,8 @@ pub const DiffDocument = struct {
             allocator.free(file.metadata);
         }
         allocator.free(self.files);
+        for (self.owned_paths) |path| allocator.free(path);
+        allocator.free(self.owned_paths);
     }
 };
 
@@ -33,6 +31,8 @@ pub const FileDiff = struct {
     /// Usually the `diff --git ...` line. Plain unified diffs without that
     /// header use the first path or hunk header that introduced the file.
     header: []const u8,
+    /// Decoded repository-relative bytes. Null denotes an absent/unknown side;
+    /// protocol prefixes and `/dev/null` never appear as path identities.
     old_path: ?[]const u8 = null,
     new_path: ?[]const u8 = null,
     /// File-level lines that are not hunk contents: index, mode changes,
@@ -73,15 +73,16 @@ pub const DiffLine = struct {
 };
 
 pub const ParseError = error{
+    InvalidDiffPath,
     InvalidHunkHeader,
     InvalidHunkRange,
     OutOfMemory,
 };
 
-/// Parse a unified diff without copying string data.
+/// Parse a unified diff, copying only paths that require C-quote decoding.
 ///
-/// The returned document borrows all string fields from `text`; keep `text`
-/// alive for the lifetime of the document. For long-lived app state, copy
+/// The returned document borrows patch text and unquoted paths from `text`;
+/// keep `text` alive for the lifetime of the document. For long-lived app state, copy
 /// `text` into the same arena used for parsing so the borrowed strings and
 /// parser-allocated arrays share one cleanup boundary.
 pub fn parse(allocator: std.mem.Allocator, text: []const u8) ParseError!DiffDocument {
@@ -93,6 +94,7 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) ParseError!DiffDocu
 const Parser = struct {
     allocator: std.mem.Allocator,
     files: std.ArrayList(FileDiff) = .empty,
+    owned_paths: std.ArrayList([]u8) = .empty,
     current_file: ?FileBuilder = null,
     current_hunk: ?HunkBuilder = null,
     old_line: u32 = 0,
@@ -115,6 +117,8 @@ const Parser = struct {
             self.allocator.free(file.metadata);
         }
         self.files.deinit(self.allocator);
+        for (self.owned_paths.items) |path| self.allocator.free(path);
+        self.owned_paths.deinit(self.allocator);
     }
 
     fn parse(self: *Parser, text: []const u8) ParseError!DiffDocument {
@@ -131,7 +135,15 @@ const Parser = struct {
 
         try self.finishHunk();
         try self.finishFile();
-        return .{ .files = try self.files.toOwnedSlice(self.allocator) };
+        const owned_paths = try self.owned_paths.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned_paths) |path| self.allocator.free(path);
+            self.allocator.free(owned_paths);
+        }
+        return .{
+            .files = try self.files.toOwnedSlice(self.allocator),
+            .owned_paths = owned_paths,
+        };
     }
 
     fn parseLine(self: *Parser, line: []const u8) ParseError!void {
@@ -157,11 +169,11 @@ const Parser = struct {
                 try self.finishFile();
             }
             try self.ensureFile(line);
-            self.current_file.?.old_path = parsePath(line[4..]);
+            self.current_file.?.old_endpoint = line[4..];
             try self.current_file.?.metadata.append(self.allocator, line);
         } else if (std.mem.startsWith(u8, line, "+++ ")) {
             try self.ensureFile(line);
-            self.current_file.?.new_path = parsePath(line[4..]);
+            self.current_file.?.new_endpoint = line[4..];
             try self.current_file.?.metadata.append(self.allocator, line);
         } else if (self.current_file != null) {
             if (std.mem.startsWith(u8, line, "Binary files ")) self.current_file.?.is_binary = true;
@@ -182,6 +194,24 @@ const Parser = struct {
 
     fn finishFile(self: *Parser) ParseError!void {
         if (self.current_file) |*file| {
+            var old_path = if (file.old_endpoint) |raw| try self.parseEndpoint(raw, 'a') else null;
+            var new_path = if (file.new_endpoint) |raw| try self.parseEndpoint(raw, 'b') else null;
+            if (file.old_endpoint == null and file.new_endpoint == null) {
+                for (file.metadata.items) |line| {
+                    if (std.mem.startsWith(u8, line, "rename from ")) old_path = try self.decodePath(line[12..]);
+                    if (std.mem.startsWith(u8, line, "rename to ")) new_path = try self.decodePath(line[10..]);
+                    if (std.mem.startsWith(u8, line, "copy from ")) old_path = try self.decodePath(line[10..]);
+                    if (std.mem.startsWith(u8, line, "copy to ")) new_path = try self.decodePath(line[8..]);
+                }
+                if (old_path == null and new_path == null) {
+                    old_path = try self.samePathHeader(file.header);
+                    new_path = old_path;
+                }
+                for (file.metadata.items) |line| {
+                    if (std.mem.startsWith(u8, line, "new file mode ")) old_path = null;
+                    if (std.mem.startsWith(u8, line, "deleted file mode ")) new_path = null;
+                }
+            }
             const metadata = try file.metadata.toOwnedSlice(self.allocator);
             errdefer self.allocator.free(metadata);
 
@@ -193,14 +223,96 @@ const Parser = struct {
 
             try self.files.append(self.allocator, .{
                 .header = file.header,
-                .old_path = file.old_path,
-                .new_path = file.new_path,
+                .old_path = old_path,
+                .new_path = new_path,
                 .metadata = metadata,
                 .hunks = hunks,
                 .is_binary = file.is_binary,
             });
         }
         self.current_file = null;
+    }
+
+    fn parseEndpoint(self: *Parser, raw: []const u8, side: u8) ParseError!?[]const u8 {
+        const end = if (std.mem.startsWith(u8, raw, "\""))
+            try quotedPathLength(raw)
+        else
+            std.mem.indexOfScalar(u8, raw, '\t') orelse raw.len;
+        if (end < raw.len and raw[end] != '\t') return error.InvalidDiffPath;
+        const decoded = try self.decodePath(raw[0..end]);
+        if (std.mem.eql(u8, decoded, "/dev/null")) return null;
+        const path = if (decoded.len >= 2 and decoded[0] == side and decoded[1] == '/') decoded[2..] else decoded;
+        if (path.len == 0) return error.InvalidDiffPath;
+        return path;
+    }
+
+    /// Git's metadata-only non-rename header repeats the same path on both
+    /// sides. Equal halves preserve spaces, even a literal ` b/` in the name.
+    fn samePathHeader(self: *Parser, header: []const u8) ParseError!?[]const u8 {
+        const prefix = "diff --git ";
+        if (!std.mem.startsWith(u8, header, prefix)) return null;
+        const raw = header[prefix.len..];
+        const split = if (std.mem.startsWith(u8, raw, "\""))
+            try quotedPathLength(raw)
+        else if (raw.len % 2 == 1)
+            raw.len / 2
+        else
+            return null;
+        if (split >= raw.len or raw[split] != ' ') return null;
+        const old = try self.decodePath(raw[0..split]);
+        const new = try self.decodePath(raw[split + 1 ..]);
+        if (!std.mem.startsWith(u8, old, "a/") or !std.mem.startsWith(u8, new, "b/")) return null;
+        if (old.len <= 2 or !std.mem.eql(u8, old[2..], new[2..])) return null;
+        return old[2..];
+    }
+
+    fn decodePath(self: *Parser, raw: []const u8) ParseError![]const u8 {
+        if (raw.len == 0) return error.InvalidDiffPath;
+        if (raw[0] != '"') {
+            if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.InvalidDiffPath;
+            return raw;
+        }
+        if (try quotedPathLength(raw) != raw.len) return error.InvalidDiffPath;
+        const decoded = try self.allocator.alloc(u8, raw.len - 2);
+        errdefer self.allocator.free(decoded);
+        var input: usize = 1;
+        var written: usize = 0;
+        const end = raw.len - 1;
+        while (input < end) {
+            var byte = raw[input];
+            input += 1;
+            if (byte == '\\') {
+                if (input >= end) return error.InvalidDiffPath;
+                const escape = raw[input];
+                input += 1;
+                byte = switch (escape) {
+                    'a' => 7,
+                    'b' => 8,
+                    't' => '\t',
+                    'n' => '\n',
+                    'v' => 11,
+                    'f' => 12,
+                    'r' => '\r',
+                    '\\', '"' => escape,
+                    '0'...'3' => blk: {
+                        if (end - input < 2) return error.InvalidDiffPath;
+                        const second = raw[input];
+                        const third = raw[input + 1];
+                        if (second < '0' or second > '7' or third < '0' or third > '7') return error.InvalidDiffPath;
+                        const value = (escape - '0') * 64 + (second - '0') * 8 + (third - '0');
+                        input += 2;
+                        break :blk value;
+                    },
+                    else => return error.InvalidDiffPath,
+                };
+            }
+            if (byte == 0) return error.InvalidDiffPath;
+            decoded[written] = byte;
+            written += 1;
+        }
+        if (written == 0) return error.InvalidDiffPath;
+        try self.owned_paths.append(self.allocator, decoded);
+        return decoded[0..written];
     }
 
     fn startHunk(self: *Parser, parsed: ParsedHunkHeader) ParseError!void {
@@ -270,8 +382,8 @@ const Parser = struct {
 
 const FileBuilder = struct {
     header: []const u8,
-    old_path: ?[]const u8 = null,
-    new_path: ?[]const u8 = null,
+    old_endpoint: ?[]const u8 = null,
+    new_endpoint: ?[]const u8 = null,
     metadata: std.ArrayList([]const u8) = .empty,
     hunks: std.ArrayList(Hunk) = .empty,
     is_binary: bool = false,
@@ -346,15 +458,91 @@ fn parseRange(part: []const u8, expected_prefix: u8) ParseError!LineRange {
     return range;
 }
 
-fn parsePath(raw: []const u8) ?[]const u8 {
-    const path = std.mem.trim(u8, raw, " \t");
-    if (std.mem.eql(u8, path, "/dev/null")) return null;
-    return path;
+fn quotedPathLength(raw: []const u8) ParseError!usize {
+    var index: usize = 1;
+    while (index < raw.len) : (index += 1) {
+        if (raw[index] == '"') return index + 1;
+        if (raw[index] == '\\') index += 1;
+    }
+    return error.InvalidDiffPath;
 }
 
 fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
     if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
     return line;
+}
+
+test "diff path endpoints preserve raw bytes and encoded patch text" {
+    const cases = [_]struct { old: []const u8, new: []const u8, path: []const u8 }{
+        .{ .old = "a/a/victim", .new = "b/a/victim", .path = "a/victim" },
+        .{ .old = "a/b/victim", .new = "b/b/victim", .path = "b/victim" },
+        .{ .old = "a/has space \t", .new = "b/has space \t", .path = "has space " },
+        .{ .old = "\"a/tail\\t\"", .new = "\"b/tail\\t\"", .path = "tail\t" },
+        .{ .old = "\"a/quote\\\"slash\\\\\"", .new = "\"b/quote\\\"slash\\\\\"", .path = "quote\"slash\\" },
+        .{ .old = "\"a/\\a\\b\\t\\n\\v\\f\\r\"", .new = "\"b/\\a\\b\\t\\n\\v\\f\\r\"", .path = "\x07\x08\t\n\x0b\x0c\r" },
+        .{ .old = "\"a/\\346\\227\\245\\346\\234\\254\\350\\252\\236.txt\"", .new = "\"b/\\346\\227\\245\\346\\234\\254\\350\\252\\236.txt\"", .path = "日本語.txt" },
+        .{ .old = "\"a/\\377.txt\"", .new = "\"b/\\377.txt\"", .path = "\xff.txt" },
+    };
+    for (cases) |case| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "--- {s}\n+++ {s}\n@@ -1 +1 @@\n-old\n+new\n", .{ case.old, case.new });
+        defer std.testing.allocator.free(text);
+        const doc = try parse(std.testing.allocator, text);
+        defer doc.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.path, doc.files[0].old_path.?);
+        try std.testing.expectEqualStrings(case.path, doc.files[0].new_path.?);
+        try std.testing.expectEqualStrings(text[0..std.mem.indexOfScalar(u8, text, '\n').?], doc.files[0].metadata[0]);
+        try std.testing.expectEqualStrings("old", doc.files[0].hunks[0].lines[0].text);
+    }
+}
+
+test "diff metadata resolves raw sides without whitespace splitting" {
+    const cases = [_]struct { text: []const u8, old: ?[]const u8, new: ?[]const u8 }{
+        .{ .text = "diff --git a/part b/name  b/part b/name \nold mode 100644\nnew mode 100755\n", .old = "part b/name ", .new = "part b/name " },
+        .{ .text = "diff --git \"a/tail\\t\" \"b/tail\\t\"\nold mode 100644\nnew mode 100755\n", .old = "tail\t", .new = "tail\t" },
+        .{ .text = "diff --git a/image.bin b/image.bin\nBinary files a/image.bin and b/image.bin differ\n", .old = "image.bin", .new = "image.bin" },
+        .{ .text = "diff --git a/empty b/empty\nnew file mode 100644\n", .old = null, .new = "empty" },
+        .{ .text = "diff --git a/empty b/empty\ndeleted file mode 100644\n", .old = "empty", .new = null },
+        .{ .text = "diff --git a/old b/new\nrename from \"old\\t.txt\"\nrename to \"a/new\\377\"\n", .old = "old\t.txt", .new = "a/new\xff" },
+        .{ .text = "diff --git a/a/old b/b/new\ncopy from a/old\ncopy to b/new\n", .old = "a/old", .new = "b/new" },
+        .{ .text = "diff --git a/new b/new\n--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+new\n", .old = null, .new = "new" },
+        .{ .text = "diff --git a/old b/old\n--- a/old\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n", .old = "old", .new = null },
+        .{ .text = "diff --git a/old b/new\nindex 111..222\n", .old = null, .new = null },
+    };
+    for (cases) |case| {
+        const doc = try parse(std.testing.allocator, case.text);
+        defer doc.deinit(std.testing.allocator);
+        const file = doc.files[0];
+        if (case.old) |path| {
+            try std.testing.expectEqualStrings(path, file.old_path.?);
+        } else try std.testing.expect(file.old_path == null);
+        if (case.new) |path| {
+            try std.testing.expectEqualStrings(path, file.new_path.?);
+        } else try std.testing.expect(file.new_path == null);
+    }
+}
+
+test "diff path rejects malformed endpoints and cleans earlier decoded files" {
+    const invalid = [_][]const u8{
+        "",            "a/",          "\"\"",        "\"a/unterminated", "\"a/\\q\"", "\"a/\\12\"",
+        "\"a/\\400\"", "\"a/\\0_1\"", "\"a/\\000\"", "\"a/ok\"junk",     "a/\x00",
+    };
+    for (invalid) |endpoint| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "diff --git a/good b/good\n--- \"a/good\\t\"\n+++ \"b/good\\t\"\ndiff --git a/bad b/bad\n--- {s}\n+++ b/bad\n", .{endpoint});
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(error.InvalidDiffPath, parse(std.testing.allocator, text));
+    }
+}
+
+test "diff path allocations clean up on every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseQuotedPathAllocationCase, .{});
+}
+
+fn parseQuotedPathAllocationCase(allocator: std.mem.Allocator) !void {
+    const text = "diff --git \"a/file\\t\" \"b/file\\t\"\n--- \"a/file\\t\"\n+++ \"b/file\\t\"\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/old b/new\nrename from \"old\\377\"\nrename to \"b/new\\t\"\n";
+    const doc = try parse(allocator, text);
+    defer doc.deinit(allocator);
+    try std.testing.expectEqualStrings("file\t", doc.files[0].new_path.?);
+    try std.testing.expectEqualStrings("b/new\t", doc.files[1].new_path.?);
 }
 
 test "parse unified diff with one file and one hunk" {
@@ -376,8 +564,8 @@ test "parse unified diff with one file and one hunk" {
 
     try std.testing.expectEqual(@as(usize, 1), doc.files.len);
     try std.testing.expectEqual(@as(usize, 1), doc.totalHunks());
-    try std.testing.expectEqualStrings("a/src/main.zig", doc.files[0].old_path.?);
-    try std.testing.expectEqualStrings("b/src/main.zig", doc.files[0].new_path.?);
+    try std.testing.expectEqualStrings("src/main.zig", doc.files[0].old_path.?);
+    try std.testing.expectEqualStrings("src/main.zig", doc.files[0].new_path.?);
     try std.testing.expectEqual(@as(u32, 1), doc.files[0].hunks[0].old_start);
     try std.testing.expectEqual(@as(u32, 3), doc.files[0].hunks[0].new_count);
     try std.testing.expectEqualStrings("@@ -1,2 +1,3 @@ fn main", doc.files[0].hunks[0].header);
@@ -446,8 +634,8 @@ test "parse hunk lines that look like file path headers" {
     try std.testing.expectEqualStrings("-- separator", lines[0].text);
     try std.testing.expectEqual(DiffLine.Kind.added, lines[1].kind);
     try std.testing.expectEqualStrings("++ separator", lines[1].text);
-    try std.testing.expectEqualStrings("a/markers.txt", doc.files[0].old_path.?);
-    try std.testing.expectEqualStrings("b/markers.txt", doc.files[0].new_path.?);
+    try std.testing.expectEqualStrings("markers.txt", doc.files[0].old_path.?);
+    try std.testing.expectEqualStrings("markers.txt", doc.files[0].new_path.?);
 }
 
 test "parse plain unified diff with multiple files" {

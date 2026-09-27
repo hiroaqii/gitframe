@@ -180,8 +180,8 @@ test "formatSingleHunkPatch rejects incomplete hunks accepted by parser" {
 test "formatSingleHunkPatch rejects unsupported files" {
     const modified = diff_parser.FileDiff{
         .header = "diff --git a/src/app.zig b/src/app.zig",
-        .old_path = "a/src/app.zig",
-        .new_path = "b/src/app.zig",
+        .old_path = "src/app.zig",
+        .new_path = "src/app.zig",
         .metadata = &.{ "old mode 100644", "new mode 100755" },
         .hunks = &.{},
     };
@@ -190,7 +190,7 @@ test "formatSingleHunkPatch rejects unsupported files" {
     const added = diff_parser.FileDiff{
         .header = "diff --git a/new.zig b/new.zig",
         .old_path = null,
-        .new_path = "b/new.zig",
+        .new_path = "new.zig",
         .metadata = &.{ "new file mode 100644", "--- /dev/null", "+++ b/new.zig" },
         .hunks = &.{},
     };
@@ -198,8 +198,8 @@ test "formatSingleHunkPatch rejects unsupported files" {
 
     const binary = diff_parser.FileDiff{
         .header = "diff --git a/img.png b/img.png",
-        .old_path = "a/img.png",
-        .new_path = "b/img.png",
+        .old_path = "img.png",
+        .new_path = "img.png",
         .metadata = &.{},
         .hunks = &.{},
         .is_binary = true,
@@ -208,8 +208,8 @@ test "formatSingleHunkPatch rejects unsupported files" {
 
     const copied = diff_parser.FileDiff{
         .header = "diff --git a/src/old.zig b/src/new.zig",
-        .old_path = "a/src/old.zig",
-        .new_path = "b/src/new.zig",
+        .old_path = "src/old.zig",
+        .new_path = "src/new.zig",
         .metadata = &.{ "similarity index 95%", "copy from src/old.zig", "copy to src/new.zig" },
         .hunks = &.{},
     };

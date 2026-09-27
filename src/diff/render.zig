@@ -550,8 +550,8 @@ test "side-by-side presentation rejects incompatible placement and spacer order"
 test "presentation rendering keeps the header and starts scrolled card source and tail rows in the body" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/card.zig b/src/card.zig",
-        .old_path = "a/src/card.zig",
-        .new_path = "b/src/card.zig",
+        .old_path = "src/card.zig",
+        .new_path = "src/card.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -633,8 +633,8 @@ test "presentation rendering keeps the header and starts scrolled card source an
 test "side-by-side presentation renderer confines cards to aligned pane surfaces" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/panes.zig b/src/panes.zig",
-        .old_path = "a/src/panes.zig",
-        .new_path = "b/src/panes.zig",
+        .old_path = "src/panes.zig",
+        .new_path = "src/panes.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2201,8 +2201,8 @@ test "display mode falls back to unified on narrow panes" {
 test "display mode header renders a readable configurable toggle hint" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{},
     };
@@ -2355,8 +2355,8 @@ test "review diff cursor projection admission leaves invalid body rows untouched
     const invalid_utf8 = [_]u8{0xff};
     const unified_file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2369,8 +2369,8 @@ test "review diff cursor projection admission leaves invalid body rows untouched
     };
     const paired_file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2417,8 +2417,8 @@ test "full-row diff background fills unified rows without leaking into chrome" {
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{"rename from a"},
         .hunks = &.{.{
             .old_start = 1,
@@ -2483,8 +2483,8 @@ test "full-row diff background clips paired single and missing side rows" {
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2533,8 +2533,8 @@ test "full-row diff background follows folded hunk visibility" {
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2585,8 +2585,8 @@ test "full-row diff background preserves cursor and selection precedence" {
     const palette = reviewCursorTestPalette();
     const added_file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 0,
@@ -2633,8 +2633,8 @@ test "full-row diff background preserves cursor and selection precedence" {
 
     const paired_file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2679,8 +2679,8 @@ test "renderFile composes diff state as body background and marker foreground" {
     const palette = theme.Palette.default();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -2738,8 +2738,8 @@ test "renderFile fills unified gutter lead-in when line numbers are hidden" {
     const palette = theme.Palette.default();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2771,8 +2771,8 @@ test "renderFile fills context gutter lead-in and line numbers with context back
     palette.colors[@intFromEnum(theme.Role.diff_context_bg)] = .{ .index = 8 };
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -2807,8 +2807,8 @@ test "renderFile colors staged current hunk header without dimming body" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -2852,8 +2852,8 @@ test "renderFile colors staged current hunk header without dimming body" {
 test "renderFile colors current header and guide from exact per-hunk stage state" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -2915,8 +2915,8 @@ test "renderFile colors current header and guide from exact per-hunk stage state
 test "whole-file and per-hunk staged authority converge on current hunk presentation" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 0,
@@ -2970,8 +2970,8 @@ test "renderFile applies unified syntax spans without removing diff background" 
     palette.colors[@intFromEnum(theme.Role.syntax_string)] = .{ .rgb = .{ 4, 5, 6 } };
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -3016,8 +3016,8 @@ test "renderFile hides unified diff prefix for highlighted hunk side and keeps f
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -3055,8 +3055,8 @@ test "renderFile normalizes highlighted unified body base foreground" {
     const palette = theme.Palette.default();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -3121,8 +3121,8 @@ test "renderFile keeps unified diff prefix when spans do not change foreground" 
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -3169,8 +3169,8 @@ test "renderFile applies side-by-side context syntax spans per side" {
     const palette = theme.Palette.default();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
             .{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 },
@@ -3204,8 +3204,8 @@ test "renderFile hides side-by-side diff prefixes by highlighted hunk side" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
             .{ .kind = .removed, .text = "old", .old_line = 1 },
@@ -3244,8 +3244,8 @@ test "renderFile resolves reordered combined syntax in unified and side-by-side 
     const allocator = std.testing.allocator;
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -3358,8 +3358,8 @@ test "renderFile highlights only the selected side-by-side pane side" {
     const palette = theme.Palette.default();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
             .{ .kind = .removed, .text = "old", .old_line = 1 },
@@ -3398,8 +3398,8 @@ test "review diff cursor unified whole-row selection preserves syntax without st
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 0,
@@ -3458,8 +3458,8 @@ test "review diff cursor side-by-side character selection stays inside the locke
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -3509,8 +3509,8 @@ test "review diff cursor unified TAB row selection preserves syntax" {
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 0,
@@ -3559,8 +3559,8 @@ test "review diff cursor unified row keeps wide combining and emoji graphemes at
     const text = "a界e\u{301}👩‍💻z";
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 0,
@@ -3614,8 +3614,8 @@ test "renderFile normalizes highlighted side-by-side body base foreground" {
     const palette = theme.Palette.default();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{ .old_start = 1, .old_count = 1, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
             .{ .kind = .removed, .text = "var old_item", .old_line = 1 },
@@ -3653,8 +3653,8 @@ test "renderFile clips syntax spans through horizontal scroll without splitting 
     const palette = theme.Palette.default();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{ .old_start = 1, .old_count = 0, .new_start = 1, .new_count = 1, .section = "", .lines = &.{
             .{ .kind = .added, .text = "aあbc", .new_line = 1 },
@@ -3712,8 +3712,8 @@ test "selected hunk guide is drawn only for highlighted hunk" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -3756,8 +3756,8 @@ test "side-by-side selected hunk guide is mirrored in center separator" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -3807,8 +3807,8 @@ test "side-by-side staged hunk colors current chrome without dimming body" {
     palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 51, 52, 53 } };
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -3852,8 +3852,8 @@ test "selected hunk guides are dim when pane is inactive" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -3913,8 +3913,8 @@ test "selected hunk guide continues when hunk header is scrolled above viewport"
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -3955,8 +3955,8 @@ test "selected hunk guide is suppressed for folded highlighted hunk" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -3998,8 +3998,8 @@ test "selected hunk guide is suppressed for folded highlighted hunk" {
 test "displayPath prefers new path and strips git prefixes" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{},
     };
@@ -4092,8 +4092,8 @@ test "narrow side-by-side request labels file header as automatic unified fallba
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -4124,8 +4124,8 @@ test "side-by-side clips old column before new column" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -4167,8 +4167,8 @@ test "side-by-side hunk header is clipped before the new column" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -4199,8 +4199,8 @@ test "header clipping keeps filename tail visible" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/very-long-file-name.zig b/very-long-file-name.zig",
-        .old_path = "a/very-long-file-name.zig",
-        .new_path = "b/very-long-file-name.zig",
+        .old_path = "very-long-file-name.zig",
+        .new_path = "very-long-file-name.zig",
         .metadata = &.{},
         .hunks = &.{},
     };
@@ -4218,8 +4218,8 @@ test "header clipping keeps path tail without repo prefix" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/very/deep/path/example.zig b/very/deep/path/example.zig",
-        .old_path = "a/very/deep/path/example.zig",
-        .new_path = "b/very/deep/path/example.zig",
+        .old_path = "very/deep/path/example.zig",
+        .new_path = "very/deep/path/example.zig",
         .metadata = &.{},
         .hunks = &.{},
     };
@@ -4263,8 +4263,8 @@ test "header selection highlights path without highlighting stats" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{},
     };
@@ -4287,8 +4287,8 @@ test "unified horizontal scroll keeps line numbers and prefix fixed" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -4322,8 +4322,8 @@ test "unified line numbers can be hidden while keeping prefix" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -4350,8 +4350,8 @@ test "unified line numbers can be hidden while keeping prefix" {
 test "parsed file header keeps semantic statistics and metadata when inactive" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -4421,8 +4421,8 @@ test "side-by-side horizontal scroll keeps gutter fixed" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -4453,8 +4453,8 @@ test "side-by-side line numbers can be hidden while keeping prefixes" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{
@@ -4487,8 +4487,8 @@ test "renderFile can start from cached viewport offset" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{ "--- a/src/main.zig", "+++ b/src/main.zig" },
         .hunks = &.{
             .{
@@ -4539,8 +4539,8 @@ test "renderFile cursor marker uses absolute body offset and dims when pane is i
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{ "--- a/src/main.zig", "+++ b/src/main.zig" },
         .hunks = &.{
             .{
@@ -4598,8 +4598,8 @@ test "review diff cursor composes unified selection inside pane chrome" {
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -4651,8 +4651,8 @@ test "review diff cursor keeps side-by-side separator outside selected side" {
     const palette = reviewCursorTestPalette();
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -4701,8 +4701,8 @@ test "review diff cursor restores parsed signs from cross-row syntax authority" 
     const allocator = std.testing.allocator;
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
@@ -4783,8 +4783,8 @@ test "review diff cursor covers metadata binary and hunk rows only while active"
     const palette = reviewCursorTestPalette();
     const text_file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{"new file mode 100644"},
         .hunks = &.{.{
             .old_start = 0,
@@ -4836,8 +4836,8 @@ test "renderFile can start from cached side-by-side viewport offset" {
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
-        .old_path = "a/src/main.zig",
-        .new_path = "b/src/main.zig",
+        .old_path = "src/main.zig",
+        .new_path = "src/main.zig",
         .metadata = &.{},
         .hunks = &.{
             .{

@@ -113,6 +113,3 @@ pub const SelectionContext = struct {
     source: SourceContext,
     selected: ?Selection,
 };
-
-pub const canonicalRepoPath = path_key.canonicalRepoPath;
-pub const stripGitSidePrefix = path_key.stripGitSidePrefix;

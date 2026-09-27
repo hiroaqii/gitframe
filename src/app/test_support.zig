@@ -220,13 +220,13 @@ pub const files_two_statuses = [_]diff_parser.FileDiff{
     .{
         .header = "diff --git a/src/added.zig b/src/added.zig",
         .old_path = null,
-        .new_path = "b/src/added.zig",
+        .new_path = "src/added.zig",
         .metadata = &.{"new file mode 100644"},
         .hunks = &.{},
     },
     .{
         .header = "diff --git a/src/deleted.zig b/src/deleted.zig",
-        .old_path = "a/src/deleted.zig",
+        .old_path = "src/deleted.zig",
         .new_path = null,
         .metadata = &.{"deleted file mode 100644"},
         .hunks = &.{},
@@ -240,8 +240,8 @@ pub const files_wide = [_]diff_parser.FileDiff{
 pub const files_metadata_only = [_]diff_parser.FileDiff{
     .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{ "index 1..2", "old mode 100644" },
         .hunks = &.{},
     },
@@ -250,8 +250,8 @@ pub const files_metadata_only = [_]diff_parser.FileDiff{
 pub const files_binary_only = [_]diff_parser.FileDiff{
     .{
         .header = "diff --git a/bin b/bin",
-        .old_path = "a/bin",
-        .new_path = "b/bin",
+        .old_path = "bin",
+        .new_path = "bin",
         .metadata = &.{"index 1..2"},
         .hunks = &.{},
         .is_binary = true,
@@ -260,8 +260,8 @@ pub const files_binary_only = [_]diff_parser.FileDiff{
 
 pub const file_wide = diff_parser.FileDiff{
     .header = "diff --git a/a b/a",
-    .old_path = "a/a",
-    .new_path = "b/a",
+    .old_path = "a",
+    .new_path = "a",
     .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
     .hunks = &.{.{
         .old_start = 1,
@@ -335,8 +335,8 @@ pub const diff_unstaged_projection =
 
 pub const file_with_hunks = diff_parser.FileDiff{
     .header = "diff --git a/a b/a",
-    .old_path = "a/a",
-    .new_path = "b/a",
+    .old_path = "a",
+    .new_path = "a",
     .metadata = &.{ "index 1..2", "--- a/a", "+++ b/a" },
     .hunks = &hunks,
 };
@@ -378,8 +378,8 @@ pub const hunk_second_lines = [_]diff_parser.DiffLine{
 
 pub const file_with_target_metadata = diff_parser.FileDiff{
     .header = "diff --git a/b b/b",
-    .old_path = "a/b",
-    .new_path = "b/b",
+    .old_path = "b",
+    .new_path = "b",
     .metadata = &.{"target metadata"},
     .hunks = &.{},
 };

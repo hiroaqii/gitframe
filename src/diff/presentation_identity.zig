@@ -219,8 +219,8 @@ const CanonicalPaths = struct {
 };
 
 fn canonicalPaths(file: diff_parser.FileDiff) CanonicalPaths {
-    const old = canonicalOptionalPath(file.old_path);
-    const new = canonicalOptionalPath(file.new_path);
+    const old = file.old_path;
+    const new = file.new_path;
     return .{
         .old = old,
         .new = new,
@@ -229,10 +229,6 @@ fn canonicalPaths(file: diff_parser.FileDiff) CanonicalPaths {
         // the current Changes chrome for metadata-only inputs.
         .display = if (new) |path| path else if (old) |path| path else diff_file.displayPath(file),
     };
-}
-
-fn canonicalOptionalPath(path: ?[]const u8) ?[]const u8 {
-    return diff_file.stripGitPathPrefix(path orelse return null);
 }
 
 fn classifyMetadata(line: []const u8) MetadataFact {
@@ -380,8 +376,8 @@ const base_hunks = [_]diff_parser.Hunk{
 fn baseFile() diff_parser.FileDiff {
     return .{
         .header = "diff --git a/src/例.zig b/src/例.zig",
-        .old_path = "a/src/例.zig",
-        .new_path = "b/src/例.zig",
+        .old_path = "src/例.zig",
+        .new_path = "src/例.zig",
         .metadata = &.{
             "index 1111111..2222222 100644",
             "--- a/src/例.zig",
@@ -398,7 +394,7 @@ fn expectMutationUnequal(base: diff_parser.FileDiff, changed: diff_parser.FileDi
     try std.testing.expect(!fingerprint(base).eql(fingerprint(changed)));
 }
 
-test "presentation identity normalizes paths and excludes component-only metadata" {
+test "presentation identity preserves raw paths and excludes component-only metadata" {
     const base = baseFile();
     var equivalent = base;
     equivalent.header = "authority-only header changed";
@@ -414,6 +410,8 @@ test "presentation identity normalizes paths and excludes component-only metadat
 
     try std.testing.expect(exactEqual(base, equivalent));
     try std.testing.expect(fingerprint(base).eql(fingerprint(equivalent)));
+    equivalent.new_path = "a/src/例.zig";
+    try expectMutationUnequal(base, equivalent);
 }
 
 test "canonical metadata is typed ordered and preserves unknown visible rows" {
@@ -466,11 +464,11 @@ test "visible canonical metadata facts and order affect identity" {
 test "paths binary and header fallback affect identity" {
     const base = baseFile();
     var changed = base;
-    changed.old_path = "a/src/old.zig";
+    changed.old_path = "src/old.zig";
     try expectMutationUnequal(base, changed);
 
     changed = base;
-    changed.new_path = "b/src/new.zig";
+    changed.new_path = "src/new.zig";
     try expectMutationUnequal(base, changed);
 
     changed = base;
@@ -670,7 +668,7 @@ test "same A C component pair stays equal when B partition and origins change" {
     changed.metadata = &.{ "old mode 100644", "new mode 100755" };
     try expectMutationUnequal(before.presentation.file, changed);
     changed = after.presentation.file;
-    changed.new_path = "b/src/other.zig";
+    changed.new_path = "src/other.zig";
     try expectMutationUnequal(before.presentation.file, changed);
 
     var changed_hunks = try allocator.dupe(diff_parser.Hunk, after.presentation.file.hunks);

@@ -380,8 +380,8 @@ fn changesContentTestView(page: *const changes_page.ChangesPageState, source: di
 test "repository target maps only a direct unified current-side line" {
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 4,
@@ -423,8 +423,8 @@ test "repository target maps only a direct unified current-side line" {
 test "repository target side-by-side pair uses added line but pure removal has none" {
     const paired: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 7,
@@ -448,8 +448,8 @@ test "repository target side-by-side pair uses added line but pure removal has n
 
     const removed_only: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
-        .old_path = "a/a",
-        .new_path = "b/a",
+        .old_path = "a",
+        .new_path = "a",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 9,
@@ -472,8 +472,8 @@ test "repository target side-by-side pair uses added line but pure removal has n
 test "repository target distinguishes deleted path from removed row in extant file" {
     const deleted: diff_parser.FileDiff = .{
         .header = "diff --git a/old.zig b/old.zig",
-        .old_path = "a/old.zig",
-        .new_path = "/dev/null",
+        .old_path = "old.zig",
+        .new_path = null,
         .metadata = &.{"deleted file mode 100644"},
         .hunks = &.{.{
             .old_start = 1,
@@ -499,8 +499,8 @@ test "repository target distinguishes deleted path from removed row in extant fi
 test "repository target uses metadata-only rename current path" {
     const renamed: diff_parser.FileDiff = .{
         .header = "diff --git a/old.zig b/new.zig",
-        .old_path = null,
-        .new_path = null,
+        .old_path = "old.zig",
+        .new_path = "new.zig",
         .metadata = &.{ "rename from old.zig", "rename to new.zig" },
         .hunks = &.{},
     };

@@ -174,8 +174,8 @@ test "mixed eligibility skips invalid files without shifting valid span indices"
     const files = [_]diff_parser.FileDiff{
         .{
             .header = "diff --git a/invalid.zig b/invalid.zig",
-            .old_path = "a/invalid.zig",
-            .new_path = "b/invalid.zig",
+            .old_path = "invalid.zig",
+            .new_path = "invalid.zig",
             .metadata = &.{},
             .hunks = &.{.{
                 .old_start = 1,
@@ -188,8 +188,8 @@ test "mixed eligibility skips invalid files without shifting valid span indices"
         },
         .{
             .header = "diff --git a/valid.zig b/valid.zig",
-            .old_path = "a/valid.zig",
-            .new_path = "b/valid.zig",
+            .old_path = "valid.zig",
+            .new_path = "valid.zig",
             .metadata = &.{},
             .hunks = &.{.{
                 .old_start = 1,
@@ -242,8 +242,8 @@ test "flow syntax leaves Markdown diff sides undecorated" {
     }};
     const files = [_]diff_parser.FileDiff{.{
         .header = "diff --git a/README.md b/README.md",
-        .old_path = "a/README.md",
-        .new_path = "b/README.md",
+        .old_path = "README.md",
+        .new_path = "README.md",
         .metadata = &.{},
         .hunks = &.{.{
             .old_start = 1,
