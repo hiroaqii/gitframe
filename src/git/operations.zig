@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const git_command = @import("command.zig");
+const git_ref = @import("ref.zig");
 const process_runner = @import("../process/runner.zig");
 
 pub const OperationResult = union(enum) {
@@ -238,13 +239,14 @@ fn runGitCommitLike(allocator: std.mem.Allocator, io: std.Io, context: git_comma
 }
 
 fn runGitSwitchBranch(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, request: SwitchBranchRequest) git_command.Error!OperationResult {
+    if (std.mem.startsWith(u8, request.target_branch, "-")) return .{ .failed_static = "unsupported branch name" };
     if (!try verifyCurrentBranchSnapshot(allocator, io, context, request.expected_branch, request.expected_oid)) {
         return .{ .failed_static = "Branch changed before switch; reload and try again" };
     }
     if (!try verifyBranchOid(allocator, io, context, request.target_branch, request.target_oid)) {
         return .{ .failed_static = "branch list changed; reopen branch switch and try again" };
     }
-    const argv = [_][]const u8{ "git", "switch", "--no-guess", request.target_branch };
+    const argv = [_][]const u8{ "git", "switch", "--no-guess", "--", request.target_branch };
     const result = try runCaptured(allocator, io, context, &argv, .limited(128 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git switch");
 }
@@ -257,14 +259,17 @@ fn verifyCurrentBranchSnapshot(allocator: std.mem.Allocator, io: std.Io, context
 
 /// Returns an owned live HEAD only while the requested branch is current.
 pub fn readCurrentBranchOid(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, branch: ?[]const u8) git_command.Error!?[]u8 {
-    const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
+    const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "HEAD" };
     const branch_result = try runCaptured(allocator, io, context, &branch_argv, .limited(4 * 1024), .limited(16 * 1024));
     defer branch_result.deinit(allocator);
     switch (branch_result.term) {
         .exited => |code| if (code != (if (branch != null) @as(u8, 0) else @as(u8, 1))) return null,
         else => return null,
     }
-    if (branch) |name| if (!std.mem.eql(u8, trimLineEnd(branch_result.stdout), name)) return null;
+    if (branch) |name| {
+        const actual = git_ref.localBranchName(trimLineEnd(branch_result.stdout)) orelse return null;
+        if (!std.mem.eql(u8, actual, name)) return null;
+    }
 
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
     const oid_result = try runCaptured(allocator, io, context, &oid_argv, .limited(4 * 1024), .limited(16 * 1024));
@@ -615,7 +620,7 @@ test "operations switch branch rejects changed target oid" {
     }
 }
 
-test "operations switch branch carries staged unstaged and untracked changes" {
+test "operations switch exact local names and reject special names while preserving local changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -629,27 +634,41 @@ test "operations switch branch carries staged unstaged and untracked changes" {
     try work.writeFile(io, .{ .sub_path = "local.txt", .data = "untracked\n" });
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
-    const result = try runOperation(std.testing.allocator, io, .{
-        .context = .{ .cwd = work, .environment = &environment },
-        .kind = .{ .switch_branch = .{ .expected_branch = "main", .expected_oid = fixture.main_oid, .target_branch = "feature/topic", .target_oid = fixture.feature_oid } },
-    });
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result == .ok);
-    const current = try gitOutputAlloc(io, work, &.{ "git", "branch", "--show-current" });
-    defer std.testing.allocator.free(current);
-    try std.testing.expectEqualStrings("feature/topic", trimLineEnd(current));
-    const staged = try gitOutputAlloc(io, work, &.{ "git", "show", ":README.md" });
-    defer std.testing.allocator.free(staged);
-    try std.testing.expectEqualStrings("staged\n", staged);
-    const unstaged = try work.readFileAlloc(io, "README.md", std.testing.allocator, .limited(1024));
-    defer std.testing.allocator.free(unstaged);
-    try std.testing.expectEqualStrings("unstaged\n", unstaged);
-    const untracked = try work.readFileAlloc(io, "local.txt", std.testing.allocator, .limited(1024));
-    defer std.testing.allocator.free(untracked);
-    try std.testing.expectEqualStrings("untracked\n", untracked);
-    const status = try gitOutputAlloc(io, work, &.{ "git", "status", "--porcelain=v1" });
-    defer std.testing.allocator.free(status);
-    try std.testing.expectEqualStrings("MM README.md\n?? local.txt\n", status);
+    try runTestGit(io, &.{ "git", "tag", "main" }, work);
+    try runTestGit(io, &.{ "git", "tag", "topic" }, work);
+    for ([_][]const u8{ "plain", "feature/topic", "topic", "--detach", "-" }) |target| {
+        try runTestGit(io, &.{ "git", "switch", "--", "main" }, work);
+        const full_ref = try std.fmt.allocPrint(std.testing.allocator, "refs/heads/{s}", .{target});
+        defer std.testing.allocator.free(full_ref);
+        try runTestGit(io, &.{ "git", "update-ref", full_ref, fixture.feature_oid }, work);
+        const unsupported = std.mem.startsWith(u8, target, "-");
+        const result = try runOperation(std.testing.allocator, io, .{
+            .context = .{ .cwd = work, .environment = &environment },
+            .kind = .{ .switch_branch = .{ .expected_branch = "main", .expected_oid = fixture.main_oid, .target_branch = target, .target_oid = fixture.feature_oid } },
+        });
+        defer result.deinit(std.testing.allocator);
+        if (unsupported) {
+            try std.testing.expect(result == .failed_static);
+            try std.testing.expectEqualStrings("unsupported branch name", result.failed_static);
+        } else {
+            try std.testing.expect(result == .ok);
+        }
+        const current = try gitOutputAlloc(io, work, &.{ "git", "symbolic-ref", "HEAD" });
+        defer std.testing.allocator.free(current);
+        try std.testing.expectEqualStrings(if (unsupported) "refs/heads/main" else full_ref, trimLineEnd(current));
+        const staged = try gitOutputAlloc(io, work, &.{ "git", "show", ":README.md" });
+        defer std.testing.allocator.free(staged);
+        try std.testing.expectEqualStrings("staged\n", staged);
+        const unstaged = try work.readFileAlloc(io, "README.md", std.testing.allocator, .limited(1024));
+        defer std.testing.allocator.free(unstaged);
+        try std.testing.expectEqualStrings("unstaged\n", unstaged);
+        const untracked = try work.readFileAlloc(io, "local.txt", std.testing.allocator, .limited(1024));
+        defer std.testing.allocator.free(untracked);
+        try std.testing.expectEqualStrings("untracked\n", untracked);
+        const status = try gitOutputAlloc(io, work, &.{ "git", "status", "--porcelain=v1" });
+        defer std.testing.allocator.free(status);
+        try std.testing.expectEqualStrings("MM README.md\n?? local.txt\n", status);
+    }
 }
 
 test "operations switch branch preserves local state when Git refuses an overwrite" {

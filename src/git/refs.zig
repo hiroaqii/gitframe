@@ -108,13 +108,14 @@ pub fn loadBranchStatus(
     var builder = git_branch_status.Builder.init(allocator);
     defer builder.deinit();
 
-    const head_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
+    const head_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "HEAD" };
     const head_result = try runBranchCommand(allocator, io, request.context, &head_argv, .limited(4 * 1024));
     defer head_result.deinit(allocator);
 
     switch (head_result.term) {
         .exited => |code| if (code == 0) {
-            try builder.setBranchHead(trimLineEnd(head_result.stdout));
+            const branch = git_ref.localBranchName(trimLineEnd(head_result.stdout)) orelse return .{ .failed_static = "invalid local HEAD ref" };
+            try builder.setBranchHead(branch);
         } else {
             builder.setDetached();
         },
@@ -177,7 +178,7 @@ fn loadBranchListWithLimit(
     request: BranchListRequest,
     list_stdout_limit: std.Io.Limit,
 ) git_command.Error!BranchListLoadResult {
-    const current_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
+    const current_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "HEAD" };
     const current_result = try runBranchCommand(allocator, io, request.context, &current_argv, .limited(4 * 1024));
     defer current_result.deinit(allocator);
 
@@ -234,7 +235,8 @@ fn branchListResultFromCommandResultsWithOptions(
     defer if (current) |owned| allocator.free(owned);
     switch (current_result.term) {
         .exited => |code| if (code == 0) {
-            current = allocator.dupe(u8, trimLineEnd(current_result.stdout)) catch return error.OutOfMemory;
+            const branch = git_ref.localBranchName(trimLineEnd(current_result.stdout)) orelse return .{ .failed_static = "invalid local HEAD ref" };
+            current = allocator.dupe(u8, branch) catch return error.OutOfMemory;
         },
         else => {},
     }
@@ -306,7 +308,7 @@ fn branchListResultFromCommandResultsWithOptions(
             .name = owned_name,
             .kind = kind,
             .oid = owned_oid,
-            .current = kind == .local and current != null and std.mem.eql(u8, current.?, name),
+            .current = kind == .local and current != null and std.mem.eql(u8, trimLineEnd(current_result.stdout), full_ref),
             .tip_committer_unix = tip_committer_unix,
             .worktree_path = owned_path,
         }) catch {
@@ -382,7 +384,7 @@ test "skipBranchListRecordSeparators preserves branch name after for-each-ref ne
 }
 
 test "branch list non-zero result releases current and preserves stderr" {
-    var current_stdout = "main\n".*;
+    var current_stdout = "refs/heads/main\n".*;
     var list_stderr = "fatal: branch list failed\n".*;
     var empty: [0]u8 = .{};
     const result = try branchListResultFromCommandResults(
@@ -399,7 +401,7 @@ test "branch list non-zero result releases current and preserves stderr" {
 }
 
 test "branch list abnormal result releases current and preserves termination" {
-    var current_stdout = "main\n".*;
+    var current_stdout = "refs/heads/main\n".*;
     var empty: [0]u8 = .{};
     const result = try branchListResultFromCommandResults(
         std.testing.allocator,
@@ -418,7 +420,7 @@ test "branch list abnormal result releases current and preserves termination" {
 }
 
 test "branch list diagnostic allocation failure releases current" {
-    var current_stdout = "main\n".*;
+    var current_stdout = "refs/heads/main\n".*;
     var list_stderr = "fatal: branch list failed\n".*;
     var empty: [0]u8 = .{};
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
@@ -431,7 +433,7 @@ test "branch list diagnostic allocation failure releases current" {
 }
 
 test "branch list success transfers current ownership exactly once" {
-    var current_stdout = "main\n".*;
+    var current_stdout = "refs/heads/main\n".*;
     var list_stdout = "refs/heads/main\x00main\x00abc\x00\x001700000001\x00\nrefs/heads/feature/topic\x00feature/topic\x00def\x00\x001700000002\x00".*;
     var empty: [0]u8 = .{};
     const result = try branchListResultFromCommandResults(
@@ -458,7 +460,7 @@ test "branch list success transfers current ownership exactly once" {
 }
 
 test "branch list typed tip time parses per item without reordering or whole-list failure" {
-    var current_stdout = "main\n".*;
+    var current_stdout = "refs/heads/main\n".*;
     var list_stdout = ("refs/heads/zeta\x00zeta\x00abc\x00\x001700000001\x00\n" ++
         "refs/heads/alpha\x00alpha\x00def\x00\x00not-a-time\x00\n" ++
         "refs/remotes/origin/topic\x00origin/topic\x00123\x00\x001700000003\x00").*;
@@ -497,6 +499,7 @@ test "refs loads local branch list without record separator newlines" {
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
 
+    try runTestGit(io, &.{ "git", "tag", "main" }, work);
     const result = try loadBranchList(std.testing.allocator, io, .{
         .context = .{ .cwd = work, .environment = &environment },
         .scope = .local,
@@ -508,7 +511,7 @@ test "refs loads local branch list without record separator newlines" {
         .failed, .failed_static => return error.ExpectedBranchList,
     };
     try std.testing.expectEqualStrings("main", list.current.?);
-    try expectBranchListed(list.branches, "main");
+    try expectBranchListed(list.branches, "heads/main");
     try expectBranchListed(list.branches, "feature/topic");
     try expectBranchNotListed(list.branches, "origin/remote-only");
     const main = branchByFullRef(list.branches, "refs/heads/main") orelse return error.ExpectedBranchListed;
@@ -676,6 +679,7 @@ test "refs loads branch status without upstream" {
     try tmp.dir.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
     try runTestGit(io, &.{ "git", "add", "README.md" }, tmp.dir);
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "tag", "main" }, tmp.dir);
     var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
 

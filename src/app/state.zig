@@ -2,6 +2,7 @@ const std = @import("std");
 const ui = @import("chasen_ui");
 const app_prompt = @import("prompt.zig");
 const git_branch_status = @import("../git/branch_status.zig");
+const git_ref = @import("../git/ref.zig");
 const git_push = @import("../git/push.zig");
 const loaded_diff = @import("../loaded_diff.zig");
 const content_selection = @import("diff_surface/selection.zig");
@@ -247,6 +248,7 @@ pub const PullConfirmation = struct {
 };
 
 pub const BranchSwitchItem = struct {
+    full_ref: []u8,
     name: []u8,
     oid: []u8,
     current: bool,
@@ -254,11 +256,13 @@ pub const BranchSwitchItem = struct {
     worktree_path: ?[]u8 = null,
 
     pub fn action(self: BranchSwitchItem, current_branch: []const u8) enum { close, checkout, open_worktree } {
-        if (self.current or std.mem.eql(u8, self.name, current_branch)) return .close;
+        const local_name = git_ref.localBranchName(self.full_ref);
+        if (self.current or (local_name != null and std.mem.eql(u8, local_name.?, current_branch))) return .close;
         return if (self.worktree_path != null) .open_worktree else .checkout;
     }
 
     pub fn deinit(self: *BranchSwitchItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.full_ref);
         allocator.free(self.name);
         allocator.free(self.oid);
         if (self.worktree_path) |path| allocator.free(path);

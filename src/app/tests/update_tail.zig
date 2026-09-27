@@ -263,7 +263,9 @@ test "branch time pickers sample one real-clock snapshot at every non-skipped re
     var repo_root = "/repo".*;
     var branch = "main".*;
     var oid = "abc123".*;
+    var full_ref = "refs/heads/main".*;
     var branches = [_]app_state.BranchSwitchItem{.{
+        .full_ref = &full_ref,
         .name = &branch,
         .oid = &oid,
         .current = true,
@@ -306,7 +308,9 @@ test "branch time pickers fail closed for unavailable and zero-resolution real c
     var repo_root = "/repo".*;
     var branch = "main".*;
     var oid = "abc123".*;
+    var full_ref = "refs/heads/main".*;
     var branches = [_]app_state.BranchSwitchItem{.{
+        .full_ref = &full_ref,
         .name = &branch,
         .oid = &oid,
         .current = true,

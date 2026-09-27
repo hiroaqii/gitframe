@@ -3727,9 +3727,12 @@ fn branchSwitchStateForViewTest(
     var initialized: usize = 0;
     errdefer for (branches[0..initialized]) |*branch| branch.deinit(allocator);
     for (specs, branches) |spec, *branch| {
+        const full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{spec.name});
+        errdefer allocator.free(full_ref);
         const name = try allocator.dupe(u8, spec.name);
         errdefer allocator.free(name);
         branch.* = .{
+            .full_ref = full_ref,
             .name = name,
             .oid = try allocator.dupe(u8, "abc123"),
             .current = spec.current,

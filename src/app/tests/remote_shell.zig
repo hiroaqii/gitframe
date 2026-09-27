@@ -1925,6 +1925,7 @@ test "branch switch filter routes text selection and cancellation through the sh
     state.branches = try allocator.alloc(app_state.BranchSwitchItem, 3);
     for ([_][]const u8{ "main", "feature/qjk-one", "feature/qjk-two" }, state.branches, 0..) |name, *branch, index| {
         branch.* = .{
+            .full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{name}),
             .name = try allocator.dupe(u8, name),
             .oid = try allocator.dupe(u8, "abc"),
             .current = index == 0,

@@ -6,6 +6,7 @@ const actions = @import("actions.zig");
 const app_state = @import("state.zig");
 const git_command = @import("../git/command.zig");
 const refs = @import("../git/refs.zig");
+const git_ref = @import("../git/ref.zig");
 const discovery = @import("../repo/discovery.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
@@ -120,7 +121,8 @@ pub fn prepare(
     };
     var matches = false;
     for (list.branches) |item| {
-        if (std.mem.eql(u8, item.name, branch)) {
+        const local_name = git_ref.localBranchName(item.full_ref) orelse continue;
+        if (std.mem.eql(u8, local_name, branch)) {
             matches = if (item.worktree_path) |current_path| std.mem.eql(u8, current_path, path) else false;
             break;
         }
@@ -134,9 +136,10 @@ pub fn prepare(
     if (found != .single_repo or !std.mem.eql(u8, found.single_repo.canonical_root, path)) return error.WorktreeMappingChanged;
 
     const target: git_command.DirectoryContext = .{ .cwd = root.dir(), .environment = source.environment };
-    const current_branch = try readValue(allocator, io, target, &.{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" });
+    const current_branch = try readValue(allocator, io, target, &.{ "git", "symbolic-ref", "--quiet", "HEAD" });
     defer allocator.free(current_branch);
-    if (!std.mem.eql(u8, current_branch, branch)) return error.WorktreeMappingChanged;
+    const local_name = git_ref.localBranchName(current_branch) orelse return error.WorktreeMappingChanged;
+    if (!std.mem.eql(u8, local_name, branch)) return error.WorktreeMappingChanged;
     const source_common = try commonIdentity(allocator, io, source);
     const target_common = try commonIdentity(allocator, io, target);
     if (!source_common.eql(target_common)) return error.WorktreeRepositoryChanged;
@@ -203,6 +206,8 @@ test "worktree preparation verifies live mapping in both directions without carr
     try testGit(main, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
     try testGit(main, &.{ "git", "branch", "free" });
     try testGit(main, &.{ "git", "worktree", "add", "-b", "linked", linked_path });
+    try testGit(main, &.{ "git", "tag", "main" });
+    try testGit(main, &.{ "git", "tag", "linked" });
     const canonical = try tmp.dir.realPathFileAlloc(io, "linked tree", allocator);
     defer allocator.free(canonical);
     var linked_dir = try tmp.dir.openDir(io, "linked tree", .{});

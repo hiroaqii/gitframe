@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const git_push = @import("push.zig");
 const git_command = @import("command.zig");
+const git_ref = @import("ref.zig");
 const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
@@ -1371,12 +1372,12 @@ fn secureRemoteBranchSnapshotMatches(
     branch: []const u8,
     oid: []const u8,
 ) RemoteCheck {
-    const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" };
+    const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "HEAD" };
     var branch_command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &branch_argv);
     defer branch_command.deinit();
     if (commandFailure(&branch_command, false)) |failure| return .{ .failed = failure };
     const actual_branch = switch (branch_command) {
-        .completed => |*result| trimLineEnd(result.stdout.bytes()),
+        .completed => |*result| git_ref.localBranchName(trimLineEnd(result.stdout.bytes())) orelse return .mismatch,
         else => unreachable,
     };
     if (!std.mem.eql(u8, actual_branch, branch)) return .mismatch;

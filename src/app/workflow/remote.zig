@@ -32,6 +32,7 @@ const remote_state = @import("remote_state.zig");
 const git_remote = @import("../../git/remote.zig");
 const git_command = @import("../../git/command.zig");
 const git_refs = @import("../../git/refs.zig");
+const git_ref = @import("../../git/ref.zig");
 const root_capability = @import("../../repo/root_capability.zig");
 const worktree_switch = @import("../worktree_switch.zig");
 
@@ -558,6 +559,8 @@ pub const Controller = struct {
         if (self.lifecycle.view().hasPending()) return status.set("another git action is running", .{});
 
         const selected = branch_switch.selectedItem() orelse return;
+        const local_name = git_ref.localBranchName(selected.full_ref) orelse return status.set("unsupported branch ref", .{});
+        if (std.mem.startsWith(u8, local_name, "-")) return status.set("unsupported branch name", .{});
         if (selected.action(branch_switch.current_branch) == .close) {
             status.set("already on branch: {s}", .{branch_switch.current_branch});
             self.clearBranchSwitch(ctx.allocator());
@@ -571,7 +574,7 @@ pub const Controller = struct {
                 branch_switch.generation,
                 self.repo.activeCapability().?.*,
                 self.env_map,
-                selected.name,
+                local_name,
                 selected.worktree_path.?,
             );
             errdefer task.destroy(ctx.allocator());
@@ -598,7 +601,7 @@ pub const Controller = struct {
         request.repo_root = try ctx.allocator().dupe(u8, branch_switch.repo_root);
         request.expected_branch = try ctx.allocator().dupe(u8, branch_switch.current_branch);
         request.expected_oid = try ctx.allocator().dupe(u8, branch_switch.current_oid);
-        request.target_branch = try ctx.allocator().dupe(u8, selected.name);
+        request.target_branch = try ctx.allocator().dupe(u8, local_name);
         request.target_oid = try ctx.allocator().dupe(u8, selected.oid);
         const prepared = self.lifecycle.prepare(.switch_branch);
         errdefer self.lifecycle.rejectSpawn(prepared);
@@ -818,7 +821,8 @@ pub const Controller = struct {
                 // on any Changes activation or file/status read.
                 var oid: ?[]const u8 = null;
                 if (list.current) |current| for (list.branches) |branch| {
-                    if (branch.kind == .local and std.mem.eql(u8, branch.name, current)) {
+                    const local_name = git_ref.localBranchName(branch.full_ref) orelse continue;
+                    if (branch.kind == .local and std.mem.eql(u8, local_name, current)) {
                         oid = branch.oid;
                         break;
                     }
@@ -1448,12 +1452,14 @@ fn copyBranchSwitchItems(allocator: std.mem.Allocator, source: []const git_refs.
     errdefer for (items[0..initialized]) |*item| item.deinit(allocator);
     for (source, 0..) |branch, index| {
         items[index] = .{
+            .full_ref = &.{},
             .name = try allocator.dupe(u8, branch.name),
             .oid = &.{},
             .current = branch.current,
             .tip_committer_unix = branch.tip_committer_unix,
         };
         initialized += 1;
+        items[index].full_ref = try allocator.dupe(u8, branch.full_ref);
         items[index].oid = try allocator.dupe(u8, branch.oid);
         if (branch.worktree_path) |path| items[index].worktree_path = try allocator.dupe(u8, path);
     }

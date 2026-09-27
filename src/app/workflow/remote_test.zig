@@ -428,12 +428,16 @@ fn branchSwitchItemsForTest(
     errdefer for (items[0..initialized]) |*item| item.deinit(allocator);
     for (specs, 0..) |spec, index| {
         items[index] = .{
-            .name = try allocator.dupe(u8, spec.name),
-            .oid = try allocator.dupe(u8, spec.oid),
+            .full_ref = &.{},
+            .name = &.{},
+            .oid = &.{},
             .current = spec.current,
             .tip_committer_unix = spec.tip_committer_unix,
         };
         initialized += 1;
+        items[index].full_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{spec.name});
+        items[index].name = try allocator.dupe(u8, spec.name);
+        items[index].oid = try allocator.dupe(u8, spec.oid);
     }
     return items;
 }
@@ -815,7 +819,9 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try accepted.writeFile(io, .{ .sub_path = "A.txt", .data = "accepted\n" });
     try runAppTestGit(allocator, io, &.{ "git", "add", "A.txt" }, accepted);
     try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "accepted" }, accepted);
-    try runAppTestGit(allocator, io, &.{ "git", "branch", "accepted-only" }, accepted);
+    try runAppTestGit(allocator, io, &.{ "git", "branch", "feature/topic" }, accepted);
+    try runAppTestGit(allocator, io, &.{ "git", "tag", "main" }, accepted);
+    try runAppTestGit(allocator, io, &.{ "git", "tag", "feature/topic" }, accepted);
     try runAppTestGit(allocator, io, &.{ "git", "init", "--initial-branch=replacement" }, replacement);
     try replacement.writeFile(io, .{ .sub_path = "B.txt", .data = "replacement\n" });
     try runAppTestGit(allocator, io, &.{ "git", "add", "B.txt" }, replacement);
@@ -882,14 +888,14 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     var saw_accepted = false;
     var saw_replacement = false;
     for (list.branches) |branch| {
-        saw_accepted = saw_accepted or std.mem.eql(u8, branch.name, "accepted-only");
+        saw_accepted = saw_accepted or std.mem.eql(u8, branch.full_ref, "refs/heads/feature/topic");
         saw_replacement = saw_replacement or std.mem.eql(u8, branch.name, "replacement-only");
         try std.testing.expect(branch.tip_committer_unix != null);
     }
     try std.testing.expect(saw_accepted);
     try std.testing.expect(!saw_replacement);
 
-    // Apply the accepted list, then abandon a queued switch. The switch task
+    // Apply the accepted list, then execute its exact local branch. The switch task
     // owns a second duplicate of the same physical A descriptor and a
     // selector-free environment snapshot even though the display path now
     // resolves to replacement B.
@@ -898,6 +904,19 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     const expected_oid = try allocator.dupe(u8, app.remote_workflow.branch_switch.current_oid);
     defer allocator.free(expected_oid);
     try std.testing.expect(expected_oid.len == 40);
+    const selected = &app.remote_workflow.branch_switch.branches[app.remote_workflow.branch_switch.selected_index];
+    for ([_][]const u8{ "refs/heads/--detach", "refs/heads/-" }) |special_ref| {
+        const original_ref = selected.full_ref;
+        selected.full_ref = try allocator.dupe(u8, special_ref);
+        defer {
+            allocator.free(selected.full_ref);
+            selected.full_ref = original_ref;
+        }
+        try app.confirmBranchSwitch(&ctx);
+        try std.testing.expectEqualStrings("unsupported branch name", app.repository_status.text());
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+    }
     const DummyConfirmTask = struct {
         fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!RemoteHarness.Msg {
             return .quit;
@@ -920,7 +939,14 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try std.testing.expectEqual(page.Id.repository, app.remote_workflow.branch_switch_pending.?.owner.origin.page_id);
     const switch_entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), switch_entries.len);
-    switch_entries[0].discard(allocator);
+    const switched_msg = try switch_entries[0].run(allocator, io);
+    var switched = switched_msg.action_finished.switch_branch;
+    defer switched.deinit(allocator);
+    try std.testing.expectEqualStrings("feature/topic", switched.new_branch);
+    try std.testing.expect(switched.result == .ok);
+    const actual = try appGitOutputAlloc(allocator, io, accepted, &.{ "git", "symbolic-ref", "HEAD" });
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings("refs/heads/feature/topic\n", actual);
 
     // Task admission failure rolls back the newly owned popup snapshot and
     // leaves no pending branch-list correlation behind.
