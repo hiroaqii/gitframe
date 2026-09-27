@@ -117,12 +117,15 @@ pub const ControlledFailure = union(enum) {
     }
 };
 
+/// Whether a child was spawned before cancellation or timeout was accepted.
+pub const SpawnPhase = enum { not_started, started };
+
 /// A controlled run returns captured output only when the direct child
 /// completes before cancellation or timeout is accepted.
 pub const ControlledResult = union(enum) {
     completed: CapturedResult,
-    canceled,
-    timed_out,
+    canceled: SpawnPhase,
+    timed_out: SpawnPhase,
     failed: ControlledFailure,
 
     pub fn deinit(self: *ControlledResult, allocator: std.mem.Allocator) void {
@@ -927,8 +930,8 @@ fn runWithStdinControlledInternal(
     const previous_cancel_protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(previous_cancel_protection);
     if (pollControl(io, control)) |terminal| return switch (terminal) {
-        .canceled => .canceled,
-        .timed_out => .timed_out,
+        .canceled => .{ .canceled = .not_started },
+        .timed_out => .{ .timed_out = .not_started },
     };
 
     var child = std.process.spawn(io, .{
@@ -1052,8 +1055,8 @@ fn runWithStdinControlledInternal(
     if (terminate_error) |err| return .{ .failed = .{ .terminate = err } };
     if (observer_error) |err| return .{ .failed = .{ .wait = err } };
     if (stopped) |terminal| return switch (terminal) {
-        .canceled => .canceled,
-        .timed_out => .timed_out,
+        .canceled => .{ .canceled = .started },
+        .timed_out => .{ .timed_out = .started },
     };
     if (capture_error) |err| return .{ .failed = .{ .capture = err } };
     if (drain_error) |err| return .{ .failed = .{ .capture = err } };
@@ -1092,8 +1095,8 @@ fn runCapturedControlledInternal(
     defer _ = io.swapCancelProtection(previous_cancel_protection);
 
     if (pollControl(io, control)) |terminal| return switch (terminal) {
-        .canceled => .canceled,
-        .timed_out => .timed_out,
+        .canceled => .{ .canceled = .not_started },
+        .timed_out => .{ .timed_out = .not_started },
     };
 
     var child = std.process.spawn(io, .{
@@ -1184,8 +1187,8 @@ fn runCapturedControlledInternal(
         if (cleanup_failure) |failure| return .{ .failed = failure };
         if (capture_error) |err| return .{ .failed = .{ .capture = err } };
         return switch (stopped.?) {
-            .canceled => .canceled,
-            .timed_out => .timed_out,
+            .canceled => .{ .canceled = .started },
+            .timed_out => .{ .timed_out = .started },
         };
     }
 
@@ -1194,8 +1197,8 @@ fn runCapturedControlledInternal(
     return switch (wait_result) {
         .completed => |term| finishControlledCapture(allocator, &multi_reader, capture_mode, term),
         .stopped => |terminal| switch (terminal) {
-            .canceled => .canceled,
-            .timed_out => .timed_out,
+            .canceled => .{ .canceled = .started },
+            .timed_out => .{ .timed_out = .started },
         },
         .failed => |failure| .{ .failed = failure },
     };
@@ -1694,6 +1697,7 @@ test "process cancel is generation scoped before and during a controlled run" {
     } });
     defer canceled_before_spawn.deinit(std.testing.allocator);
     try std.testing.expect(canceled_before_spawn == .canceled);
+    try std.testing.expectEqual(SpawnPhase.not_started, canceled_before_spawn.canceled);
 
     canceled_generation.store(0, .release);
     var cancel_future = try std.testing.io.concurrent(cancellationAfter, .{
@@ -1715,6 +1719,7 @@ test "process cancel is generation scoped before and during a controlled run" {
     defer canceled.deinit(std.testing.allocator);
     try cancel_future.await(std.testing.io);
     try std.testing.expect(canceled == .canceled);
+    try std.testing.expectEqual(SpawnPhase.started, canceled.canceled);
 }
 
 test "process timeout uses an absolute deadline before spawn and while running" {
@@ -1734,6 +1739,7 @@ test "process timeout uses an absolute deadline before spawn and while running" 
     }, .ordinary, .{ .deadline = expired_deadline });
     defer expired.deinit(std.testing.allocator);
     try std.testing.expect(expired == .timed_out);
+    try std.testing.expectEqual(SpawnPhase.not_started, expired.timed_out);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "marker", .{}));
 
     const hanging_argv = [_][]const u8{ "sh", "-c", "trap '' TERM; while :; do sleep 1; done" };
@@ -1748,6 +1754,7 @@ test "process timeout uses an absolute deadline before spawn and while running" 
     }, .ordinary, .{ .deadline = deadline }, .{ .terminate_grace = .fromMilliseconds(20) });
     defer timed_out.deinit(std.testing.allocator);
     try std.testing.expect(timed_out == .timed_out);
+    try std.testing.expectEqual(SpawnPhase.started, timed_out.timed_out);
 }
 
 test "process cancel completion race prefers a ready child result" {
@@ -2067,7 +2074,16 @@ test "controlled stdin empties background process groups before one final reap" 
     const argv = [_][]const u8{
         "/bin/sh",
         "-c",
-        "sh -c 'trap \"\" TERM; printf \"%s\" \"$$\" > descendant.pid; while :; do sleep 1; done' & printf ok; exit 0",
+        \\sh -c 'trap "" TERM; printf "%s" "$$" > descendant.pid; while :; do sleep 1; done' &
+        \\i=0
+        \\while [ ! -s descendant.pid ]; do
+        \\    i=$((i + 1))
+        \\    [ "$i" -lt 100 ] || exit 1
+        \\    sleep 0.01
+        \\done
+        \\printf ok
+        \\exit 0
+        ,
     };
     var result = runWithStdinControlledInternal(allocator, io, .{
         .argv = &argv,
@@ -2115,6 +2131,7 @@ test "controlled stdin cancel and timeout kill TERM-ignoring groups" {
     }, .sensitive, .{ .deadline = deadline }, .{ .terminate_grace = .fromMilliseconds(20) });
     defer timed_out.deinit(allocator);
     try std.testing.expect(timed_out == .timed_out);
+    try std.testing.expectEqual(SpawnPhase.started, timed_out.timed_out);
 
     var canceled_generation: std.atomic.Value(u64) = .init(27);
     var canceled = runWithStdinControlled(allocator, io, .{
@@ -2126,4 +2143,5 @@ test "controlled stdin cancel and timeout kill TERM-ignoring groups" {
     } });
     defer canceled.deinit(allocator);
     try std.testing.expect(canceled == .canceled);
+    try std.testing.expectEqual(SpawnPhase.not_started, canceled.canceled);
 }

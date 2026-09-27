@@ -1802,39 +1802,42 @@ test "remote cancel terminal drops retry authority and requires reload before de
     try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, "outcome is unknown") != null);
 }
 
-test "remote timeout terminal drops retry authority and requires reload" {
-    const allocator = std.testing.allocator;
-    var app: RemoteHarness = .{ .allocator = allocator };
-    const repo_root = try installCurrentRepoForTest(&app, allocator);
-    defer app.repo_session.repo_state.deinit(allocator);
-    defer app.clearRemoteError(allocator);
-    activateChanges(&app);
+test "remote uncertain and pre-update stop terminals drop retry authority" {
+    for ([_]git_remote.RemoteFailure{ .outcome_unknown, .timed_out_outcome_unknown, .canceled, .timed_out }) |failure| {
+        const allocator = std.testing.allocator;
+        var app: RemoteHarness = .{ .allocator = allocator };
+        const repo_root = try installCurrentRepoForTest(&app, allocator);
+        defer app.repo_session.repo_state.deinit(allocator);
+        defer app.clearRemoteError(allocator);
+        activateChanges(&app);
 
-    const pending = beginAcceptedTestAction(&app, .push);
-    app.remote_workflow.action_control.begin(pending.generation);
-    const outcome = try app.remoteWorkflow().finishPush(allocator, .{
-        .pending = pending,
-        .identity = .{
-            .repo_epoch = app.repoSessionView().epoch(),
-            .root_identity = app.repoSessionView().activeIdentity().?,
-            .operation_generation = pending.generation,
-        },
-        .mode = .upstream,
-        .repo_root = try allocator.dupe(u8, repo_root),
-        .branch = try allocator.dupe(u8, "main"),
-        .remote = try allocator.dupe(u8, "origin"),
-        .remote_branch = try allocator.dupe(u8, "main"),
-        .oid = try allocator.dupe(u8, "abc123"),
-        .result = .{
-            .outcome = .{ .failed = .timed_out_outcome_unknown },
-        },
-    });
+        const pending = beginAcceptedTestAction(&app, .push);
+        app.remote_workflow.action_control.begin(pending.generation);
+        const outcome = try app.remoteWorkflow().finishPush(allocator, .{
+            .pending = pending,
+            .identity = .{
+                .repo_epoch = app.repoSessionView().epoch(),
+                .root_identity = app.repoSessionView().activeIdentity().?,
+                .operation_generation = pending.generation,
+            },
+            .mode = .upstream,
+            .repo_root = try allocator.dupe(u8, repo_root),
+            .branch = try allocator.dupe(u8, "main"),
+            .remote = try allocator.dupe(u8, "origin"),
+            .remote_branch = try allocator.dupe(u8, "main"),
+            .oid = try allocator.dupe(u8, "abc123"),
+            .result = .{
+                .outcome = .{ .failed = failure },
+            },
+        });
 
-    try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, outcome.reload);
-    try std.testing.expect(!outcome.quit_after_terminal);
-    try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, "timed out") != null);
+        const unknown = failure == .outcome_unknown or failure == .timed_out_outcome_unknown;
+        if (unknown) try std.testing.expect(outcome.reload == .source_and_aux) else try std.testing.expect(outcome.reload == .none);
+        try std.testing.expect(!outcome.quit_after_terminal);
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
+        try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, if (unknown) "unknown" else "before repository updates") != null);
+    }
 }
 
 test "clearRemoteError frees retained retry target" {

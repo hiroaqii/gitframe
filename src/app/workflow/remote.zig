@@ -676,7 +676,8 @@ pub const Controller = struct {
             },
             .failed => |failure| {
                 self.setRemoteFailureStatus(result.result.warnings, .push, failure);
-                const retry_allowed = failure != .http_userinfo_rejected and !remoteOutcomeUnknown(failure);
+                const retry_allowed = failure != .http_userinfo_rejected and
+                    failure != .canceled and failure != .timed_out and !remoteOutcomeUnknown(failure);
                 const retry_target = if (retry_allowed) try pushRetryTargetFromFinished(allocator, result) else null;
                 errdefer if (retry_target) |owned_target| {
                     var target = owned_target;
@@ -1369,7 +1370,7 @@ fn isBackgroundRemoteKind(kind: app_actions.ActionKind) bool {
 }
 
 fn remoteOutcomeUnknown(failure: git_remote.RemoteFailure) bool {
-    return failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown;
+    return failure == .outcome_unknown or failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown;
 }
 
 fn pullFailureHasDetails(failure: git_remote.RemoteFailure) bool {
@@ -1386,6 +1387,9 @@ fn remoteFailureMessage(kind: RemotePresentationKind, failure: git_remote.Remote
             "authentication is required; configure a credential helper or retry in an external terminal",
         .ssh_public_key => "SSH public-key authentication failed; check ssh-agent and repository access",
         .http_userinfo_rejected => "remote URL contains embedded user information; replace it with a credential-free URL",
+        .canceled => "remote operation canceled before repository updates",
+        .timed_out => "remote operation timed out before repository updates",
+        .outcome_unknown => "remote operation outcome is unknown; repository reload required",
         .canceled_outcome_unknown => "remote operation canceled; outcome is unknown; repository reload required",
         .timed_out_outcome_unknown => "remote operation timed out; outcome is unknown; repository reload required",
         .spawn_failed => "remote command could not be started",

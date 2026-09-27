@@ -47,6 +47,9 @@ pub const RemoteFailure = enum {
     authentication_required,
     ssh_public_key,
     http_userinfo_rejected,
+    canceled,
+    timed_out,
+    outcome_unknown,
     canceled_outcome_unknown,
     timed_out_outcome_unknown,
     spawn_failed,
@@ -242,16 +245,16 @@ const max_remote_diagnostic_bytes = 256 * 1024;
 
 const SensitiveRemoteCommand = union(enum) {
     completed: process_runner.SensitiveResult,
-    canceled,
-    timed_out,
-    failed: RemoteFailure,
+    canceled: process_runner.SpawnPhase,
+    timed_out: process_runner.SpawnPhase,
+    failed: process_runner.ControlledFailure,
 
     fn deinit(self: *SensitiveRemoteCommand) void {
         switch (self.*) {
             .completed => |*result| result.deinit(),
             .canceled, .timed_out, .failed => {},
         }
-        self.* = .{ .failed = .failed };
+        self.* = .{ .failed = .empty_argv };
     }
 };
 
@@ -332,12 +335,9 @@ fn runSensitiveRemoteCommand(
             .sensitive => |result| .{ .completed = result },
             .ordinary => unreachable,
         },
-        .canceled => .canceled,
-        .timed_out => .timed_out,
-        .failed => |failure| .{ .failed = switch (failure) {
-            .spawn => .spawn_failed,
-            else => .failed,
-        } },
+        .canceled => |phase| .{ .canceled = phase },
+        .timed_out => |phase| .{ .timed_out = phase },
+        .failed => |failure| .{ .failed = failure },
     };
 }
 
@@ -351,11 +351,24 @@ fn commandExited(command: *const SensitiveRemoteCommand, expected_code: u8) bool
     };
 }
 
-fn commandFailure(command: *const SensitiveRemoteCommand, diagnose: bool) ?RemoteFailure {
+/// after_update retains earlier effects even if this particular child never starts.
+const CommandPhase = enum { read_only, may_update, after_update };
+
+fn commandFailure(command: *const SensitiveRemoteCommand, diagnose: bool, phase: CommandPhase) ?RemoteFailure {
     return switch (command.*) {
-        .canceled => .canceled_outcome_unknown,
-        .timed_out => .timed_out_outcome_unknown,
-        .failed => |failure| failure,
+        .canceled => |spawn| if (phase == .after_update or (phase == .may_update and spawn == .started))
+            .canceled_outcome_unknown
+        else
+            .canceled,
+        .timed_out => |spawn| if (phase == .after_update or (phase == .may_update and spawn == .started))
+            .timed_out_outcome_unknown
+        else
+            .timed_out,
+        .failed => |failure| switch (failure) {
+            .spawn => if (phase == .after_update) .outcome_unknown else .spawn_failed,
+            .empty_argv, .unsupported_process_control => if (phase == .after_update) .outcome_unknown else .failed,
+            else => if (phase == .read_only) .failed else .outcome_unknown,
+        },
         .completed => |result| switch (result.term) {
             .exited => |code| if (code == 0)
                 null
@@ -363,10 +376,7 @@ fn commandFailure(command: *const SensitiveRemoteCommand, diagnose: bool) ?Remot
                 diagnoseRemoteFailure(result.stdout.bytes(), result.stderr.bytes())
             else
                 .failed,
-            else => if (diagnose)
-                diagnoseRemoteFailure(result.stdout.bytes(), result.stderr.bytes())
-            else
-                .failed,
+            else => if (phase == .read_only) .failed else .outcome_unknown,
         },
     };
 }
@@ -414,7 +424,7 @@ fn auditRemoteUrls(
     };
     var effective = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, effective_argv);
     defer effective.deinit();
-    if (commandFailure(&effective, false)) |failure| return failure;
+    if (commandFailure(&effective, false, .read_only)) |failure| return failure;
     const effective_bytes = switch (effective) {
         .completed => |*result| result.stdout.bytes(),
         else => unreachable,
@@ -449,7 +459,7 @@ fn auditConfigUrlValues(
     var command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &argv);
     defer command.deinit();
     if (optional and commandExited(&command, 1)) return null;
-    if (commandFailure(&command, false)) |failure| return failure;
+    if (commandFailure(&command, false, .read_only)) |failure| return failure;
     const bytes = switch (command) {
         .completed => |*result| result.stdout.bytes(),
         else => unreachable,
@@ -540,7 +550,7 @@ fn classifyCredentialPolicy(
     var helpers = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &helper_argv);
     defer helpers.deinit();
     if (!commandExited(&helpers, 1)) {
-        if (commandFailure(&helpers, false)) |failure| return failure;
+        if (commandFailure(&helpers, false, .read_only)) |failure| return failure;
         const bytes = switch (helpers) {
             .completed => |*result| result.stdout.bytes(),
             else => unreachable,
@@ -552,7 +562,7 @@ fn classifyCredentialPolicy(
     var origins = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &origin_argv);
     defer origins.deinit();
     if (!commandExited(&origins, 1)) {
-        if (commandFailure(&origins, false)) |failure| return failure;
+        if (commandFailure(&origins, false, .read_only)) |failure| return failure;
         const bytes = switch (origins) {
             .completed => |*result| result.stdout.bytes(),
             else => unreachable,
@@ -564,7 +574,7 @@ fn classifyCredentialPolicy(
     var scoped = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &scoped_argv);
     defer scoped.deinit();
     if (!commandExited(&scoped, 1)) {
-        if (commandFailure(&scoped, false)) |failure| return failure;
+        if (commandFailure(&scoped, false, .read_only)) |failure| return failure;
         const bytes = switch (scoped) {
             .completed => |*result| result.stdout.bytes(),
             else => unreachable,
@@ -576,7 +586,7 @@ fn classifyCredentialPolicy(
     var store = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &store_argv);
     defer store.deinit();
     if (!commandExited(&store, 1)) {
-        if (commandFailure(&store, false)) |failure| return failure;
+        if (commandFailure(&store, false, .read_only)) |failure| return failure;
         const bytes = switch (store) {
             .completed => |*result| result.stdout.bytes(),
             else => unreachable,
@@ -780,7 +790,7 @@ fn validatePushRefNames(
     const branch_argv = [_][]const u8{ "git", "check-ref-format", "--branch", branch };
     var branch_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &branch_argv);
     defer branch_command.deinit();
-    switch (sensitiveExitCode(&branch_command)) {
+    switch (sensitiveExitCode(&branch_command, .read_only)) {
         .code => |code| if (code != 0) return .invalid,
         .failure => |failure| return .{ .failed = failure },
     }
@@ -791,7 +801,7 @@ fn validatePushRefNames(
     const remote_argv = [_][]const u8{ "git", "check-ref-format", remote_ref };
     var remote_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &remote_argv);
     defer remote_command.deinit();
-    return switch (sensitiveExitCode(&remote_command)) {
+    return switch (sensitiveExitCode(&remote_command, .read_only)) {
         .code => |code| if (code == 0) .valid else .invalid,
         .failure => |failure| .{ .failed = failure },
     };
@@ -802,16 +812,10 @@ const SensitiveExitCode = union(enum) {
     failure: RemoteFailure,
 };
 
-fn sensitiveExitCode(command: *const SensitiveRemoteCommand) SensitiveExitCode {
-    return switch (command.*) {
-        .completed => |result| switch (result.term) {
-            .exited => |code| .{ .code = code },
-            else => .{ .failure = .failed },
-        },
-        .canceled => .{ .failure = .canceled_outcome_unknown },
-        .timed_out => .{ .failure = .timed_out_outcome_unknown },
-        .failed => |failure| .{ .failure = failure },
-    };
+fn sensitiveExitCode(command: *const SensitiveRemoteCommand, phase: CommandPhase) SensitiveExitCode {
+    if (command.* == .completed and command.completed.term == .exited)
+        return .{ .code = command.completed.term.exited };
+    return .{ .failure = commandFailure(command, false, phase).? };
 }
 
 const BranchOidInspection = union(enum) {
@@ -834,7 +838,7 @@ fn inspectCurrentBranchAndOid(
     const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "HEAD" };
     var branch_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &branch_argv);
     defer branch_command.deinit();
-    switch (sensitiveExitCode(&branch_command)) {
+    switch (sensitiveExitCode(&branch_command, .read_only)) {
         .failure => |failure| return switch (failure) {
             .failed => .context_changed,
             else => .{ .failed = failure },
@@ -853,7 +857,7 @@ fn inspectCurrentBranchAndOid(
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
     var oid_command = runSensitiveRemoteCommand(allocator, io, cwd, environment, control, &oid_argv);
     defer oid_command.deinit();
-    switch (sensitiveExitCode(&oid_command)) {
+    switch (sensitiveExitCode(&oid_command, .read_only)) {
         .failure => |failure| return switch (failure) {
             .failed => .oid_changed,
             else => .{ .failed = failure },
@@ -1051,7 +1055,7 @@ fn runPushUpstreamFinalizer(
 
 fn finalizerFailureBeforeWrite(failure: RemoteFailure) PushUpstreamFinalizeOutcome {
     return switch (failure) {
-        .canceled_outcome_unknown, .timed_out_outcome_unknown => .tracking_unknown,
+        .canceled, .timed_out, .outcome_unknown, .canceled_outcome_unknown, .timed_out_outcome_unknown => .tracking_unknown,
         else => .config_verification_failed,
     };
 }
@@ -1098,7 +1102,7 @@ fn readAutoSetupRebase(
     const argv = [_][]const u8{ "git", "config", "--null", "--get-all", "branch.autoSetupRebase" };
     var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, &argv);
     defer command.deinit();
-    switch (sensitiveExitCode(&command)) {
+    switch (sensitiveExitCode(&command, .read_only)) {
         .failure => |failure| return finalizerReadFailure(failure, mutation_started),
         .code => |code| {
             if (code == 1) return false;
@@ -1146,7 +1150,7 @@ fn readConfigRelation(
     const argv: []const []const u8 = if (local) &local_argv else &effective_argv;
     var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, argv);
     defer command.deinit();
-    switch (sensitiveExitCode(&command)) {
+    switch (sensitiveExitCode(&command, .read_only)) {
         .failure => |failure| return finalizerReadFailure(failure, mutation_started),
         .code => |code| {
             if (code == 1) return .missing;
@@ -1173,7 +1177,7 @@ fn readBooleanRelation(
     const argv: []const []const u8 = if (local) &local_argv else &effective_argv;
     var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, argv);
     defer command.deinit();
-    switch (sensitiveExitCode(&command)) {
+    switch (sensitiveExitCode(&command, .read_only)) {
         .failure => |failure| return finalizerReadFailure(failure, mutation_started),
         .code => |code| {
             if (code == 1) return .missing;
@@ -1191,7 +1195,8 @@ fn readBooleanRelation(
 }
 
 fn finalizerReadFailure(failure: RemoteFailure, mutation_started: bool) FinalizerReadError {
-    if (mutation_started or failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown)
+    if (mutation_started or failure == .canceled or failure == .timed_out or
+        failure == .outcome_unknown or failure == .canceled_outcome_unknown or failure == .timed_out_outcome_unknown)
         return error.TrackingUnknown;
     return error.VerificationFailed;
 }
@@ -1224,9 +1229,12 @@ fn writeLocalConfig(
     const argv = [_][]const u8{ "git", "config", "--local", "--replace-all", key, value };
     var command = runSensitiveRemoteCommand(allocator, io, request.root.dir(), &request.environment.map, request.control, &argv);
     defer command.deinit();
-    return switch (sensitiveExitCode(&command)) {
+    return switch (sensitiveExitCode(&command, .may_update)) {
         .code => |code| if (code == 0) .written else .failed,
-        .failure => |failure| if (failure == .spawn_failed) .failed else .unknown,
+        .failure => |failure| switch (failure) {
+            .outcome_unknown, .canceled_outcome_unknown, .timed_out_outcome_unknown => .unknown,
+            else => .failed,
+        },
     };
 }
 
@@ -1237,7 +1245,7 @@ fn runSecureGitPush(
     request: PushRequest,
     warnings: RemoteWarningSet,
 ) RemoteOperationResult {
-    switch (secureRemoteBranchSnapshotMatches(allocator, io, operation, request.branch, request.oid)) {
+    switch (secureRemoteBranchSnapshotMatches(allocator, io, operation, request.branch, request.oid, .read_only)) {
         .matches => {},
         .mismatch => return remoteFailureResult(.failed, warnings),
         .failed => |failure| return remoteFailureResult(failure, warnings),
@@ -1253,7 +1261,7 @@ fn runSecureGitPush(
     };
     var command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &argv);
     defer command.deinit();
-    if (commandFailure(&command, true)) |failure| return remoteFailureResult(failure, warnings);
+    if (commandFailure(&command, true, .may_update)) |failure| return remoteFailureResult(failure, warnings);
     if (request.mode == .set_upstream) {
         var environment = buildRemoteEnvironment(allocator, &operation.environment.map, .local_finalizer) catch
             return remoteSuccessResult(.push_tracking_incomplete, warnings);
@@ -1287,7 +1295,7 @@ fn runSecureGitFetch(
     };
     var command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &argv);
     defer command.deinit();
-    if (commandFailure(&command, true)) |failure| return remoteFailureResult(failure, warnings);
+    if (commandFailure(&command, true, .may_update)) |failure| return remoteFailureResult(failure, warnings);
     return remoteSuccessResult(.completed, warnings);
 }
 
@@ -1298,7 +1306,7 @@ fn runSecureGitPull(
     request: PullRequest,
     warnings: RemoteWarningSet,
 ) RemoteOperationResult {
-    switch (securePullPreconditionsMatch(allocator, io, operation, request)) {
+    switch (securePullPreconditionsMatch(allocator, io, operation, request, .read_only)) {
         .matches => {},
         .mismatch => return remoteFailureResult(.failed, warnings),
         .failed => |failure| return remoteFailureResult(failure, warnings),
@@ -1310,9 +1318,9 @@ fn runSecureGitPull(
     };
     var fetch = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &fetch_argv);
     defer fetch.deinit();
-    if (commandFailure(&fetch, true)) |failure| return remoteFailureResult(failure, warnings);
+    if (commandFailure(&fetch, true, .may_update)) |failure| return remoteFailureResult(failure, warnings);
 
-    switch (securePullPreconditionsMatch(allocator, io, operation, request)) {
+    switch (securePullPreconditionsMatch(allocator, io, operation, request, .after_update)) {
         .matches => {},
         .mismatch => return remoteFailureResult(.failed, warnings),
         .failed => |failure| return remoteFailureResult(failure, warnings),
@@ -1324,7 +1332,7 @@ fn runSecureGitPull(
     const ahead_behind_argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", spec };
     var ahead_behind_command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &ahead_behind_argv);
     defer ahead_behind_command.deinit();
-    if (commandFailure(&ahead_behind_command, false)) |failure| return remoteFailureResult(failure, warnings);
+    if (commandFailure(&ahead_behind_command, false, .after_update)) |failure| return remoteFailureResult(failure, warnings);
     const ahead_behind_bytes = switch (ahead_behind_command) {
         .completed => |*result| result.stdout.bytes(),
         else => unreachable,
@@ -1338,7 +1346,7 @@ fn runSecureGitPull(
     const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", request.upstream_ref };
     var merge = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &merge_argv);
     defer merge.deinit();
-    if (commandFailure(&merge, false)) |failure| return remoteFailureResult(failure, warnings);
+    if (commandFailure(&merge, false, .after_update)) |failure| return remoteFailureResult(failure, warnings);
     return remoteSuccessResult(.completed, warnings);
 }
 
@@ -1347,8 +1355,9 @@ fn securePullPreconditionsMatch(
     io: std.Io,
     operation: RemoteOperationRequest,
     request: PullRequest,
+    phase: CommandPhase,
 ) RemoteCheck {
-    switch (secureRemoteBranchSnapshotMatches(allocator, io, operation, request.branch, request.oid)) {
+    switch (secureRemoteBranchSnapshotMatches(allocator, io, operation, request.branch, request.oid, phase)) {
         .matches => {},
         .mismatch => return .mismatch,
         .failed => |failure| return .{ .failed = failure },
@@ -1359,7 +1368,7 @@ fn securePullPreconditionsMatch(
     const upstream_argv = [_][]const u8{ "git", "for-each-ref", git_branch_status.upstream_format, "--", local_ref };
     var upstream = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &upstream_argv);
     defer upstream.deinit();
-    if (commandFailure(&upstream, false)) |failure| return .{ .failed = failure };
+    if (commandFailure(&upstream, false, phase)) |failure| return .{ .failed = failure };
     const actual = switch (upstream) {
         .completed => |*result| (git_branch_status.parseUpstreamRecord(result.stdout.bytes(), local_ref) catch return .{ .failed = .failed }) orelse return .mismatch,
         else => unreachable,
@@ -1371,7 +1380,7 @@ fn securePullPreconditionsMatch(
     const status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
     var status = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &status_argv);
     defer status.deinit();
-    if (commandFailure(&status, false)) |failure| return .{ .failed = failure };
+    if (commandFailure(&status, false, phase)) |failure| return .{ .failed = failure };
     return switch (status) {
         .completed => |*result| if (result.stdout.bytes().len == 0) .matches else .mismatch,
         else => unreachable,
@@ -1384,11 +1393,12 @@ fn secureRemoteBranchSnapshotMatches(
     operation: RemoteOperationRequest,
     branch: []const u8,
     oid: []const u8,
+    phase: CommandPhase,
 ) RemoteCheck {
     const branch_argv = [_][]const u8{ "git", "symbolic-ref", "--quiet", "HEAD" };
     var branch_command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &branch_argv);
     defer branch_command.deinit();
-    if (commandFailure(&branch_command, false)) |failure| return .{ .failed = failure };
+    if (commandFailure(&branch_command, false, phase)) |failure| return .{ .failed = failure };
     const actual_branch = switch (branch_command) {
         .completed => |*result| git_ref.localBranchName(trimLineEnd(result.stdout.bytes())) orelse return .mismatch,
         else => unreachable,
@@ -1398,7 +1408,7 @@ fn secureRemoteBranchSnapshotMatches(
     const oid_argv = [_][]const u8{ "git", "rev-parse", "--verify", "HEAD" };
     var oid_command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &oid_argv);
     defer oid_command.deinit();
-    if (commandFailure(&oid_command, false)) |failure| return .{ .failed = failure };
+    if (commandFailure(&oid_command, false, phase)) |failure| return .{ .failed = failure };
     const actual_oid = switch (oid_command) {
         .completed => |*result| trimLineEnd(result.stdout.bytes()),
         else => unreachable,
@@ -1775,7 +1785,7 @@ test "remote authentication blocks GUI interaction and bounds a noncooperating c
 
     var denied = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
     defer denied.deinit();
-    try std.testing.expectEqual(RemoteFailure.failed, commandFailure(&denied, true).?);
+    try std.testing.expectEqual(RemoteFailure.failed, commandFailure(&denied, true, .read_only).?);
     try tmp.dir.access(io, "home/helper-invoked", .{});
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/gui-attempted", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/interaction-enabled", .{}));
@@ -1838,7 +1848,7 @@ test "remote authentication uses a DBus cached libsecret-equivalent helper witho
     try std.testing.expectEqualStrings(dbus_address, environment.map.get("DBUS_SESSION_BUS_ADDRESS").?);
     var command = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
     defer command.deinit();
-    try std.testing.expect(commandFailure(&command, true) == null);
+    try std.testing.expect(commandFailure(&command, true, .read_only) == null);
     const output = switch (command) {
         .completed => |*result| result.stdout.bytes(),
         else => return error.ExpectedDbusCredential,
@@ -1884,7 +1894,7 @@ test "credential helper requiring an omitted key returns only a fixed sensitive 
 
     var command = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
     defer command.deinit();
-    const failure = commandFailure(&command, true) orelse return error.ExpectedCredentialFailure;
+    const failure = commandFailure(&command, true, .read_only) orelse return error.ExpectedCredentialFailure;
     try std.testing.expectEqual(RemoteFailure.failed, failure);
     const raw = switch (command) {
         .completed => |*result| result.stderr.bytes(),
@@ -2145,6 +2155,35 @@ test "remote authentication failure becomes a typed sensitive diagnostic" {
     );
 }
 
+test "remote failures preserve command phase and earlier updates" {
+    const Case = struct {
+        command: SensitiveRemoteCommand,
+        phase: CommandPhase,
+        expected: RemoteFailure,
+    };
+    const cases = [_]Case{
+        .{ .command = .{ .failed = .{ .spawn = error.FileNotFound } }, .phase = .may_update, .expected = .spawn_failed },
+        .{ .command = .{ .failed = .{ .spawn = error.FileNotFound } }, .phase = .after_update, .expected = .outcome_unknown },
+        .{ .command = .{ .failed = .{ .capture = error.StreamTooLong } }, .phase = .read_only, .expected = .failed },
+        .{ .command = .{ .failed = .{ .capture = error.StreamTooLong } }, .phase = .may_update, .expected = .outcome_unknown },
+        .{ .command = .{ .failed = .{ .wait = error.InjectedWaitFailure } }, .phase = .may_update, .expected = .outcome_unknown },
+        .{ .command = .{ .failed = .{ .terminate = error.PermissionDenied } }, .phase = .may_update, .expected = .outcome_unknown },
+        .{ .command = .{ .canceled = .started }, .phase = .read_only, .expected = .canceled },
+        .{ .command = .{ .canceled = .not_started }, .phase = .may_update, .expected = .canceled },
+        .{ .command = .{ .canceled = .started }, .phase = .may_update, .expected = .canceled_outcome_unknown },
+        .{ .command = .{ .timed_out = .not_started }, .phase = .may_update, .expected = .timed_out },
+        .{ .command = .{ .timed_out = .started }, .phase = .may_update, .expected = .timed_out_outcome_unknown },
+        .{ .command = .{ .timed_out = .not_started }, .phase = .after_update, .expected = .timed_out_outcome_unknown },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, commandFailure(&case.command, true, case.phase).?);
+
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var denied = runSensitiveRemoteCommand(std.testing.allocator, std.testing.io, std.Io.Dir.cwd(), &environment, .{}, &.{ "/bin/sh", "-c", "printf 'Permission denied (publickey).' >&2; exit 1" });
+    defer denied.deinit();
+    try std.testing.expectEqual(RemoteFailure.ssh_public_key, commandFailure(&denied, true, .may_update).?);
+}
+
 test "remote cancel is observed before a sensitive child spawn" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     var environment = std.process.Environ.Map.init(std.testing.allocator);
@@ -2305,7 +2344,7 @@ test "remote authentication uses a cached noninteractive HTTPS credential helper
         &argv,
     );
     defer command.deinit();
-    try std.testing.expect(commandFailure(&command, false) == null);
+    try std.testing.expect(commandFailure(&command, false, .read_only) == null);
     const output = switch (command) {
         .completed => |*result| result.stdout.bytes(),
         else => return error.ExpectedCachedCredential,
@@ -3101,4 +3140,137 @@ fn gitOutputAlloc(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
     }
     freeRunResult(std.testing.allocator, result);
     return error.GitCommandFailed;
+}
+
+test "remote push failure phase preserves actual effects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = enum { normal, overflow, signal, cancel, timeout, preflight_overflow, spawn_failure, pre_cancel, pre_timeout, after_fetch_spawn };
+    for ([_]Case{ .normal, .overflow, .signal, .cancel, .timeout, .preflight_overflow, .spawn_failure, .pre_cancel, .pre_timeout, .after_fetch_spawn }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+        try tmp.dir.createDir(io, "work", .default_dir);
+        var work = try tmp.dir.openDir(io, "work", .{});
+        defer work.close(io);
+        var remote = try tmp.dir.openDir(io, "remote.git", .{});
+        defer remote.close(io);
+        try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+        try runTestGit(io, &.{ "git", "remote", "add", "origin", "../remote.git" }, work);
+        try work.writeFile(io, .{ .sub_path = "guard", .data = "committed\n" });
+        try runTestGit(io, &.{ "git", "add", "guard" }, work);
+        try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "O" }, work);
+        try runTestGit(io, &.{ "git", "push", "origin", "HEAD:refs/heads/main" }, work);
+        const oid_o = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(oid_o);
+        try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "A" }, work);
+        const oid_a = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(oid_a);
+        if (case == .after_fetch_spawn) {
+            try runTestGit(io, &.{ "git", "push", "origin", "HEAD:refs/heads/main" }, work);
+            try runTestGit(io, &.{ "git", "update-ref", "refs/heads/main", trimLineEnd(oid_o) }, work);
+            try runTestGit(io, &.{ "git", "update-ref", "refs/remotes/origin/main", trimLineEnd(oid_o) }, work);
+            try runTestGit(io, &.{ "git", "config", "branch.main.remote", "origin" }, work);
+            try runTestGit(io, &.{ "git", "config", "branch.main.merge", "refs/heads/main" }, work);
+        } else {
+            try work.writeFile(io, .{ .sub_path = "guard", .data = "staged\n" });
+            try runTestGit(io, &.{ "git", "add", "guard" }, work);
+            try work.writeFile(io, .{ .sub_path = "guard", .data = "worktree\n" });
+        }
+        try tmp.dir.createDir(io, "bin", .default_dir);
+        const fault = switch (case) {
+            .spawn_failure, .after_fetch_spawn => "/usr/bin/rm -- \"$0\"\n",
+            .cancel, .timeout => "printf pushed > pushed.marker\n/bin/sleep 10\n",
+            .overflow, .preflight_overflow => "/usr/bin/head -c 300000 /dev/zero\n",
+            .signal => "kill -TERM $$\n",
+            else => "",
+        };
+        const trigger = if (case == .preflight_overflow) "remote" else if (case == .spawn_failure) "rev-parse" else if (case == .after_fetch_spawn) "fetch" else "push";
+        const script = try std.fmt.allocPrint(allocator, "#!/bin/sh\nfor arg do\n if [ \"$arg\" = {s} ]; then\n /usr/bin/git \"$@\" || exit 1\n {s}exit 0\n fi\ndone\nexec /usr/bin/git \"$@\"\n", .{ trigger, fault });
+        defer allocator.free(script);
+        try writeExecutableRemoteTestScript(io, tmp.dir, "bin/git", script);
+        const bin = try tmp.dir.realPathFileAlloc(io, "bin", allocator);
+        defer allocator.free(bin);
+        const repo_root = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+        defer allocator.free(repo_root);
+        var parent = std.process.Environ.Map.init(allocator);
+        defer parent.deinit();
+        try parent.put("PATH", bin);
+        try parent.put("HOME", repo_root);
+        const block = try parent.createPosixBlock(allocator, .{});
+        defer block.deinit(allocator);
+        var threaded = std.Io.Threaded.init(allocator, .{ .environ = .{ .block = block } });
+        defer threaded.deinit();
+        var environment = try buildRemoteEnvironment(allocator, &parent, .background);
+        defer environment.deinit();
+        var canceled_generation: std.atomic.Value(u64) = .init(if (case == .pre_cancel) 23 else 0);
+        var cancel_future: ?std.Io.Future(std.Io.Cancelable!void) = if (case == .cancel)
+            try io.concurrent(cancelRemoteAfterPushMarker, .{ io, work, &canceled_generation })
+        else
+            null;
+        defer if (cancel_future) |*future| {
+            _ = future.cancel(io) catch {};
+        };
+        const control: process_runner.ProcessControl = .{
+            .cancellation = .{ .canceled_generation = &canceled_generation, .generation = 23 },
+            .deadline = if (case == .timeout or case == .pre_timeout)
+                std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(if (case == .pre_timeout) -1 else 3000), .clock = .awake })
+            else
+                null,
+        };
+        var root = try root_capability.RootCapability.openCanonical(repo_root);
+        defer root.deinit();
+        const result = runOperation(allocator, threaded.io(), .{
+            .root = &root,
+            .environment = &environment,
+            .control = control,
+            .kind = if (case == .after_fetch_spawn) .{ .pull_refresh_ff_only = .{ .branch = "main", .remote = "origin", .remote_branch = "main", .upstream_ref = "refs/remotes/origin/main", .oid = trimLineEnd(oid_o) } } else .{ .push = .{ .branch = "main", .remote = "origin", .remote_branch = "main", .oid = trimLineEnd(oid_a) } },
+        });
+        if (cancel_future) |*future| try future.await(io);
+        const expected: RemoteOperationOutcome = switch (case) {
+            .normal => .{ .ok = .completed },
+            .overflow, .signal, .after_fetch_spawn => .{ .failed = .outcome_unknown },
+            .cancel => .{ .failed = .canceled_outcome_unknown },
+            .timeout => .{ .failed = .timed_out_outcome_unknown },
+            .preflight_overflow => .{ .failed = .failed },
+            .spawn_failure => .{ .failed = .spawn_failed },
+            .pre_cancel => .{ .failed = .canceled },
+            .pre_timeout => .{ .failed = .timed_out },
+        };
+        try std.testing.expectEqual(expected, result.outcome);
+        const updated = switch (case) {
+            .preflight_overflow, .spawn_failure, .pre_cancel, .pre_timeout => false,
+            else => true,
+        };
+        const sent = try gitOutputAlloc(io, remote, &.{ "git", "rev-parse", "refs/heads/main" });
+        defer allocator.free(sent);
+        try std.testing.expectEqualStrings(if (updated) oid_a else oid_o, sent);
+        const head = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(head);
+        try std.testing.expectEqualStrings(if (case == .after_fetch_spawn) oid_o else oid_a, head);
+        const index = try gitOutputAlloc(io, work, &.{ "git", "show", ":guard" });
+        defer allocator.free(index);
+        try std.testing.expectEqualStrings(if (case == .after_fetch_spawn) "committed\n" else "staged\n", index);
+        const file = try work.readFileAlloc(io, "guard", allocator, .limited(1024));
+        defer allocator.free(file);
+        try std.testing.expectEqualStrings(if (case == .after_fetch_spawn) "committed\n" else "worktree\n", file);
+        if (case == .after_fetch_spawn) {
+            const fetched = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
+            defer allocator.free(fetched);
+            try std.testing.expectEqualStrings(oid_a, fetched);
+        }
+        if (case == .cancel or case == .timeout) try work.access(io, "pushed.marker", .{});
+    }
+}
+
+fn cancelRemoteAfterPushMarker(io: std.Io, work: std.Io.Dir, generation: *std.atomic.Value(u64)) std.Io.Cancelable!void {
+    // Only cancel after real Git reported success; bounded polling avoids a hanging test.
+    for (0..500) |_| {
+        if (work.access(io, "pushed.marker", .{})) |_| {
+            generation.store(23, .release);
+            return;
+        } else |_| {}
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    generation.store(23, .release);
 }
