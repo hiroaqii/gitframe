@@ -250,7 +250,7 @@ pub const Controller = struct {
         };
         environment_consumed = true;
         command_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = RepoDiscoveryTask.run, .failed = RepoDiscoveryTask.failed, .cleanup = RepoDiscoveryTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             self.reloadOwner().rejectRepoDiscoverySpawn(generation);
             try self.reloadOwner().replaceSourceFailure(ctx.allocator(), "Could not start repo discovery task");
@@ -466,7 +466,7 @@ pub const Controller = struct {
         };
         authority_consumed = true;
         command_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = DiffLoadTask.run, .failed = DiffLoadTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = DiffLoadTask.run, .failed = DiffLoadTask.failed, .cleanup = DiffLoadTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             const retained_publication = self.reloadOwner().rejectSourceSpawn(ctx.allocator(), generation);
             if (action_cursor_generation) |action_generation| {
@@ -554,7 +554,7 @@ pub const Controller = struct {
         root_consumed = true;
         environment_consumed = true;
         command_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = StatusLoadTask.run, .failed = StatusLoadTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = StatusLoadTask.run, .failed = StatusLoadTask.failed, .cleanup = StatusLoadTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             self.reloadOwner().rejectStatusSpawn(background_cycle_id);
             if (action_cursor_generation) |generation| {
@@ -642,7 +642,7 @@ pub const Controller = struct {
         root_consumed = true;
         environment_consumed = true;
         command_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = BranchStatusLoadTask.run, .failed = BranchStatusLoadTask.failed }) catch {
+        _ = ctx.task().spawnOwned(task, .{ .run = BranchStatusLoadTask.run, .failed = BranchStatusLoadTask.failed, .cleanup = BranchStatusLoadTask.destroy }) catch {
             task.destroy(ctx.allocator());
             self.reloadOwner().rejectBranchStatusSpawn(background_cycle_id);
             self.setStatus("could not start branch status load task", .{});
@@ -741,7 +741,7 @@ pub const Controller = struct {
                     environment_consumed = true;
                     request.* = undefined;
                     command_consumed = true;
-                    ctx.task().spawnWith(.{ .ctx = task, .run = ChangesProjectionTask.run, .failed = ChangesProjectionTask.failed }) catch |err| {
+                    _ = ctx.task().spawnOwned(task, .{ .run = ChangesProjectionTask.run, .failed = ChangesProjectionTask.failed, .cleanup = ChangesProjectionTask.destroy }) catch |err| {
                         task.destroy(allocator);
                         self.reloadOwner().rejectProjectionSpawn(allocator, request_id);
                         return err;
@@ -783,7 +783,7 @@ pub const Controller = struct {
         task.* = .{ .request = request, .root = root };
         request_consumed = true;
         root_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = GeneratedSyntaxTask.run, .failed = GeneratedSyntaxTask.failed }) catch {
+        _ = ctx.task().spawnOwned(task, .{ .run = GeneratedSyntaxTask.run, .failed = GeneratedSyntaxTask.failed, .cleanup = GeneratedSyntaxTask.destroy }) catch {
             task.destroy(allocator);
             self.reloadOwner().rejectGeneratedSyntaxSpawn(allocator, request_id);
             return;

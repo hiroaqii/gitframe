@@ -1310,10 +1310,9 @@ test "History picker replaces preview immediately and fences detail clipboard co
     try std.testing.expect(app.pages.history.preview_state.phase == .loading);
     try std.testing.expect(app.pages.history.preview_state.accepted == null);
     try std.testing.expect(app.pages.history.preview_state.current_key.?.identity.selection == .single);
-    const tasks = ctx.takePendingTasksWith();
+    const tasks = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), tasks.len);
-    const debounce_task: *HistoryPreviewDebounceTask = @ptrCast(@alignCast(tasks[0].ctx));
-    HistoryPreviewDebounceTask.destroy(debounce_task, allocator);
+    tasks[0].discard(allocator);
 
     try app.update(.{ .history = .copy_detail }, &ctx);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
@@ -2179,12 +2178,13 @@ test "focus loss terminates selection without a deferred result" {
     try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
 
     try app.update(.auto_reload_tick, &ctx);
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const task: *DiffLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    var task_message = entries[0].failed(error.ConcurrencyUnavailable, std.testing.allocator);
+    defer task_message.deinitUndelivered(std.testing.allocator);
+    const task = task_message.load_finished.changes.source;
     const cycle_id = task.background_cycle_id.?;
     const generation = task.generation;
-    DiffLoadTask.destroy(task, std.testing.allocator);
     _ = app.pages.changes.load.clearPendingIfCurrent(.{ .diff_load = generation });
     changesReload(&app).clearPendingReloadIfGeneration(std.testing.allocator, generation);
     app.pages.changes.auto_reload.finishMember(cycle_id, .source);

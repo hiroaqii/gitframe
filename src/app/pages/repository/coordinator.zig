@@ -226,7 +226,7 @@ pub const Controller = struct {
         task.* = .{ .request = request, .environment = environment };
         request_consumed = true;
         environment_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = ManifestTask.run, .failed = ManifestTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = ManifestTask.run, .failed = ManifestTask.failed, .cleanup = ManifestTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             self.page_state.rejectSpawn(generation);
             return err;
@@ -256,7 +256,7 @@ pub const Controller = struct {
         };
         task.* = .{ .request = request };
         request_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = DocumentTask.run, .failed = DocumentTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = DocumentTask.run, .failed = DocumentTask.failed, .cleanup = DocumentTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             self.page_state.rejectDocumentSpawn(generation);
             return err;
@@ -289,7 +289,7 @@ pub const Controller = struct {
         };
         task.* = .{ .request = request, .env_map = self.env_map };
         request_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = BranchTask.run, .failed = BranchTask.failed }) catch {
+        _ = ctx.task().spawnOwned(task, .{ .run = BranchTask.run, .failed = BranchTask.failed, .cleanup = BranchTask.destroy }) catch {
             task.destroy(ctx.allocator());
             self.page_state.rejectBranchSpawn(generation);
         };
@@ -327,7 +327,7 @@ pub const Controller = struct {
         task.* = .{ .request = request, .environment = environment };
         request_consumed = true;
         environment_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = PathHistoryTask.run, .failed = PathHistoryTask.failed }) catch {
+        _ = ctx.task().spawnOwned(task, .{ .run = PathHistoryTask.run, .failed = PathHistoryTask.failed, .cleanup = PathHistoryTask.destroy }) catch {
             task.destroy(ctx.allocator());
             self.page_state.rejectPathHistorySpawn(generation);
         };
@@ -349,7 +349,7 @@ pub const Controller = struct {
         };
         task.* = .{ .request = request };
         request_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = SyntaxTask.run, .failed = SyntaxTask.failed }) catch {
+        _ = ctx.task().spawnOwned(task, .{ .run = SyntaxTask.run, .failed = SyntaxTask.failed, .cleanup = SyntaxTask.destroy }) catch {
             task.destroy(ctx.allocator());
             self.page_state.rejectSyntaxSpawn(generation);
         };
@@ -382,7 +382,7 @@ pub const Controller = struct {
         task.* = .{ .request = request, .environment = environment };
         request_consumed = true;
         environment_consumed = true;
-        ctx.task().spawnWith(.{ .ctx = task, .run = ChangeMapTask.run, .failed = ChangeMapTask.failed }) catch {
+        _ = ctx.task().spawnOwned(task, .{ .run = ChangeMapTask.run, .failed = ChangeMapTask.failed, .cleanup = ChangeMapTask.destroy }) catch {
             task.destroy(ctx.allocator());
             self.page_state.rejectChangeMapSpawn(generation);
         };

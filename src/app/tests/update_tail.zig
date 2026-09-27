@@ -533,14 +533,14 @@ fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
     const old = app.pages.compare.beginRefresh().?;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .switch_page = .repository }, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     // The destination page queues its own reads, separate from Compare's
     // completion/re-entry ordering exercised below.
-    clearPendingRepositoryTasks(&ctx, allocator);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     app.status.set("visible page sentinel", .{});
 
     if (order == .completion_before_reentry) {
@@ -560,8 +560,11 @@ fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !
 
     try app.update(.{ .switch_page = .compare }, &ctx);
     try std.testing.expectEqual(page.Id.compare, app.active_page);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const newer: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
+    const pending_0 = ctx.takePendingTasks();
+    var newer_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer newer_message.deinitUndelivered(ctx.allocator());
+    const newer = newer_message.load_finished.compare.source;
     try std.testing.expect(newer.generation > old.generation);
 
     ctx.resetRedrawSuppressed();
@@ -598,7 +601,7 @@ test "repository commitment resets Compare and refreshes the new physical root" 
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     _ = app.pages.compare.activate(0);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     const initial = app.pages.compare.beginRefresh().?;
     try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
@@ -625,9 +628,12 @@ test "repository commitment resets Compare and refreshes the new physical root" 
     try std.testing.expect(app.pages.compare.base_target == null);
     try std.testing.expect(app.pages.compare.activation.state == .active);
     try std.testing.expectEqual(@as(u64, 1), app.pages.compare.activation.state.active.repo_epoch);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const task: *CompareLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-    try std.testing.expect(task.root.identity.eql(app.repo_session.view().activeIdentity().?));
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
+    const pending_0 = ctx.takePendingTasks();
+    var task_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer task_message.deinitUndelivered(ctx.allocator());
+    const task = task_message.load_finished.compare.source;
+    try std.testing.expectEqual(app.repo_session.view().epoch(), task.identity.repo_epoch);
 }
 
 test "repository activation and manual reload route to page-owned manifest tasks" {
@@ -649,26 +655,36 @@ test "repository activation and manual reload route to page-owned manifest tasks
     defer app.pages.repository.deinit(std.testing.allocator);
     _ = activateChanges(&app);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer clearPendingRepositoryTasks(&ctx, std.testing.allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .switch_page = .repository }, &ctx);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
-    const first: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-    try std.testing.expectEqual(page.Id.repository, first.request.identity.origin);
-    try std.testing.expectEqual(app.repo_session.repo_epoch, first.request.identity.repo_epoch);
-    const first_generation = first.request.generation;
-    const first_branch: *RepositoryBranchTask = @ptrCast(@alignCast(ctx._pending_tasks_with[1].ctx));
-    const first_branch_generation = first_branch.request.generation;
-    try std.testing.expectEqual(first.request.identity, first_branch.request.identity);
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
+    const pending_0 = ctx.takePendingTasks();
+    var first_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer first_message.deinitUndelivered(ctx.allocator());
+    const first = first_message.repository.manifest_finished;
+    try std.testing.expectEqual(page.Id.repository, first.identity.origin);
+    try std.testing.expectEqual(app.repo_session.repo_epoch, first.identity.repo_epoch);
+    const first_generation = first.generation;
+    var first_branch_message = pending_0[1].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer first_branch_message.deinitUndelivered(ctx.allocator());
+    const first_branch = first_branch_message.repository.branch_finished;
+    const first_branch_generation = first_branch.generation;
+    try std.testing.expectEqual(first.identity, first_branch.identity);
 
     try app.update(.reload, &ctx);
-    try std.testing.expectEqual(@as(u8, 4), ctx._pending_tasks_with_len);
-    const second: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
-    try std.testing.expect(second.request.generation > first_generation);
-    try std.testing.expectEqual(second.request.generation, app.pages.repository.pending_generation.?);
-    const second_branch: *RepositoryBranchTask = @ptrCast(@alignCast(ctx._pending_tasks_with[3].ctx));
-    try std.testing.expect(second_branch.request.generation > first_branch_generation);
-    try std.testing.expectEqual(second_branch.request.generation, app.pages.repository.branch.pending.?.generation);
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
+    const pending_1 = ctx.takePendingTasks();
+    var second_message = pending_1[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer second_message.deinitUndelivered(ctx.allocator());
+    const second = second_message.repository.manifest_finished;
+    try std.testing.expect(second.generation > first_generation);
+    try std.testing.expectEqual(second.generation, app.pages.repository.pending_generation.?);
+    var second_branch_message = pending_1[1].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer second_branch_message.deinitUndelivered(ctx.allocator());
+    const second_branch = second_branch_message.repository.branch_finished;
+    try std.testing.expect(second_branch.generation > first_branch_generation);
+    try std.testing.expectEqual(second_branch.generation, app.pages.repository.branch.pending.?.generation);
 }
 
 test "changes repository transition active repository replacement rejects old owner and result" {
@@ -700,21 +716,25 @@ test "changes repository transition active repository replacement rejects old ow
     );
     app.pages.repository.acceptIncoming(allocator, &incoming);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingRepositoryTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.reload, &ctx);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
-    const old_task: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-    const old_identity = old_task.request.identity;
-    const old_root_identity = old_task.request.root.identity;
-    const old_generation = old_task.request.generation;
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
+    const pending_0 = ctx.takePendingTasks();
+    var old_task_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer old_task_message.deinitUndelivered(ctx.allocator());
+    const old_task = old_task_message.repository.manifest_finished;
+    pending_0[1].discard(ctx.allocator());
+    const old_identity = old_task.identity;
+    const old_root_identity = old_task.root_identity;
+    const old_generation = old_task.generation;
     try std.testing.expectEqual(page.Id.repository, old_identity.origin);
     try std.testing.expectEqual(app.pages.repository.repo_epoch, old_identity.repo_epoch);
     try std.testing.expectEqual(app.pages.repository.activation_id, old_identity.activation_id);
     try std.testing.expectEqual(app.pages.repository.generation, old_generation);
     try std.testing.expectEqual(old_generation, app.pages.repository.pending_generation.?);
     try std.testing.expect(old_root_identity.eql(root_a_identity));
-    try std.testing.expectEqualStrings(roots.a, old_task.request.root_path);
+    try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
 
     try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
         &app,
@@ -752,11 +772,15 @@ test "changes repository transition active repository replacement rejects old ow
         return error.ExpectedReplacementManifest;
     try std.testing.expect(!app.pages.repository.needs_revalidation);
     try std.testing.expect(!app.pages.repository.wantsManifestRequest());
-    try std.testing.expectEqual(@as(u8, 4), ctx._pending_tasks_with_len);
-    const replacement_task: *RepositoryManifestTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
-    try std.testing.expectEqual(replacement_generation, replacement_task.request.generation);
-    try std.testing.expectEqualStrings(roots.b, replacement_task.request.root_path);
-    try std.testing.expect(replacement_task.request.root.identity.eql(root_b_identity));
+    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
+    const pending_1 = ctx.takePendingTasks();
+    var replacement_task_message = pending_1[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer replacement_task_message.deinitUndelivered(ctx.allocator());
+    const replacement_task = replacement_task_message.repository.manifest_finished;
+    pending_1[1].discard(ctx.allocator());
+    try std.testing.expectEqual(replacement_generation, replacement_task.generation);
+    try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
+    try std.testing.expect(replacement_task.root_identity.eql(root_b_identity));
     try std.testing.expectEqual(@as(usize, 0), app.pages.repository.status.text().len);
     // The stale completion is a skip candidate, but the same root tail arms
     // the visible replacement manifest lifecycle and therefore needs a frame.
@@ -822,7 +846,7 @@ test "changes repository transition post-commit manifest start failures stay on 
         try std.testing.expectEqual(case.generation, app.pages.repository.generation);
         try std.testing.expect(app.pages.repository.pending_generation == null);
         try std.testing.expectEqualStrings(case.status, app.pages.repository.status.text());
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     }
 }
@@ -1089,7 +1113,7 @@ test "repository incoming viewport scroll App immediate and deferred routes use 
         app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
         const identity = app.repo_session.view().activeIdentity().?;
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer clearPendingRepositoryTasks(&ctx, allocator);
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
         try std.testing.expectEqual(
             chasen.Size{ .width = 118, .height = 7 },
             app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).bodySize(),
@@ -1199,15 +1223,21 @@ test "changes repository transition unavailable path is not replayed after reloa
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     app.pages.repository.root_identity = app.repo_session.view().activeIdentity().?;
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .switch_page = .changes }, &ctx);
 
     try std.testing.expectEqualStrings("Repository file is not part of the current Changes", app.status.text());
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
-    const diff_task: *DiffLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[2].ctx));
-    const status_task: *StatusLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+    const pending_0 = ctx.takePendingTasks();
+    var diff_task_message = pending_0[2].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer diff_task_message.deinitUndelivered(ctx.allocator());
+    const diff_task = diff_task_message.load_finished.changes.source;
+    var status_task_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    defer status_task_message.deinitUndelivered(ctx.allocator());
+    const status_task = status_task_message.load_finished.changes.status;
+    pending_0[1].discard(ctx.allocator());
     var replacement = app_test_support.loadedDiffTwo();
     replacement.text = "new";
     try app.update(.{ .load_finished = .{ .changes = .{ .source = .{
@@ -1575,20 +1605,6 @@ fn syncTestActivation(app: *App) void {
     );
 }
 
-fn clearPendingRepositoryTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}
-
-fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}
-
 const repository_incoming_viewport_changes_files = [_]diff_parser.FileDiff{
     .{
         .header = "diff --git a/src/app.zig b/src/app.zig",
@@ -1665,18 +1681,16 @@ fn branchListForTest(allocator: std.mem.Allocator, specs: []const BranchListItem
     return .{ .loaded = .{ .branches = items } };
 }
 
-fn abandonSingleQueuedTask(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) !void {
-    const queued = ctx.takePendingTasksWith();
+fn discardSingleQueuedTask(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) !void {
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    queued[0].discard(allocator);
 }
 
-fn abandonQueuedTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) usize {
-    const queued = ctx.takePendingTasksWith();
+fn discardQueuedTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) usize {
+    const queued = ctx.takePendingTasks();
     for (queued) |task| {
-        var abandoned = task.failed(task.ctx, .runtime_abandoned, allocator);
-        abandoned.deinitUndelivered(allocator);
+        task.discard(allocator);
     }
     return queued.len;
 }
@@ -1792,7 +1806,7 @@ test "Changes staged boundary keeps owner body through real update tail" {
     const pending = app.pages.changes.changes_projection.pending orelse
         return error.ExpectedBoundaryProjection;
     try std.testing.expectEqual(app_changes_projection.Kind.cached_diff, pending.kind);
-    try abandonSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx, allocator);
 
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
     var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
@@ -1809,7 +1823,7 @@ test "Changes staged boundary keeps owner body through real update tail" {
     candidate = undefined;
 
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 test "Changes staged boundary with queued revalidation defers to canonical gate" {
     const allocator = std.testing.allocator;
@@ -1854,12 +1868,12 @@ test "Changes staged boundary result lands safely while canonical gate is open" 
 
     try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
     try std.testing.expect(app.pages.changes.changes_projection.pending != null);
-    try abandonSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx, allocator);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
 
     // A watch tick cannot open the gate while the boundary read is pending.
     try app.update(.auto_reload_tick, &ctx);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 
     // A queued full revalidation is not blocked by the pending read: the next
     // update tail starts it while the canonical boundary read is in flight.
@@ -1886,7 +1900,7 @@ test "Changes staged boundary result lands safely while canonical gate is open" 
     const held = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedRetainedCombinedProjection;
     try std.testing.expect(held.displayFile().hunks.ptr == prior_hunks);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 test "Changes watch cycle after staged boundary advances revisions monotonically" {
     const allocator = std.testing.allocator;
@@ -1903,7 +1917,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     const prior_hunks = prior.displayFile().hunks.ptr;
 
     try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
-    try abandonSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx, allocator);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
     var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
         allocator,
@@ -1935,7 +1949,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     watch_status = undefined;
     try std.testing.expect(app.pages.changes.status_snapshot_revision >= boundary_revision);
     const status_revision = app.pages.changes.status_snapshot_revision;
-    _ = abandonQueuedTasks(&ctx, allocator);
+    _ = discardQueuedTasks(&ctx, allocator);
     try std.testing.expect(changesNavigationView(&app).displayedChangesBody() != .none);
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .branch_status = .{
@@ -1946,7 +1960,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
         .repo_root = try allocator.dupe(u8, roots.a),
         .result = .empty,
     } } }), &ctx);
-    _ = abandonQueuedTasks(&ctx, allocator);
+    _ = discardQueuedTasks(&ctx, allocator);
     try std.testing.expect(changesNavigationView(&app).displayedChangesBody() != .none);
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
@@ -1964,7 +1978,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     // The committed publication resolves the staged-only row through a fresh
     // canonical cached read; deliver it and land on the cached preview.
     const canonical_request = try cloneBoundaryProjectionRequest(&app, allocator);
-    try abandonSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx, allocator);
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = canonical_request,
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(
@@ -1977,7 +1991,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     try std.testing.expect(app.pages.changes.changes_projection.displayed == .ready);
     try std.testing.expect(app.pages.changes.changes_projection.displayed.ready.value == .cached_diff);
     try std.testing.expect(app.pages.changes.status_snapshot_revision >= status_revision);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 test "Changes staged boundary result defers during drag and lands afterward" {
     const allocator = std.testing.allocator;
@@ -1994,7 +2008,7 @@ test "Changes staged boundary result defers during drag and lands afterward" {
     const prior_hunks = prior.displayFile().hunks.ptr;
 
     try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
-    try abandonSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx, allocator);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
 
     app.pages.changes.selection_owner = .{ .diff = .{
@@ -2027,7 +2041,7 @@ test "Changes staged boundary result defers during drag and lands afterward" {
 
     try std.testing.expect(app.pages.changes.deferred_projection_apply == null);
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 test "Changes deferred boundary publication forces frame past skip latch" {
     const allocator = std.testing.allocator;
@@ -2044,7 +2058,7 @@ test "Changes deferred boundary publication forces frame past skip latch" {
     const prior_hunks = prior.displayFile().hunks.ptr;
 
     try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
-    try abandonSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx, allocator);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
 
     app.pages.changes.selection_owner = .{ .diff = .{
@@ -2077,7 +2091,7 @@ test "Changes deferred boundary publication forces frame past skip latch" {
     ctx.resetRedrawSuppressed();
     try app.update(.git_action_spinner_tick, &ctx);
     try std.testing.expect(ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 test "Changes unchanged tail keeps handler redraw skip" {
     const allocator = std.testing.allocator;
@@ -2092,7 +2106,7 @@ test "Changes unchanged tail keeps handler redraw skip" {
     ctx.resetRedrawSuppressed();
     try app.update(.git_action_spinner_tick, &ctx);
     try std.testing.expect(ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 test "canonical noop commit clearing failure banner forces frame" {
     const allocator = std.testing.allocator;
@@ -2134,7 +2148,7 @@ test "canonical noop commit clearing failure banner forces frame" {
         std.mem.indexOf(u8, app.pages.changes.status.text(), "auto reload failed") == null,
     );
     try std.testing.expect(!ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 test "canonical noop commit without projection kind clears banner and forces frame" {
     const allocator = std.testing.allocator;

@@ -800,7 +800,7 @@ test "History preview single-flight keeps only the latest inline request" {
     try std.testing.expectEqual(QueueOutcome.queued, state.queue(allocator, replacement_identity, request_a));
     try std.testing.expectEqual(
         DebounceOutcome.start_debounce,
-        state.finishDebounce(stale_stamp, .{ .failed = .runtime_abandoned }),
+        state.finishDebounce(stale_stamp, .{ .failed = .task_start }),
     );
     try std.testing.expect(state.latest.?.key.identity.eql(replacement_identity));
 }

@@ -32,7 +32,7 @@ pub fn startCreateStash(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
     const task = try ctx.allocator().create(Task);
     errdefer ctx.allocator().destroy(task);
     task.* = .{ .pending = pending, .snapshot = snapshot, .scope = dialog.scope, .message = message, .root = authority.root, .environment = authority.environment };
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startStashSelection(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, confirmation: *const @import("stash.zig").Selection, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
@@ -45,7 +45,7 @@ pub fn startStashSelection(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: a
     const task = try ctx.allocator().create(Task);
     errdefer ctx.allocator().destroy(task);
     task.* = .{ .pending = pending, .confirmation = owned, .root = authority.root, .environment = authority.environment };
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.StageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
@@ -67,13 +67,13 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: action
         .target_kind = target.kind,
     };
     authority_consumed = true;
-    errdefer destroyFileTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
     task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.UnstageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
@@ -95,13 +95,13 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
         .target_kind = target.kind,
     };
     authority_consumed = true;
-    errdefer destroyFileTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
     task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkStageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
@@ -125,14 +125,14 @@ pub fn startStageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: action
         .session_mark_mutation = target.session_mark_mutation,
     };
     authority_consumed = true;
-    errdefer destroyHunkTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
     task.patch = target.patch;
     target.patch = &.{};
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: *git_ops.HunkUnstageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
@@ -157,14 +157,14 @@ pub fn startUnstageHunk(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
         .reload_after_success = target.reload_after_success,
     };
     authority_consumed = true;
-    errdefer destroyHunkTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
     task.path = try ctx.allocator().dupe(u8, target.path);
     task.patch = target.patch;
     target.patch = &.{};
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, repo_root: []const u8, path: []const u8, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
@@ -184,12 +184,12 @@ pub fn startDiscardFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
         .path = &.{},
     };
     authority_consumed = true;
-    errdefer destroyFileTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
     task.repo_root = try ctx.allocator().dupe(u8, repo_root);
     task.path = try ctx.allocator().dupe(u8, path);
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub const CommitRequest = struct {
@@ -225,9 +225,9 @@ pub fn startCommit(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.P
     };
     authority_consumed = true;
     request.* = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
-    errdefer destroyCommitTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, confirmation: *app_state.AmendConfirmation, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
@@ -250,9 +250,9 @@ pub fn startAmend(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.Pe
     };
     authority_consumed = true;
     confirmation.* = .{ .repo_root = &.{}, .subject = &.{}, .body = null };
-    errdefer destroyCommitTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startPush(
@@ -301,9 +301,9 @@ pub fn startPush(
         .oid = &.{},
         .ahead_behind = null,
     };
-    errdefer destroyPushTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub fn startPull(
@@ -351,9 +351,9 @@ pub fn startPull(
         .ahead = 0,
         .behind = 0,
     };
-    errdefer destroyPullTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub const FetchRequest = struct {
@@ -406,9 +406,9 @@ pub fn startFetch(
         .repo_root = &.{},
         .remote = &.{},
     };
-    errdefer destroyFetchTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 pub const SwitchBranchRequest = struct {
@@ -458,9 +458,9 @@ pub fn startSwitchBranch(
         .target_branch = &.{},
         .target_oid = &.{},
     };
-    errdefer destroySwitchBranchTask(Task, ctx.allocator(), task);
+    errdefer Task.destroy(task, ctx.allocator());
 
-    try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
 const LocalTaskAuthority = struct {
@@ -486,15 +486,6 @@ const LocalTaskAuthority = struct {
         self.* = undefined;
     }
 };
-
-fn destroyFileTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.path.len > 0) allocator.free(task.path);
-    if (@hasField(Task, "label") and task.label.len > 0) allocator.free(task.label);
-    task.environment.deinit();
-    task.root.deinit();
-    allocator.destroy(task);
-}
 
 fn requireKind(pending: actions.PendingAction, expected: actions.ActionKind) void {
     if (pending.kind != expected) @panic("Git action launcher received the wrong action kind");
@@ -553,17 +544,6 @@ fn consumePullConfirmation(allocator: std.mem.Allocator, confirmation: *app_stat
     };
 }
 
-fn destroyPullTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.branch.len > 0) allocator.free(task.branch);
-    if (task.remote.len > 0) allocator.free(task.remote);
-    if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
-    if (task.oid.len > 0) allocator.free(task.oid);
-    if (task.root) |*root| root.deinit();
-    if (task.environment) |*environment| environment.deinit();
-    allocator.destroy(task);
-}
-
 fn consumeFetchRequest(allocator: std.mem.Allocator, request: *FetchRequest) void {
     if (request.repo_root.len > 0) allocator.free(request.repo_root);
     if (request.remote.len > 0) allocator.free(request.remote);
@@ -575,14 +555,6 @@ fn consumeFetchRequest(allocator: std.mem.Allocator, request: *FetchRequest) voi
         .repo_root = &.{},
         .remote = &.{},
     };
-}
-
-fn destroyFetchTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.remote.len > 0) allocator.free(task.remote);
-    if (task.root) |*root| root.deinit();
-    if (task.environment) |*environment| environment.deinit();
-    allocator.destroy(task);
 }
 
 fn consumeSwitchBranchRequest(allocator: std.mem.Allocator, request: *SwitchBranchRequest) void {
@@ -598,44 +570,4 @@ fn consumeSwitchBranchRequest(allocator: std.mem.Allocator, request: *SwitchBran
         .target_branch = &.{},
         .target_oid = &.{},
     };
-}
-
-fn destroySwitchBranchTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
-    if (task.expected_oid.len > 0) allocator.free(task.expected_oid);
-    if (task.target_branch.len > 0) allocator.free(task.target_branch);
-    if (task.target_oid.len > 0) allocator.free(task.target_oid);
-    task.environment.deinit();
-    task.root.deinit();
-    allocator.destroy(task);
-}
-
-fn destroyHunkTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.path.len > 0) allocator.free(task.path);
-    if (task.patch.len > 0) allocator.free(task.patch);
-    task.environment.deinit();
-    task.root.deinit();
-    allocator.destroy(task);
-}
-
-fn destroyCommitTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.subject.len > 0) allocator.free(task.subject);
-    if (task.body) |body| allocator.free(body);
-    task.environment.deinit();
-    task.root.deinit();
-    allocator.destroy(task);
-}
-
-fn destroyPushTask(comptime Task: type, allocator: std.mem.Allocator, task: *Task) void {
-    if (task.repo_root.len > 0) allocator.free(task.repo_root);
-    if (task.branch.len > 0) allocator.free(task.branch);
-    if (task.remote.len > 0) allocator.free(task.remote);
-    if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
-    if (task.oid.len > 0) allocator.free(task.oid);
-    if (task.root) |*root| root.deinit();
-    if (task.environment) |*environment| environment.deinit();
-    allocator.destroy(task);
 }

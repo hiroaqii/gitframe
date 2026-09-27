@@ -133,7 +133,7 @@ pub const Controller = struct {
             self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not prepare Compare load task");
             return err;
         };
-        ctx.task().spawnWith(.{ .ctx = task, .run = CompareLoadTask.run, .failed = CompareLoadTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = CompareLoadTask.run, .failed = CompareLoadTask.failed, .cleanup = CompareLoadTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             self.page_state.failRefresh(ctx.allocator(), request, self.repo.epoch(), "Could not start Compare load task");
             return err;
@@ -255,7 +255,7 @@ pub const Controller = struct {
             self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not prepare Compare base list task");
             return err;
         };
-        ctx.task().spawnWith(.{ .ctx = task, .run = BranchListTask.run, .failed = BranchListTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = BranchListTask.run, .failed = BranchListTask.failed, .cleanup = BranchListTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             self.page_state.base_picker.markStaticFailure(ctx.allocator(), "Could not start Compare base list task");
             return err;

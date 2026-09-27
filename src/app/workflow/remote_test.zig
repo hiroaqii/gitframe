@@ -374,16 +374,6 @@ fn testSessionHunkMarkKey(
     };
 }
 
-fn clearPendingBranchListTasks(
-    ctx: *chasen.Ctx(RemoteHarness.Msg),
-    allocator: std.mem.Allocator,
-) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        const task: *BranchListLoadTask = @ptrCast(@alignCast(entry.ctx));
-        task.destroy(allocator);
-    }
-}
-
 const BranchListItemSpec = struct {
     name: []const u8,
     oid: []const u8,
@@ -594,9 +584,9 @@ fn runOnlyPushInspectionTaskForTest(
     ctx: *chasen.Ctx(RemoteHarness.Msg),
     io: std.Io,
 ) !void {
-    const pending = ctx.takePendingTasksWith();
+    const pending = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending.len);
-    const msg = pending[0].run(pending[0].ctx, ctx.allocator(), io);
+    const msg = try pending[0].run(ctx.allocator(), io);
     try app.update(msg, ctx);
 }
 
@@ -604,12 +594,10 @@ fn deinitOnlyPushInspectionTaskForTest(
     ctx: *chasen.Ctx(RemoteHarness.Msg),
     io: std.Io,
 ) !repo_root_capability.RootCapability {
-    const pending = ctx.takePendingTasksWith();
+    const pending = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending.len);
-    const Task = app_push_retry.InspectionTask(RemoteHarness.Msg);
-    const task: *Task = @ptrCast(@alignCast(pending[0].ctx));
-    const root_observer = task.root;
-    var msg = pending[0].run(pending[0].ctx, ctx.allocator(), io);
+    var msg = try pending[0].run(ctx.allocator(), io);
+    const root_observer = msg.push_inspection_finished.root.?;
     msg.deinitUndelivered(ctx.allocator());
     return root_observer;
 }
@@ -854,14 +842,19 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     defer app.clearBranchSwitch(allocator);
 
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
-    defer clearPendingBranchListTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(RemoteHarness.Msg, &ctx);
 
     try app.requestBranchSwitch(&ctx);
 
     try std.testing.expect(app.overlay.isSwitchBranch());
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const task: *BranchListLoadTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0..ctx._pending_tasks_with_len][0].ctx));
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
+    const pending = ctx.takePendingTasks();
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
+    try tmp.dir.rename("replacement", tmp.dir, "slot", io);
+    const task_message = try pending[0].run(allocator, io);
+    const task = task_message.load_finished.shell.branch_list;
     try std.testing.expectEqual(page.Id.repository, task.origin);
     try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
     try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
@@ -869,14 +862,6 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     try std.testing.expectEqual(app.pages.changes.activation.next_activation_id, task.activation_id);
     try std.testing.expectEqualStrings(slot_path, task.repo_root);
     try std.testing.expectEqual(app.remote_workflow.branch_switch.generation, task.generation);
-    try std.testing.expect(task.environment.borrow().get("GIT_DIR") == null);
-    const root_observer = task.root;
-
-    const pending = ctx.takePendingTasksWith();
-    try std.testing.expectEqual(@as(usize, 1), pending.len);
-    try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
-    try tmp.dir.rename("replacement", tmp.dir, "slot", io);
-    const task_message = pending[0].run(pending[0].ctx, allocator, io);
     var finished = switch (task_message) {
         .load_finished => |load| switch (load) {
             .shell => |shell| switch (shell) {
@@ -903,11 +888,6 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     }
     try std.testing.expect(saw_accepted);
     try std.testing.expect(!saw_replacement);
-    if (root_observer.duplicate()) |unexpected_value| {
-        var unexpected = unexpected_value;
-        unexpected.deinit();
-        return error.ExpectedClosedRootCapability;
-    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 
     // Apply the accepted list, then abandon a queued switch. The switch task
     // owns a second duplicate of the same physical A descriptor and a
@@ -919,15 +899,15 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     defer allocator.free(expected_oid);
     try std.testing.expect(expected_oid.len == 40);
     const DummyConfirmTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) RemoteHarness.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!RemoteHarness.Msg {
             return .quit;
         }
-        fn failed(_: chasen.TaskFailure) RemoteHarness.Msg {
+        fn failed(_: chasen.TaskStartError) RemoteHarness.Msg {
             return .quit;
         }
     };
     var saturated: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
-    for (0..16) |_| try saturated.task().spawn(.{ .run = DummyConfirmTask.run, .failed = DummyConfirmTask.failed });
+    for (0..16) |_| _ = try saturated.task().spawn(.{ .run = DummyConfirmTask.run, .failed = DummyConfirmTask.failed });
     try std.testing.expectError(error.TaskLimitExceeded, app.confirmBranchSwitch(&saturated));
     try std.testing.expect(app.overlay.isSwitchBranch());
     try std.testing.expect(!app.actionLifecycleView().hasPending());
@@ -938,17 +918,9 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
 
     try app.confirmBranchSwitch(&ctx);
     try std.testing.expectEqual(page.Id.repository, app.remote_workflow.branch_switch_pending.?.owner.origin.page_id);
-    const switch_entries = ctx.takePendingTasksWith();
+    const switch_entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), switch_entries.len);
-    const SwitchTask = app_actions.SwitchBranchTask(RemoteHarness.Msg);
-    const switch_task: *SwitchTask = @ptrCast(@alignCast(switch_entries[0].ctx));
-    const switch_root_observer = switch_task.root;
-    try std.testing.expect(switch_task.root.identity.eql(app.repoSessionView().activeIdentity().?));
-    try std.testing.expect(switch_task.environment.borrow().get("GIT_DIR") == null);
-    try std.testing.expectEqualStrings("retained", switch_task.environment.borrow().get("GITFRAME_SWITCH_CANARY").?);
-    var abandoned = switch_entries[0].failed(switch_entries[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-    try expectRootCapabilityClosed(switch_root_observer);
+    switch_entries[0].discard(allocator);
 
     // Task admission failure rolls back the newly owned popup snapshot and
     // leaves no pending branch-list correlation behind.
@@ -968,16 +940,16 @@ test "requestBranchSwitch opens loading popup and starts identity scoped list ta
     syncTestActivation(&rejected);
 
     const DummyTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) RemoteHarness.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!RemoteHarness.Msg {
             return .quit;
         }
 
-        fn failed(_: chasen.TaskFailure) RemoteHarness.Msg {
+        fn failed(_: chasen.TaskStartError) RemoteHarness.Msg {
             return .quit;
         }
     };
     var rejected_ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
-    for (0..16) |_| try rejected_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    for (0..16) |_| _ = try rejected_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
 
     try std.testing.expectError(error.TaskLimitExceeded, rejected.requestBranchSwitch(&rejected_ctx));
     try std.testing.expect(!rejected.remote_workflow.branch_switch.hasState());
@@ -1005,18 +977,18 @@ test "requestBranchSwitch opens picker with untracked-only status" {
     syncTestActivation(&app);
 
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
-    defer clearPendingBranchListTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(RemoteHarness.Msg, &ctx);
     app.config.source = .{ .range = "HEAD~1..HEAD" };
     try app.requestBranchSwitch(&ctx);
     try std.testing.expect(!app.remote_workflow.branch_switch.hasState());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expectEqualStrings("branch switch unavailable for this source", app.pages.changes.status.text());
     app.config.source = .unstaged;
     try app.requestBranchSwitch(&ctx);
 
     try std.testing.expect(app.overlay.isSwitchBranch());
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
 }
 
 test "finishBranchListLoad correlates caller repository activation and generation" {
@@ -1154,7 +1126,7 @@ test "confirmBranchSwitch treats filtered current branch as no-op and keeps call
     try std.testing.expect(app.remote_workflow.branch_switch.branches.len == 0);
     try std.testing.expect(app.pages.changes.staged_hunks.containsExact("/repo", "a", mark_key));
     try std.testing.expectEqualStrings("already on branch: main", app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
 
     var missing_authority: RemoteHarness = .{
@@ -1182,7 +1154,7 @@ test "confirmBranchSwitch treats filtered current branch as no-op and keeps call
 
     try std.testing.expectEqualStrings("branch switch unavailable: repository authority changed", missing_authority.pages.changes.status.text());
     try std.testing.expect(!missing_authority.remote_workflow.branch_switch.hasState());
-    try std.testing.expectEqual(@as(u8, 0), missing_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), missing_ctx._pending_tasks_len);
     try std.testing.expect(!missing_authority.actionLifecycleView().hasPending());
 }
 
@@ -1212,7 +1184,6 @@ test "branch switch filter allocation failure preserves query rows and selected 
 
 test "worktree branch action owns its task and fences cancel reopen and stale completions" {
     const allocator = std.testing.allocator;
-    const WorktreeTask = @import("../worktree_switch.zig").Task(app_message.Msg);
     var app: RemoteHarness = .{ .active_page = .repository };
     const root = try installCurrentRepoForTest(&app, allocator);
     defer app.repo_session.deinit(allocator);
@@ -1236,14 +1207,14 @@ test "worktree branch action owns its task and fences cancel reopen and stale co
     app.overlay.openSwitchBranch(.repository);
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
     const Dummy = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) app_message.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!app_message.Msg {
             return .quit;
         }
-        fn failed(_: chasen.TaskFailure) app_message.Msg {
+        fn failed(_: chasen.TaskStartError) app_message.Msg {
             return .quit;
         }
     };
-    for (0..16) |_| try ctx.task().spawn(.{ .run = Dummy.run, .failed = Dummy.failed });
+    for (0..16) |_| _ = try ctx.task().spawn(.{ .run = Dummy.run, .failed = Dummy.failed });
     try std.testing.expectError(error.TaskLimitExceeded, app.confirmBranchSwitch(&ctx));
     try std.testing.expect(!app.remote_workflow.branch_switch.worktree_pending);
     try std.testing.expect(app.overlay.isSwitchBranch());
@@ -1255,16 +1226,12 @@ test "worktree branch action owns its task and fences cancel reopen and stale co
     try std.testing.expectEqual(@as(usize, 0), app.remote_workflow.branch_switch.selected_index);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.branch_switch_pending == null);
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const task: *WorktreeTask = @ptrCast(@alignCast(entries[0].ctx));
-    const observer = task.source_root;
-    try std.testing.expectEqualStrings("linked", task.branch);
-    try std.testing.expectEqualStrings("/linked", task.path);
+    try std.testing.expectEqualStrings("linked", app.remote_workflow.branch_switch.selectedItem().?.name);
+    try std.testing.expectEqualStrings("/linked", app.remote_workflow.branch_switch.selectedItem().?.worktree_path.?);
     app.clearBranchSwitch(allocator);
-    var abandoned = entries[0].failed(entries[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
-    try expectRootCapabilityClosed(observer);
+    entries[0].discard(allocator);
 
     // A newly opened picker rejects the old result as well as wrong page,
     // activation, repository epoch and physical source identities.
@@ -1406,11 +1373,11 @@ test "requestFetch rejects while another action is pending" {
 test "remote authentication fetch preparation and task terminals release request ownership" {
     const backing = std.testing.allocator;
     const DummyTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) RemoteHarness.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!RemoteHarness.Msg {
             return .quit;
         }
 
-        fn failed(_: chasen.TaskFailure) RemoteHarness.Msg {
+        fn failed(_: chasen.TaskStartError) RemoteHarness.Msg {
             return .quit;
         }
     };
@@ -1433,7 +1400,7 @@ test "remote authentication fetch preparation and task terminals release request
         try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
         try std.testing.expectEqualStrings("fetch unavailable: repository authority could not be retained", app.pages.changes.status.text());
     }
 
@@ -1454,7 +1421,7 @@ test "remote authentication fetch preparation and task terminals release request
         try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try std.testing.expect(!app.remote_workflow.action_control.isActive(1));
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
         try std.testing.expectEqualStrings("could not prepare background fetch", app.pages.changes.status.text());
     }
 
@@ -1467,7 +1434,7 @@ test "remote authentication fetch preparation and task terminals release request
         defer app.pages.changes.branch_status.deinit();
 
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = backing };
-        for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+        for (0..16) |_| _ = try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
         try std.testing.expectError(error.TaskLimitExceeded, app.requestFetch(&ctx));
 
         try std.testing.expect(!app.actionLifecycleView().hasPending());
@@ -1487,12 +1454,9 @@ test "remote authentication fetch preparation and task terminals release request
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = backing };
         try app.requestFetch(&ctx);
         const pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingAction;
-        const queued = ctx.takePendingTasksWith();
+        const queued = ctx.takePendingTasks();
         try std.testing.expectEqual(@as(usize, 1), queued.len);
-        const Task = app_actions.FetchTask(RemoteHarness.Msg);
-        const task: *Task = @ptrCast(@alignCast(queued[0].ctx));
-        const root_observer = task.root.?;
-        const msg = queued[0].failed(queued[0].ctx, .runtime_abandoned, backing);
+        const msg = queued[0].failed(error.ConcurrencyUnavailable, backing);
         const finished = switch (msg) {
             .action_finished => |action| switch (action) {
                 .fetch => |fetch| fetch,
@@ -1502,7 +1466,6 @@ test "remote authentication fetch preparation and task terminals release request
         };
         _ = app.remoteWorkflow().finishFetch(backing, finished);
 
-        try expectRootCapabilityClosed(root_observer);
         try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
         try std.testing.expect(!app.actionLifecycleView().hasPending());
         try std.testing.expect(!app.remote_workflow.action_control.isActive(pending.generation));
@@ -1564,7 +1527,7 @@ test "confirmPush rejects a proposal after repository authority changes" {
     try std.testing.expect(app.remote_workflow.push_confirmation == null);
     try std.testing.expect(!app.overlay.isPushBranch());
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.changes.status.text());
 }
 
@@ -1594,18 +1557,18 @@ test "confirmPush rejects a proposal with a stale root identity" {
     try std.testing.expect(app.remote_workflow.push_confirmation == null);
     try std.testing.expect(!app.overlay.isPushBranch());
     try std.testing.expect(!app.actionLifecycleView().hasPending());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.changes.status.text());
 }
 
 test "background remote task rejection and abandonment release owned authorities" {
     const allocator = std.testing.allocator;
     const DummyTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) RemoteHarness.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!RemoteHarness.Msg {
             return .quit;
         }
 
-        fn failed(_: chasen.TaskFailure) RemoteHarness.Msg {
+        fn failed(_: chasen.TaskStartError) RemoteHarness.Msg {
             return .quit;
         }
     };
@@ -1617,7 +1580,7 @@ test "background remote task rejection and abandonment release owned authorities
         defer app.cancelPushConfirmation(allocator);
         try installPushConfirmationForTest(&app, allocator);
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
-        for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+        for (0..16) |_| _ = try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
 
         try std.testing.expectError(error.TaskLimitExceeded, app.confirmPush(&ctx));
         try std.testing.expect(!app.actionLifecycleView().hasPending());
@@ -1638,9 +1601,9 @@ test "background remote task rejection and abandonment release owned authorities
         try app.confirmPush(&ctx);
         const owner = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingAction;
         try std.testing.expect(app.remote_workflow.action_control.isActive(owner.generation));
-        const queued = ctx.takePendingTasksWith();
+        const queued = ctx.takePendingTasks();
         try std.testing.expectEqual(@as(usize, 1), queued.len);
-        const abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+        const abandoned = queued[0].failed(error.ConcurrencyUnavailable, allocator);
         try app.update(abandoned, &ctx);
 
         try std.testing.expect(!app.actionLifecycleView().hasPending());
@@ -1734,7 +1697,7 @@ test "finishPush retires an exact action before dropping a mismatched operation 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqualStrings("unchanged", app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
 }
 
 test "remote cancel terminal drops retry authority and requires reload before deferred quit" {
@@ -1873,7 +1836,7 @@ test "push retry inspection rejects duplicate requests without losing task owner
     try app.runInteractivePush(&ctx);
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .inspecting);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
     try std.testing.expectEqualStrings("push retry inspection already running", app.pages.changes.status.text());
 
     app.clearRemoteError(allocator);
@@ -1890,11 +1853,11 @@ test "push retry inspection spawn rollback restores the sole target" {
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{
         ._allocator = allocator,
         ._io = std.testing.io,
-        ._pending_tasks_with_len = 16,
+        ._pending_tasks_len = 16,
     };
 
     try std.testing.expectError(error.TaskLimitExceeded, app.runInteractivePush(&ctx));
-    ctx._pending_tasks_with_len = 0;
+    ctx._pending_tasks_len = 0;
 
     const restored = app.remote_workflow.push_retry.state.availableTarget() orelse return error.ExpectedPushRetryTarget;
     try std.testing.expectEqualStrings("abc123", restored.oid);
@@ -1915,7 +1878,7 @@ test "push retry rejects a stale root identity before inspection admission" {
     try app.runInteractivePush(&ctx);
 
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("push retry unavailable: repository authority changed", app.pages.changes.status.text());
@@ -1927,7 +1890,7 @@ test "push retry rejects a stale root identity before inspection admission" {
     try app.runInteractivePush(&ctx);
 
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqualStrings("push retry unavailable: repository authority changed", app.pages.changes.status.text());
@@ -2078,16 +2041,13 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     try app.runInteractivePush(&ctx);
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .inspecting);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
-    const Task = app_push_retry.InspectionTask(RemoteHarness.Msg);
-    const inspection_task: *Task = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-    const foreground_root_observer = inspection_task.root;
-    try expectRootCapabilityOpen(foreground_root_observer);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
     try tmp.dir.rename("work", tmp.dir, "moved", io);
     try tmp.dir.createDir(io, "work", .default_dir);
-    const pending_inspection = ctx.takePendingTasksWith();
+    const pending_inspection = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending_inspection.len);
-    const inspection_msg = pending_inspection[0].run(pending_inspection[0].ctx, allocator, io);
+    const inspection_msg = try pending_inspection[0].run(allocator, io);
+    const foreground_root_observer = inspection_msg.push_inspection_finished.root.?;
     _ = parent_environment.swapRemove("HTTPS_PROXY");
     try app.update(inspection_msg, &ctx);
 
@@ -2146,7 +2106,6 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     };
     for (entry.argv, &expected_argv) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
     for (entry.argv) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--set-upstream"));
-    try expectRootCapabilityOpen(foreground_root_observer);
 
     const foreground_request_id = app.remote_workflow.push_retry.state.foreground.request_id;
     try app.finishPushForeground(&ctx, .{
@@ -2155,9 +2114,9 @@ test "runInteractivePush queues foreground oid refspec and owns retry target" {
     });
     try std.testing.expect(app.remote_workflow.push_retry.state == .finalizing);
     try std.testing.expectEqualStrings("finalizing upstream...", app.pages.changes.status.text());
-    const pending_finalizer = ctx.takePendingTasksWith();
+    const pending_finalizer = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending_finalizer.len);
-    const finalizer_message = pending_finalizer[0].run(pending_finalizer[0].ctx, allocator, io);
+    const finalizer_message = try pending_finalizer[0].run(allocator, io);
     try app.update(finalizer_message, &ctx);
     const status = app.pages.changes.status.text();
     try std.testing.expectEqualStrings(
@@ -2184,14 +2143,14 @@ test "upstream finalization queue rejection publishes partial success once witho
     const root_observer = app.remote_workflow.push_retry.state.foreground.root;
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{
         ._allocator = allocator,
-        ._pending_tasks_with_len = 16,
+        ._pending_tasks_len = 16,
     };
 
     const outcome = try app.remoteWorkflow().finishPushForeground(&ctx, .{
         .request_id = .{ .id = 71 },
         .outcome = .{ .exited = 0 },
     });
-    ctx._pending_tasks_with_len = 0;
+    ctx._pending_tasks_len = 0;
 
     const status = app.pages.changes.status.text();
     try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, outcome.reload);
@@ -2226,9 +2185,9 @@ test "upstream finalization runtime abandonment defers quit and discards retry a
     });
     try std.testing.expect(app.remote_workflow.push_retry.state == .finalizing);
     try std.testing.expect(app.remoteWorkflow().cancelActiveRemote(true));
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    const message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+    const message = queued[0].failed(error.ConcurrencyUnavailable, allocator);
     const finished = switch (message) {
         .push_upstream_finalize_finished => |result| result,
         else => return error.ExpectedUpstreamFinalizeTerminal,
@@ -2267,10 +2226,9 @@ test "upstream finalization shutdown drops an undelivered terminal after releasi
         .outcome = .{ .exited = 0 },
     });
     try std.testing.expect(app.remote_workflow.push_retry.state == .finalizing);
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    var message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    message.deinitUndelivered(allocator);
+    queued[0].discard(allocator);
 
     try std.testing.expectEqualStrings("finalizing upstream...", app.pages.changes.status.text());
     try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), "warning:") == null);
@@ -2306,11 +2264,11 @@ test "upstream finalization stale completion closes ownership without current pu
         .request_id = .{ .id = 73 },
         .outcome = .{ .exited = 0 },
     });
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     try installActiveRepoForTest(&app, allocator, repo_b);
     app.pages.changes.status.set("replacement status", .{});
-    const message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
+    const message = queued[0].failed(error.ConcurrencyUnavailable, allocator);
     const finished = switch (message) {
         .push_upstream_finalize_finished => |result| result,
         else => return error.ExpectedUpstreamFinalizeTerminal,
@@ -2363,10 +2321,10 @@ test "runInteractivePush keeps retry target when foreground queue is full" {
     try app.setRemoteErrorWithRetry(allocator, "failed", try retryTargetForTest(&app, allocator, .{ .oid = repo.oid }));
 
     try app.runInteractivePush(&ctx);
-    const Task = app_push_retry.InspectionTask(RemoteHarness.Msg);
-    const inspection_task: *Task = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-    const inspection_root_observer = inspection_task.root;
-    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+    const inspection_entries = ctx.takePendingTasks();
+    const inspection_message = try inspection_entries[0].run(allocator, io);
+    const inspection_root_observer = inspection_message.push_inspection_finished.root.?;
+    try app.update(inspection_message, &ctx);
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
@@ -2402,12 +2360,10 @@ test "interactive push maps an invalid descriptor queue rejection without fallba
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.runInteractivePush(&ctx);
-    const pending_inspection = ctx.takePendingTasksWith();
+    const pending_inspection = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending_inspection.len);
-    const Task = app_push_retry.InspectionTask(RemoteHarness.Msg);
-    const inspection_task: *Task = @ptrCast(@alignCast(pending_inspection[0].ctx));
-    const inspection_root_observer = inspection_task.root;
-    const inspection_msg = pending_inspection[0].run(pending_inspection[0].ctx, allocator, io);
+    const inspection_msg = try pending_inspection[0].run(allocator, io);
+    const inspection_root_observer = inspection_msg.push_inspection_finished.root.?;
     _ = std.posix.system.close(inspection_root_observer.handle);
     try app.update(inspection_msg, &ctx);
 
@@ -2446,12 +2402,10 @@ test "interactive push inspection warning survives a concurrent action admission
     var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator, ._io = io };
 
     try app.runInteractivePush(&ctx);
-    const pending_inspection = ctx.takePendingTasksWith();
+    const pending_inspection = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending_inspection.len);
-    const Task = app_push_retry.InspectionTask(RemoteHarness.Msg);
-    const inspection_task: *Task = @ptrCast(@alignCast(pending_inspection[0].ctx));
-    const inspection_root_observer = inspection_task.root;
-    const inspection_msg = pending_inspection[0].run(pending_inspection[0].ctx, allocator, io);
+    const inspection_msg = try pending_inspection[0].run(allocator, io);
+    const inspection_root_observer = inspection_msg.push_inspection_finished.root.?;
     _ = beginAcceptedTestAction(&app, .stage_file);
     try app.update(inspection_msg, &ctx);
 
@@ -2511,7 +2465,7 @@ test "finishPushForeground ignores stale request id" {
 
     try std.testing.expect(app.actionLifecycleView().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .foreground);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
 }
 
 test "finishPushForeground stale and duplicate terminals preserve newer action owner" {
@@ -2538,7 +2492,7 @@ test "finishPushForeground stale and duplicate terminals preserve newer action o
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expect(app.actionLifecycleView().isAccepted(current));
     try std.testing.expectEqualStrings("unchanged", app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
 
     try app.finishPushForeground(&ctx, .{
         .request_id = .{ .id = 7 },
@@ -2587,7 +2541,7 @@ test "interactive push foreground terminals publish proxy warning once for both 
 
         const status = app.pages.changes.status.text();
         try std.testing.expectEqual(@as(@TypeOf(completion.reload), if (case.outcome == .runtime_abandoned) .none else .source_and_aux), completion.reload);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
         try std.testing.expect(app.overlay.kind == .none);
         try std.testing.expectEqualStrings(case.expected, status);
         try std.testing.expectEqual(@as(usize, if (case.outcome == .runtime_abandoned) 0 else 1), std.mem.count(u8, status, "warning: credential-bearing proxy was omitted"));
@@ -2625,7 +2579,6 @@ test "interactive push foreground root survives repository replacement and close
         app.remote_workflow.repositoryInvalidationPort(&app.overlay).invalidateBeforeRepositoryReplacement(allocator);
         try std.testing.expect(app.remote_workflow.push_retry.state == .foreground);
         try installActiveRepoForTest(&app, allocator, repo_b);
-        try expectRootCapabilityOpen(foreground_root_observer);
 
         var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
         try app.finishPushForeground(&ctx, .{

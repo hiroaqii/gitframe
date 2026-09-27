@@ -117,18 +117,17 @@ test "Repository branch App route runs owned task and preserves primary status" 
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
 
     _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    const task: *RepositoryBranchTask = @ptrCast(@alignCast(queued[0].ctx));
+    const message = try queued[0].run(allocator, io);
+    const finished = message.repository.branch_finished;
     try std.testing.expectEqual(page.RequestIdentity{
         .origin = .repository,
         .repo_epoch = 3,
         .activation_id = app.pages.repository.activation_id,
-    }, task.request.identity);
-    try std.testing.expect(task.request.root.identity.eql(app.repo_session.view().activeIdentity().?));
-    try std.testing.expectEqualStrings(root_path, task.request.root_path);
+    }, finished.identity);
+    try std.testing.expect(finished.root_identity.eql(app.repo_session.view().activeIdentity().?));
 
-    const message = queued[0].run(queued[0].ctx, allocator, io);
     try app.update(message, &ctx);
 
     try std.testing.expectEqualStrings("main", app.pages.repository.branch.snapshot.status.branchName().?);
@@ -136,7 +135,7 @@ test "Repository branch App route runs owned task and preserves primary status" 
     try std.testing.expect(app.pages.repository.branch.pending == null);
     try std.testing.expectEqualStrings("Selected source range", app.pages.repository.status.text());
     try std.testing.expect(!ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 
 test "Repository path history App route runs one task and preserves primary status" {
@@ -164,14 +163,14 @@ test "Repository path history App route runs one task and preserves primary stat
     var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
 
     _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    const task: *RepositoryPathHistoryTask = @ptrCast(@alignCast(queued[0].ctx));
-    try std.testing.expectEqualStrings("tracked.txt", task.request.path);
-    try std.testing.expectEqual(@as(u64, 7), task.request.manifest_revision);
-    try std.testing.expect(task.request.root.identity.eql(app.repo_session.view().activeIdentity().?));
+    const message = try queued[0].run(allocator, io);
+    const finished = message.repository.path_history_finished;
+    try std.testing.expectEqualStrings("tracked.txt", finished.path);
+    try std.testing.expectEqual(@as(u64, 7), finished.manifest_revision);
+    try std.testing.expect(finished.root_identity.eql(app.repo_session.view().activeIdentity().?));
 
-    const message = queued[0].run(queued[0].ctx, allocator, io);
     try app.update(message, &ctx);
 
     const presentation = app.pages.repository.sourceHeaderPresentation().?;
@@ -179,7 +178,7 @@ test "Repository path history App route runs one task and preserves primary stat
     try std.testing.expect(app.pages.repository.path_history.terminal == .known);
     try std.testing.expectEqualStrings("Selected source range", app.pages.repository.status.text());
     try std.testing.expect(!ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
 }
 
 test "Repository branch App start failures close request owners and stay branch local" {
@@ -208,7 +207,7 @@ test "Repository branch App start failures close request owners and stay branch 
         try std.testing.expect(app.pages.repository.branch.pending == null);
         try std.testing.expectEqual(@as(u64, 0), app.pages.repository.branch.generation);
         try std.testing.expect(app.pages.repository.branch.freshness.failed == .preparation_failed);
-        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
     }
 
     // Request preparation succeeds, then task allocation fails. The exact
@@ -231,7 +230,7 @@ test "Repository branch App start failures close request owners and stay branch 
         try std.testing.expect(app.pages.repository.branch.pending == null);
         try std.testing.expectEqual(@as(u64, 1), app.pages.repository.branch.generation);
         try std.testing.expect(app.pages.repository.branch.freshness.failed == .start_failed);
-        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
     }
 
     // A full Chasen task queue rejects synchronously after the task captured
@@ -239,10 +238,10 @@ test "Repository branch App start failures close request owners and stay branch 
     // only its exact generation.
     {
         const DummyTask = struct {
-            fn run(_: std.mem.Allocator, _: std.Io) TestApp.Msg {
+            fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestApp.Msg {
                 return .quit;
             }
-            fn failed(_: chasen.TaskFailure) TestApp.Msg {
+            fn failed(_: chasen.TaskStartError) TestApp.Msg {
                 return .quit;
             }
         };
@@ -255,14 +254,13 @@ test "Repository branch App start failures close request owners and stay branch 
         defer app.repo_session.repo_state.deinit(allocator);
         try configureRepositoryBranchAppForTest(&app, allocator, root_path);
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
-        for (0..16) |_| try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+        for (0..16) |_| _ = try ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
 
         _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
 
         try std.testing.expect(app.pages.repository.branch.pending == null);
         try std.testing.expectEqual(@as(u64, 1), app.pages.repository.branch.generation);
         try std.testing.expect(app.pages.repository.branch.freshness.failed == .start_failed);
-        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasksWith().len);
         try std.testing.expectEqual(@as(usize, 16), ctx.takePendingTasks().len);
     }
 }
@@ -288,10 +286,10 @@ test "Repository branch App runtime terminals preserve diagnostic ownership" {
         app.pages.repository.status.set("Copy failed", .{});
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
         _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
-        const queued = ctx.takePendingTasksWith();
+        const queued = ctx.takePendingTasks();
         try std.testing.expectEqual(@as(usize, 1), queued.len);
 
-        const message = queued[0].failed(queued[0].ctx, .{ .start_failed = "SystemResources" }, allocator);
+        const message = queued[0].failed(error.OutOfMemory, allocator);
         try app.update(message, &ctx);
 
         try std.testing.expect(app.pages.repository.branch.freshness.failed == .start_failed);
@@ -313,11 +311,10 @@ test "Repository branch App runtime terminals preserve diagnostic ownership" {
         try configureRepositoryBranchAppForTest(&app, allocator, root_path);
         var ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
         _ = try app_testing.repositoryCoordinator(&app).startPending(&ctx);
-        const queued = ctx.takePendingTasksWith();
+        const queued = ctx.takePendingTasks();
         try std.testing.expectEqual(@as(usize, 1), queued.len);
 
-        var message = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
+        queued[0].discard(allocator);
 
         try std.testing.expect(app.pages.repository.branch.pending != null);
         try std.testing.expect(app.pages.repository.branch.freshness == .validating);
@@ -440,7 +437,7 @@ test "repository transition missing document capability closes incoming owner" {
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.request_failed, unavailable.reason);
     try std.testing.expectEqual(owned_address, @intFromPtr(unavailable.path.ptr));
     try std.testing.expect(!app.pages.repository.needs_document_revalidation);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
 }
 
 test "repository transition ordinary document capability loss preserves retry" {
@@ -466,7 +463,7 @@ test "repository transition ordinary document capability loss preserves retry" {
     try std.testing.expect(app.pages.repository.needs_document_revalidation);
     try std.testing.expectEqualStrings("retained diagnostic", app.pages.repository.status.text());
     try std.testing.expect(app.pages.repository.incoming == .none);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
 }
 
 test "repository syntax task allocation and spawn failures release owners and remain retryable" {
@@ -524,29 +521,27 @@ test "repository syntax task allocation and spawn failures release owners and re
     var allocation_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
     _ = try app_testing.repositoryCoordinator(&app).startPending(&allocation_ctx);
     try std.testing.expect(app.pages.repository.wantsSyntaxRequest());
-    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasks().len);
 
     const DummyTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestApp.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestApp.Msg {
             return .quit;
         }
-        fn failed(_: chasen.TaskFailure) TestApp.Msg {
+        fn failed(_: chasen.TaskStartError) TestApp.Msg {
             return .quit;
         }
     };
     var spawn_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
-    for (0..16) |_| try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    for (0..16) |_| _ = try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
     _ = try app_testing.repositoryCoordinator(&app).startPending(&spawn_ctx);
     try std.testing.expect(app.pages.repository.wantsSyntaxRequest());
-    try std.testing.expectEqual(@as(usize, 0), spawn_ctx.takePendingTasksWith().len);
     try std.testing.expectEqual(@as(usize, 16), spawn_ctx.takePendingTasks().len);
 
     var retry_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
     _ = try app_testing.repositoryCoordinator(&app).startPending(&retry_ctx);
-    const queued = retry_ctx.takePendingTasksWith();
+    const queued = retry_ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    queued[0].discard(allocator);
 }
 
 test "repository change map task allocation and spawn failures release owners and remain retryable" {
@@ -604,29 +599,27 @@ test "repository change map task allocation and spawn failures release owners an
     var allocation_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = failing.allocator(), ._io = io };
     _ = try app_testing.repositoryCoordinator(&app).startPending(&allocation_ctx);
     try std.testing.expect(app.pages.repository.wantsChangeMapRequest());
-    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasks().len);
 
     const DummyTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) TestApp.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestApp.Msg {
             return .quit;
         }
-        fn failed(_: chasen.TaskFailure) TestApp.Msg {
+        fn failed(_: chasen.TaskStartError) TestApp.Msg {
             return .quit;
         }
     };
     var spawn_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
-    for (0..16) |_| try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    for (0..16) |_| _ = try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
     _ = try app_testing.repositoryCoordinator(&app).startPending(&spawn_ctx);
     try std.testing.expect(app.pages.repository.wantsChangeMapRequest());
-    try std.testing.expectEqual(@as(usize, 0), spawn_ctx.takePendingTasksWith().len);
     try std.testing.expectEqual(@as(usize, 16), spawn_ctx.takePendingTasks().len);
 
     var retry_ctx: chasen.Ctx(TestApp.Msg) = .{ ._allocator = allocator, ._io = io };
     _ = try app_testing.repositoryCoordinator(&app).startPending(&retry_ctx);
-    const queued = retry_ctx.takePendingTasksWith();
+    const queued = retry_ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    queued[0].discard(allocator);
 }
 
 const BranchStatusBundleSpec = struct {
@@ -744,10 +737,3 @@ const TestRepoPair = struct {
         self.* = undefined;
     }
 };
-
-fn clearPendingRepositoryTasks(ctx: *chasen.Ctx(TestApp.Msg), allocator: std.mem.Allocator) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}

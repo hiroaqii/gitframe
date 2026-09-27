@@ -514,7 +514,7 @@ pub const Controller = struct {
         environment_consumed = true;
         repo_root_consumed = true;
         errdefer task.destroy(ctx.allocator());
-        try ctx.task().spawnWith(.{ .ctx = task, .run = BranchListLoadTask.run, .failed = BranchListLoadTask.failed });
+        _ = try ctx.task().spawnOwned(task, .{ .run = BranchListLoadTask.run, .failed = BranchListLoadTask.failed, .cleanup = BranchListLoadTask.destroy });
         return .{ .cancel_local_confirmations = true };
     }
 
@@ -575,10 +575,10 @@ pub const Controller = struct {
                 selected.worktree_path.?,
             );
             errdefer task.destroy(ctx.allocator());
-            try ctx.task().spawnWith(.{
-                .ctx = task,
+            _ = try ctx.task().spawnOwned(task, .{
                 .run = worktree_switch.Task(app_message.Msg).run,
                 .failed = worktree_switch.Task(app_message.Msg).failed,
+                .cleanup = worktree_switch.Task(app_message.Msg).destroy,
             });
             branch_switch.worktree_pending = true;
             status.set("checking worktree for {s}...", .{selected.name});

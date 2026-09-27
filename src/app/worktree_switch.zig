@@ -79,22 +79,19 @@ pub fn Task(comptime Msg: type) type {
             allocator.destroy(self);
         }
 
-        pub fn run(ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
+        pub fn run(self: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const ready = prepare(allocator, io, .{
                 .cwd = self.source_root.dir(),
                 .environment = &self.environment,
-            }, self.branch, self.path) catch |err| return self.finish(allocator, .{ .failed = failureMessage(err) });
-            return self.finish(allocator, .{ .ready = ready });
+            }, self.branch, self.path) catch |err| return self.finish(.{ .failed = failureMessage(err) });
+            return self.finish(.{ .ready = ready });
         }
 
-        pub fn failed(ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.finish(allocator, .{ .failed = actions.taskFailureMessage(failure) });
+        pub fn failed(self: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return self.finish(.{ .failed = actions.taskFailureMessage(failure) });
         }
 
-        fn finish(self: *@This(), allocator: std.mem.Allocator, result: @FieldType(Finished, "result")) Msg {
-            defer self.destroy(allocator);
+        fn finish(self: *@This(), result: @FieldType(Finished, "result")) Msg {
             return Msg.loadFinished(.{ .shell = .{ .worktree_switch = .{
                 .owner = self.owner,
                 .generation = self.generation,

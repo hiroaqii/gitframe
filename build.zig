@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(
         usize,
         "expected_package_root_test_count",
-        if (!provider_enabled and test_filters.len == 0) 1955 else 0,
+        if (!provider_enabled and test_filters.len == 0) 1956 else 0,
     );
     const build_options_mod = build_options.createModule();
 
@@ -409,6 +409,12 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
+    const check_tests_step = b.step("check-tests", "Compile all test artifacts without executing them");
+    for ([_]*std.Build.Step.Compile{
+        mod_tests,             exe_tests,         draw_tests,      diff_source_tests,        diff_parser_tests,
+        diff_view_model_tests, diff_search_tests, file_tree_tests, sidebar_view_model_tests, keymap_tests,
+        perf_baseline_exe,     core_wasm,
+    }) |artifact| check_tests_step.dependOn(&artifact.step);
 }
 
 fn supportsFlowSyntaxProvider(target: std.Build.ResolvedTarget) bool {

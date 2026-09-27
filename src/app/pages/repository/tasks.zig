@@ -228,9 +228,8 @@ pub fn ManifestTask(comptime AppMsg: type) type {
         request: Request,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runManifestLoadChecked(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!AppMsg {
+            return task.finish(runManifestLoadChecked(
                 task.request.root_path,
                 task.request.root,
                 task.request.expected_fingerprint,
@@ -241,29 +240,19 @@ pub fn ManifestTask(comptime AppMsg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) AppMsg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            task.deinitOwned(allocator);
-        }
-
-        /// One epilogue owns request/root/environment cleanup for every task
-        /// exit, including rejection before the runtime accepts the task.
-        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
             task.environment.deinit();
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: TaskResult) AppMsg {
-            defer task.deinitOwned(allocator);
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: TaskResult) AppMsg {
             const finished = ManifestFinished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
@@ -282,12 +271,11 @@ pub fn BranchTask(comptime AppMsg: type) type {
     return struct {
         request: repository_branch.Request,
         /// Borrowed from process initialization. App and Chasen keep this map
-        /// alive until every started task reaches `run` or `failed` cleanup.
+        /// alive until every accepted task reaches cleanup.
         env_map: ?*const std.process.Environ.Map,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runRepositoryBranchLoadChecked(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!AppMsg {
+            return task.finish(runRepositoryBranchLoadChecked(
                 task.request.root_path,
                 task.request.root,
                 task.env_map,
@@ -296,28 +284,20 @@ pub fn BranchTask(comptime AppMsg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) AppMsg {
             // Branch keeps its typed failure vocabulary; the shared
             // failure-string helper intentionally does not apply here.
-            return task.finish(allocator, .{ .failed = switch (failure) {
-                .start_failed => .start_failed,
-                .runtime_abandoned => .runtime_abandoned,
-            } });
+            return task.finish(.{ .failed = .start_failed });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: repository_branch.Result) AppMsg {
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: repository_branch.Result) AppMsg {
             const finished = repository_branch.Finished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
@@ -337,8 +317,7 @@ pub fn PathHistoryTask(comptime AppMsg: type) type {
         request: repository_path_history.Request,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!AppMsg {
             const outcome = runRepositoryPathHistoryChecked(
                 task.request.root_path,
                 task.request.root,
@@ -347,19 +326,14 @@ pub fn PathHistoryTask(comptime AppMsg: type) type {
                 allocator,
                 io,
             );
-            return task.finish(allocator, outcome);
+            return task.finish(outcome);
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .unavailable);
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) AppMsg {
+            return task.finish(.unavailable);
         }
 
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            task.deinitOwned(allocator);
-        }
-
-        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
             task.environment.deinit();
             allocator.destroy(task);
@@ -367,10 +341,8 @@ pub fn PathHistoryTask(comptime AppMsg: type) type {
 
         fn finish(
             task: *@This(),
-            allocator: std.mem.Allocator,
             outcome: git_read.RepositoryPathHistoryOutcome,
         ) AppMsg {
-            defer task.deinitOwned(allocator);
             const finished = repository_path_history.Finished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root_identity,
@@ -504,17 +476,13 @@ pub fn DocumentTask(comptime AppMsg: type) type {
     return struct {
         request: DocumentRequest,
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
             allocator.destroy(task);
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!AppMsg {
             var snapshot = selected_document.load(task.request.root, task.request.path, allocator, io);
             defer snapshot.deinit(allocator);
             const value = DocumentValue.fromLoaded(allocator, &snapshot.value);
@@ -532,10 +500,7 @@ pub fn DocumentTask(comptime AppMsg: type) type {
             return .{ .repository = .{ .document_finished = finished } };
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) AppMsg {
             const finished = DocumentFinished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
@@ -557,17 +522,13 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
     return struct {
         request: SyntaxRequest,
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
             allocator.destroy(task);
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!AppMsg {
             // Re-read through an independently owned root/path instead of
             // borrowing DisplayedDocument across threads. The extra bounded
             // read keeps plain-source acceptance immediate and avoids shared or
@@ -603,10 +564,7 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
             return .{ .repository = .{ .syntax_finished = finished } };
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.request.deinit(allocator);
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) AppMsg {
             const finished = SyntaxFinished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
@@ -631,24 +589,14 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
         request: ChangeMapRequest,
         environment: git_command.LocalGitEnvironment,
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            task.deinitOwned(allocator);
-        }
-
-        /// One epilogue owns request/root/environment cleanup for every task
-        /// exit, including rejection before the runtime accepts the task.
-        fn deinitOwned(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
             task.environment.deinit();
             allocator.destroy(task);
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer task.deinitOwned(allocator);
-
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!AppMsg {
             var fingerprint = task.request.expected_fingerprint;
             var content_line_count = task.request.expected_content_line_count;
             var result: ChangeMapResult = .unavailable;
@@ -692,9 +640,7 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
             return .{ .repository = .{ .change_map_finished = finished } };
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) AppMsg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer task.deinitOwned(allocator);
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) AppMsg {
             const finished = ChangeMapFinished{
                 .identity = task.request.identity,
                 .root_identity = task.request.root.identity,
@@ -1123,7 +1069,8 @@ test "Repository branch task reads through its descriptor and posts an owned com
         },
         .env_map = null,
     };
-    var message = Branch.run(task, allocator, std.testing.io);
+    var message = try Branch.run(task, allocator, std.testing.io);
+    Branch.destroy(task, allocator);
     defer message.repository.deinitUndelivered(allocator);
     switch (message.repository) {
         .branch_finished => |finished| {
@@ -1151,12 +1098,13 @@ test "Repository branch task failure callback preserves typed runtime ownership"
         },
         .env_map = null,
     };
-    var message = Branch.failed(task, .runtime_abandoned, allocator);
+    var message = Branch.failed(task, error.ConcurrencyUnavailable, allocator);
+    Branch.destroy(task, allocator);
     defer message.repository.deinitUndelivered(allocator);
     switch (message.repository) {
         .branch_finished => |finished| {
             try std.testing.expect(root.capability.identity.eql(finished.root_identity));
-            try std.testing.expectEqual(repository_branch.Failure.runtime_abandoned, finished.result.failed);
+            try std.testing.expectEqual(repository_branch.Failure.start_failed, finished.result.failed);
         },
         else => return error.ExpectedBranchCompletion,
     }
@@ -1184,7 +1132,8 @@ test "Repository path history task reads descriptor-owned current path and trans
         .environment = environment,
     };
     environment = undefined;
-    var message = History.run(task, allocator, std.testing.io);
+    var message = try History.run(task, allocator, std.testing.io);
+    History.destroy(task, allocator);
     defer message.repository.deinitUndelivered(allocator);
     switch (message.repository) {
         .path_history_finished => |finished| {
@@ -1219,7 +1168,8 @@ test "Repository path history task runtime failure closes as owned unavailable c
         .environment = environment,
     };
     environment = undefined;
-    var message = History.failed(task, .runtime_abandoned, allocator);
+    var message = History.failed(task, error.ConcurrencyUnavailable, allocator);
+    History.destroy(task, allocator);
     defer message.repository.deinitUndelivered(allocator);
     switch (message.repository) {
         .path_history_finished => |finished| try std.testing.expect(finished.outcome == .unavailable),
@@ -1286,7 +1236,8 @@ test "repository tasks derive completion root identity from their descriptor" {
     };
     try std.testing.expectEqualStrings("preserved", manifest_task.environment.borrow().get("GITFRAME_S1_CANARY").?);
     try std.testing.expect(manifest_task.environment.borrow().get("GIT_mixed_case_selector") == null);
-    var manifest_message = Manifest.run(manifest_task, allocator, io);
+    var manifest_message = try Manifest.run(manifest_task, allocator, io);
+    Manifest.destroy(manifest_task, allocator);
     defer manifest_message.repository.deinitUndelivered(allocator);
     switch (manifest_message.repository) {
         .manifest_finished => |finished| {
@@ -1307,7 +1258,8 @@ test "repository tasks derive completion root identity from their descriptor" {
         },
         .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
     };
-    var manifest_failed_message = Manifest.failed(manifest_failed_task, .runtime_abandoned, allocator);
+    var manifest_failed_message = Manifest.failed(manifest_failed_task, error.ConcurrencyUnavailable, allocator);
+    Manifest.destroy(manifest_failed_task, allocator);
     defer manifest_failed_message.repository.deinitUndelivered(allocator);
 
     const manifest_destroyed_task = try allocator.create(Manifest);
@@ -1334,7 +1286,8 @@ test "repository tasks derive completion root identity from their descriptor" {
             .root = try root_b.capability.duplicate(),
         },
     };
-    var document_message = Document.run(document_task, allocator, io);
+    var document_message = try Document.run(document_task, allocator, io);
+    Document.destroy(document_task, allocator);
     defer document_message.repository.deinitUndelivered(allocator);
     switch (document_message.repository) {
         .document_finished => |finished| try std.testing.expect(expected_identity.eql(finished.root_identity)),
@@ -1356,7 +1309,8 @@ test "repository tasks derive completion root identity from their descriptor" {
             .root = try root_b.capability.duplicate(),
         },
     };
-    var syntax_message = Syntax.run(syntax_task, allocator, io);
+    var syntax_message = try Syntax.run(syntax_task, allocator, io);
+    Syntax.destroy(syntax_task, allocator);
     defer syntax_message.repository.deinitUndelivered(allocator);
     switch (syntax_message.repository) {
         .syntax_finished => |finished| {
@@ -1386,7 +1340,8 @@ test "repository tasks derive completion root identity from their descriptor" {
     };
     try std.testing.expectEqualStrings("preserved", change_map_task.environment.borrow().get("GITFRAME_S1_CANARY").?);
     try std.testing.expect(change_map_task.environment.borrow().get("GIT_mixed_case_selector") == null);
-    var change_map_message = ChangeMap.run(change_map_task, allocator, io);
+    var change_map_message = try ChangeMap.run(change_map_task, allocator, io);
+    ChangeMap.destroy(change_map_task, allocator);
     defer change_map_message.repository.deinitUndelivered(allocator);
     switch (change_map_message.repository) {
         .change_map_finished => |finished| {
@@ -1412,7 +1367,8 @@ test "repository tasks derive completion root identity from their descriptor" {
         },
         .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, &parent_environment),
     };
-    var change_map_failed_message = ChangeMap.failed(change_map_failed_task, .runtime_abandoned, allocator);
+    var change_map_failed_message = ChangeMap.failed(change_map_failed_task, error.ConcurrencyUnavailable, allocator);
+    ChangeMap.destroy(change_map_failed_task, allocator);
     defer change_map_failed_message.repository.deinitUndelivered(allocator);
 
     const change_map_destroyed_task = try allocator.create(ChangeMap);
@@ -1450,7 +1406,12 @@ test "repository document task builds the bounded source model before delivery" 
             .root = try root.capability.duplicate(),
         },
     };
-    var message = Document.run(task, allocator, std.testing.io);
+    const root_observer = task.request.root;
+    var ctx: chasen.Ctx(TaskTestMsg) = .{ ._allocator = allocator };
+    _ = try ctx.task().spawnOwned(task, .{ .run = Document.run, .failed = Document.failed, .cleanup = Document.destroy });
+    const entries = ctx.takePendingTasks();
+    var message = try entries[0].run(allocator, std.testing.io);
+    try std.testing.expectError(error.InvalidRootCapability, root_observer.duplicate());
     defer message.repository.deinitUndelivered(allocator);
     switch (message.repository) {
         .document_finished => |finished| switch (finished.value) {

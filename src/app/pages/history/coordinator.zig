@@ -233,7 +233,7 @@ pub const Controller = struct {
             .generation = generation,
             .request = request,
         });
-        ctx.task().spawnWith(.{ .ctx = task, .run = CatalogTask.run, .failed = CatalogTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = CatalogTask.run, .failed = CatalogTask.failed, .cleanup = CatalogTask.destroy }) catch |err| {
             CatalogTask.destroy(task, ctx.allocator());
             self.page_state.rejectSpawn(generation);
             return err;
@@ -283,7 +283,7 @@ pub const Controller = struct {
             .generation = generation,
             .request = request,
         });
-        ctx.task().spawnWith(.{ .ctx = task, .run = DiffTask.run, .failed = DiffTask.failed }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = DiffTask.run, .failed = DiffTask.failed, .cleanup = DiffTask.destroy }) catch |err| {
             DiffTask.destroy(task, ctx.allocator());
             self.page_state.rejectDiffSpawn(generation, "History diff task could not be started");
             return err;
@@ -298,11 +298,7 @@ pub const Controller = struct {
         };
         task.* = .{ .stamp = stamp };
         self.page_state.preview_state.armDebounce(stamp);
-        ctx.task().spawnWith(.{
-            .ctx = task,
-            .run = PreviewDebounceTask.run,
-            .failed = PreviewDebounceTask.failed,
-        }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = PreviewDebounceTask.run, .failed = PreviewDebounceTask.failed, .cleanup = PreviewDebounceTask.destroy }) catch |err| {
             PreviewDebounceTask.destroy(task, ctx.allocator());
             self.page_state.preview_state.rejectDebounceStart(stamp, .task_start);
             return err;
@@ -341,11 +337,7 @@ pub const Controller = struct {
             );
             return err;
         };
-        ctx.task().spawnWith(.{
-            .ctx = task,
-            .run = PreviewReadTask.run,
-            .failed = PreviewReadTask.failed,
-        }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = PreviewReadTask.run, .failed = PreviewReadTask.failed, .cleanup = PreviewReadTask.destroy }) catch |err| {
             PreviewReadTask.destroy(task, ctx.allocator());
             self.page_state.preview_state.rejectReaderStart(latest.key, .task_start);
             return err;

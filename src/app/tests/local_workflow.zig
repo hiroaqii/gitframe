@@ -61,21 +61,21 @@ test "body file navigation advances past a pending request and rejects its late 
     try app.pages.changes.git_status.replace(roots.a, &status);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
     defer ctx.runtimeClearPendingEffectCopies();
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx);
     try std.testing.expectEqualStrings("b", app.pages.changes.changes_projection.pending.?.path_key);
-    const first = ctx.takePendingTasksWith();
+    const first = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), first.len);
-    var late_b = first[0].failed(first[0].ctx, .runtime_abandoned, allocator);
+    var late_b = first[0].failed(error.ConcurrencyUnavailable, allocator);
     errdefer late_b.deinitUndelivered(allocator);
     late_b.load_finished.changes.projection.result = .{ .ready = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(allocator, "b", "late B\n") } };
 
     try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx);
     try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.pending.?.path_key);
-    const second = ctx.takePendingTasksWith();
+    const second = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), second.len);
-    var ready_c = second[0].failed(second[0].ctx, .runtime_abandoned, allocator);
+    var ready_c = second[0].failed(error.ConcurrencyUnavailable, allocator);
     ready_c.load_finished.changes.projection.result = .{ .ready = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(allocator, "c", "current C\n") } };
     try app.update(ready_c, &ctx);
     try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.displayed.request().?.path_key);
@@ -288,23 +288,6 @@ fn initStageHunkLaunchApp(
     return app;
 }
 
-fn clearPendingStatusTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}
-
-fn clearPendingStatusAndDiffTasks(
-    ctx: *chasen.Ctx(App.Msg),
-    allocator: std.mem.Allocator,
-) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}
-
 test "successful file action binds the exact source and status generations started by its refresh" {
     const allocator = std.testing.allocator;
     var roots = try TestRepoPair.init();
@@ -327,7 +310,7 @@ test "successful file action binds the exact source and status generations start
     const pending = beginAcceptedTestAction(&app, .stage_file);
     try installTestActionCursor(&app, allocator, .directory, "src", pending.generation);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
     try finishStageFileForTest(&app, &ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
@@ -335,10 +318,15 @@ test "successful file action binds the exact source and status generations start
         .result = .ok,
     });
 
-    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 3), entries.len);
-    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
-    const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    defer status_task_message.deinitUndelivered(allocator);
+    const status_task = status_task_message.load_finished.changes.status;
+    var source_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    defer source_task_message.deinitUndelivered(allocator);
+    const source_task = source_task_message.load_finished.changes.source;
+    entries[1].discard(allocator);
     const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
     try std.testing.expectEqual(pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
     try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
@@ -367,7 +355,7 @@ test "successful hunk action binds an exact status-only refresh" {
     const pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
     try finishStageHunkForTest(&app, &ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
@@ -377,9 +365,11 @@ test "successful hunk action binds an exact status-only refresh" {
         .result = .ok,
     });
 
-    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
+    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    defer status_task_message.deinitUndelivered(allocator);
+    const status_task = status_task_message.load_finished.changes.status;
     const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
     try std.testing.expectEqual(changes_page.action_cursor.RefreshRequirement.status_only, std.meta.activeTag(basis));
     try std.testing.expect(basis.memberState(.source) == null);
@@ -398,7 +388,7 @@ test "cached hunk unstage binds exact source and status refresh members" {
     const pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
     try finishUnstageHunkForTest(&app, &ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
@@ -409,10 +399,15 @@ test "cached hunk unstage binds exact source and status refresh members" {
         .result = .ok,
     });
 
-    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 3), entries.len);
-    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
-    const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    defer status_task_message.deinitUndelivered(allocator);
+    const status_task = status_task_message.load_finished.changes.status;
+    var source_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    defer source_task_message.deinitUndelivered(allocator);
+    const source_task = source_task_message.load_finished.changes.source;
+    entries[1].discard(allocator);
     const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
     try std.testing.expectEqual(changes_page.action_cursor.RefreshRequirement.source_and_status, std.meta.activeTag(basis));
     try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
@@ -429,7 +424,7 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
 
     const pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_len = 16 };
     try finishStageHunkForTest(&app, &ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
@@ -438,7 +433,7 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
         .session_mark_mutation = .none,
         .result = .ok,
     });
-    ctx._pending_tasks_with_len = 0;
+    ctx._pending_tasks_len = 0;
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.status_load.pending == null);

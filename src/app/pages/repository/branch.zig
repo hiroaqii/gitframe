@@ -13,7 +13,6 @@ pub const Failure = enum {
     load_failed,
     preparation_failed,
     start_failed,
-    runtime_abandoned,
 };
 
 pub const Freshness = union(enum) {

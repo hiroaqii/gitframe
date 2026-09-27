@@ -406,9 +406,9 @@ fn runOnlyPushInspectionTaskForTest(
     ctx: *chasen.Ctx(App.Msg),
     io: std.Io,
 ) !void {
-    const pending = ctx.takePendingTasksWith();
+    const pending = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending.len);
-    const msg = pending[0].run(pending[0].ctx, ctx.allocator(), io);
+    const msg = try pending[0].run(ctx.allocator(), io);
     try app.update(msg, ctx);
 }
 
@@ -416,30 +416,10 @@ fn deinitOnlyPushInspectionTaskForTest(
     ctx: *chasen.Ctx(App.Msg),
     io: std.Io,
 ) !void {
-    const pending = ctx.takePendingTasksWith();
+    const pending = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending.len);
-    var msg = pending[0].run(pending[0].ctx, ctx.allocator(), io);
+    var msg = try pending[0].run(ctx.allocator(), io);
     msg.deinitUndelivered(ctx.allocator());
-}
-
-fn clearPendingRepositoryTasks(
-    ctx: *chasen.Ctx(App.Msg),
-    allocator: std.mem.Allocator,
-) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}
-
-fn clearPendingStatusAndDiffTasks(
-    ctx: *chasen.Ctx(App.Msg),
-    allocator: std.mem.Allocator,
-) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
 }
 
 fn runAppTestGit(
@@ -581,7 +561,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
             app.pages.changes.repository_read_authority.epoch;
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
         defer ctx.runtimeClearPendingEffectCopies();
-        defer clearPendingRepositoryTasks(&ctx, allocator);
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
         try app.update(.run_interactive_push, &ctx);
         try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
@@ -607,7 +587,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         try std.testing.expect(
             app.pages.changes.repository_read_authority.mayStartRepositoryRead(),
         );
-        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
     }
 
     // The same accepted foreground owner can become detached before delivery.
@@ -628,7 +608,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         );
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
         defer ctx.runtimeClearPendingEffectCopies();
-        defer clearPendingRepositoryTasks(&ctx, allocator);
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
         try app.update(.run_interactive_push, &ctx);
         try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
@@ -650,7 +630,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         try std.testing.expect(
             app.pages.changes.repository_read_authority.mayStartRepositoryRead(),
         );
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
         try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
     }
 }
@@ -701,16 +681,16 @@ test "remote request preparation failures clear prior local confirmation" {
     };
     failure_app.overlay.openDiscardFile();
     const DummyTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) App.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!App.Msg {
             return .quit;
         }
 
-        fn failed(_: chasen.TaskFailure) App.Msg {
+        fn failed(_: chasen.TaskStartError) App.Msg {
             return .quit;
         }
     };
     var saturated_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    for (0..16) |_| try saturated_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    for (0..16) |_| _ = try saturated_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
 
     try std.testing.expectError(
         error.TaskLimitExceeded,
@@ -973,7 +953,7 @@ test "finishSwitchBranch success clears repo-local changes state and reloads mat
 
     const pending = beginAcceptedTestAction(&app, .switch_branch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
@@ -990,7 +970,7 @@ test "finishSwitchBranch success clears repo-local changes state and reloads mat
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.search.query.len);
     try std.testing.expectEqualStrings("switched branch: main -> feature", app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
 }
 
 test "finishSwitchBranch failure owns full details and allows closing and reopening picker" {
@@ -1019,7 +999,7 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
     app.pages.changes.search.query = app.pages.changes.search.input;
     const pending = beginAcceptedTestAction(&app, .switch_branch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
     defer ctx.runtimeClearPendingEffectCopies();
     try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
@@ -1038,7 +1018,7 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.staged_hunks.items.items.len);
     try std.testing.expectEqualStrings("needle", app.pages.changes.search.query.slice());
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
     try app.update(.copy_popup, &ctx);
     try std.testing.expectEqualStrings(details, ctx._pending_clipboard_copies[0].text);
 
@@ -1049,7 +1029,7 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
     try std.testing.expectEqual(page.Id.changes, app.active_page);
 
     // Simulate the branch refresh; file status may still be pending when b reopens.
-    clearPendingStatusAndDiffTasks(&ctx, allocator);
+    chasen.testing.discardPendingTasks(App.Msg, &ctx);
     var branch = try branchStatusBundleForRemoteRootTest(allocator, "abc123", "main", "origin/main");
     try app.pages.changes.branch_status.replace(roots.a, &branch);
     _ = app.pages.changes.activation.activate(app.repo_session.repo_epoch, .fresh, .pending, .fresh);
@@ -1057,7 +1037,7 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
     try app.update(reopen, &ctx);
     try std.testing.expect(app.overlay.isSwitchBranch());
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
 }
 
 test "finishSwitchBranch success clears completed repo marks when active repo changed" {
@@ -1101,7 +1081,7 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     try std.testing.expect(try app.pages.changes.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
     try std.testing.expect(!app.pages.changes.staged_hunks.containsExact("/repo", "a", old_key));
     try std.testing.expect(app.pages.changes.staged_hunks.containsExact("/other", "b", new_key));
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expectEqualStrings("", app.pages.changes.status.text());
 }
 
@@ -1183,7 +1163,7 @@ test "finishPull reloads matching active repo after up-to-date success" {
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
@@ -1219,7 +1199,7 @@ test "finishPull reloads matching active repo after failure" {
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
@@ -1261,7 +1241,7 @@ test "classified pull authentication failures open copyable sanitized details" {
         _ = activateChanges(&app);
         const pending = beginAcceptedTestAction(&app, .pull);
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
         defer ctx.runtimeClearPendingEffectCopies();
 
         try app.update(.{ .action_finished = .{ .pull = .{
@@ -1341,7 +1321,7 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
     const pending = beginAcceptedTestAction(&app, .push);
     app.remote_workflow.action_control.begin(pending.generation);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
     defer ctx.runtimeClearPendingEffectCopies();
 
     try app.update(.{ .action_finished = .{ .push = .{
@@ -1442,7 +1422,7 @@ test "finishFetch reloads matching active repo after failure" {
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .fetch);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .action_finished = .{ .fetch = .{
         .pending = pending,
@@ -1475,7 +1455,7 @@ test "remote cancel defers quit until the exact unknown-outcome terminal" {
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, std.testing.allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
     defer ctx.runtimeClearPendingEffectCopies();
 
     try app.update(.quit, &ctx);
@@ -1718,7 +1698,7 @@ test "finishPushForeground reloads matching active repo after failure" {
         .warnings = .{},
     } };
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
     try app.update(.{ .action_finished = .{ .push_foreground = .{
         .request_id = .{ .id = 9 },
@@ -1727,7 +1707,7 @@ test "finishPushForeground reloads matching active repo after failure" {
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
     try std.testing.expectEqualStrings("interactive push exited: 1", app.pages.changes.status.text());
 }
 
@@ -1772,7 +1752,7 @@ test "inactive Changes foreground completions retain diagnostics without effects
     const expected_status = try std.fmt.allocPrint(allocator, "interactive push exited for {s}: 1", .{roots.a});
     defer allocator.free(expected_status);
     try std.testing.expectEqualStrings(expected_status, app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.redraw_plan = .{};
@@ -1790,7 +1770,7 @@ test "inactive Changes foreground completions retain diagnostics without effects
     } } }, &ctx);
 
     try std.testing.expectEqualStrings("editor closed", app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     // An exact completion from the active Changes instance is the only editor
@@ -1809,7 +1789,7 @@ test "inactive Changes foreground completions retain diagnostics without effects
         },
     };
     var active_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&active_ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &active_ctx);
 
     try active_app.update(.{ .shell_effect_finished = .{ .editor = .{
         .request_id = .{ .id = 9 },
@@ -1818,7 +1798,7 @@ test "inactive Changes foreground completions retain diagnostics without effects
 
     try std.testing.expect(active_app.shell_effects_state.editor_foreground == null);
     try std.testing.expectEqualStrings("editor closed", active_app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 3), active_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 3), active_ctx._pending_tasks_len);
 }
 
 test "Repository branch switch terminals reload only their caller without activating Changes" {
@@ -1852,7 +1832,7 @@ test "Repository branch switch terminals reload only their caller without activa
         app.pages.changes.search.query = app.pages.changes.search.input;
         const pending = beginAcceptedTestAction(&app, .switch_branch);
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
         defer ctx.runtimeClearPendingEffectCopies();
 
         try app.update(.{ .action_finished = .{ .switch_branch = .{
@@ -1863,7 +1843,7 @@ test "Repository branch switch terminals reload only their caller without activa
             .result = .{ .failed_static = "wrong token" },
         } } }, &ctx);
         try std.testing.expect(app.action_runtime.view().isAccepted(pending));
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
 
         try app.update(.{ .action_finished = .{ .switch_branch = .{
             .pending = pending,
@@ -1879,7 +1859,7 @@ test "Repository branch switch terminals reload only their caller without activa
         try std.testing.expectEqual(page.Id.repository, app.active_page);
         try std.testing.expectEqualStrings("Changes retained", app.pages.changes.status.text());
         try std.testing.expectEqualStrings("needle", app.pages.changes.search.query.slice());
-        try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_with_len);
+        try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
         try std.testing.expectEqual(@as(?u64, 9), app.pages.repository.pending_generation);
         try std.testing.expectEqual(@as(u64, 8), app.pages.repository.branch.pending.?.generation);
         try std.testing.expect(app.pages.repository.pending_document_generation == null);
@@ -1926,7 +1906,7 @@ test "branch switch filter routes text selection and cancellation through the sh
     defer app.remote_workflow.deinit(allocator);
     app.pages.repository.activate(0, app.repo_session.view().activeIdentity().?);
     var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
     defer ctx.runtimeClearPendingEffectCopies();
     const Key = struct {
         fn send(target: *App, context: *chasen.Ctx(App.Msg), codepoint: u21) !void {
@@ -1936,7 +1916,7 @@ test "branch switch filter routes text selection and cancellation through the sh
     try Key.send(&app, &ctx, 'b');
     try Key.send(&app, &ctx, '/');
     try std.testing.expect(!app.remote_workflow.branch_switch.query_mode);
-    clearPendingStatusAndDiffTasks(&ctx, allocator);
+    chasen.testing.discardPendingTasks(App.Msg, &ctx);
     const state = &app.remote_workflow.branch_switch;
     state.loading = false;
     app.remote_workflow.branch_switch_load_pending = null;
@@ -1961,7 +1941,7 @@ test "branch switch filter routes text selection and cancellation through the sh
     try Key.send(&app, &ctx, '/');
     try std.testing.expectEqual(@as(usize, 0), state.visibleCount());
     try Key.send(&app, &ctx, chasen.Key.enter);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expect(app.overlay.isSwitchBranch());
     try Key.send(&app, &ctx, chasen.Key.backspace);
     try std.testing.expectEqualStrings("qjk", state.query.slice());
@@ -1986,17 +1966,15 @@ test "branch switch filter routes text selection and cancellation through the sh
     try Key.send(&app, &ctx, chasen.Key.down);
     try Key.send(&app, &ctx, chasen.Key.enter);
     try std.testing.expect(state.worktree_pending);
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const task: *@import("../worktree_switch.zig").Task(App.Msg) = @ptrCast(@alignCast(entries[0].ctx));
-    try std.testing.expectEqualStrings("feature/qjk-two", task.branch);
-    try std.testing.expectEqualStrings(roots.b, task.path);
+    try std.testing.expectEqualStrings("feature/qjk-two", state.selectedItem().?.name);
+    try std.testing.expectEqualStrings(roots.b, state.selectedItem().?.worktree_path.?);
     try std.testing.expect(app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } }) == null);
     try Key.send(&app, &ctx, chasen.Key.escape);
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expectEqual(@as(usize, 0), state.query.len);
-    var abandoned = entries[0].failed(entries[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    entries[0].discard(allocator);
     try Key.send(&app, &ctx, 'b');
     try std.testing.expect(!state.query_mode);
     try std.testing.expectEqual(@as(usize, 0), state.query.len);
@@ -2047,10 +2025,10 @@ test "worktree completion uses repository replacement from every branch picker c
             .kind = .local,
         };
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
         defer ctx.runtimeClearPendingEffectCopies();
         try app.update(.request_branch_switch, &ctx);
-        clearPendingStatusAndDiffTasks(&ctx, allocator);
+        chasen.testing.discardPendingTasks(App.Msg, &ctx);
         const owner = app.remote_workflow.branch_switch.owner.?;
         try std.testing.expectEqual(caller, owner.origin.page_id);
         app.remote_workflow.branch_switch.loading = false;
@@ -2073,8 +2051,8 @@ test "worktree completion uses repository replacement from every branch picker c
         try std.testing.expectEqualStrings(roots.b, app.repo_session.recent_repos.entries.items[0].path);
         try std.testing.expect(app.screen_transition == .waiting);
         // Read failure after commitment stays at the destination.
-        for (ctx.takePendingTasksWith()) |entry| {
-            try app.update(entry.failed(entry.ctx, .runtime_abandoned, allocator), &ctx);
+        for (ctx.takePendingTasks()) |entry| {
+            try app.update(entry.failed(error.ConcurrencyUnavailable, allocator), &ctx);
         }
         try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
         try std.testing.expectEqual(caller, app.active_page);
@@ -2120,10 +2098,10 @@ test "worktree precommit rejections keep caller page diagnostics out of shell st
         };
         history.current_view = .diff;
         var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
         defer ctx.runtimeClearPendingEffectCopies();
         try app.update(.request_branch_switch, &ctx);
-        clearPendingStatusAndDiffTasks(&ctx, allocator);
+        chasen.testing.discardPendingTasks(App.Msg, &ctx);
         const owner = app.remote_workflow.branch_switch.owner.?;
         app.remote_workflow.branch_switch.loading = false;
         app.remote_workflow.branch_switch.worktree_pending = true;
@@ -2211,14 +2189,14 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 _ = try compare.applyLoadFinished(allocator, 4, roots.a, root_identity, &loaded);
             }
             var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-            defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+            defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
             defer ctx.runtimeClearPendingEffectCopies();
             // The real root request captures these pages without a Changes activation.
             try app.update(.request_branch_switch, &ctx);
             try std.testing.expectEqual(owner, app.overlay.owner_page.?);
             try std.testing.expectEqual(owner, app.remote_workflow.branch_switch.owner.?.origin.page_id);
             try app.update(.cancel_branch_switch, &ctx);
-            clearPendingStatusAndDiffTasks(&ctx, allocator);
+            chasen.testing.discardPendingTasks(App.Msg, &ctx);
 
             const diff = if (owner == .history) &history.diff else &compare.diff;
             diff.viewer.selected_target = .{ .diff_file = 0 };

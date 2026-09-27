@@ -841,11 +841,17 @@ fn takeCanonicalPublicationReads(
     ctx: *chasen.Ctx(ReadHarness.Msg),
     allocator: std.mem.Allocator,
 ) !CanonicalPublicationReads {
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 3), entries.len);
-    const status_task: *StatusLoadTask = @ptrCast(@alignCast(entries[0].ctx));
-    const branch_task: *BranchStatusLoadTask = @ptrCast(@alignCast(entries[1].ctx));
-    const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
+    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    defer status_task_message.deinitUndelivered(allocator);
+    const status_task = status_task_message.load_finished.changes.status;
+    var branch_task_message = entries[1].failed(error.ConcurrencyUnavailable, allocator);
+    defer branch_task_message.deinitUndelivered(allocator);
+    const branch_task = branch_task_message.load_finished.changes.branch_status;
+    var source_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    defer source_task_message.deinitUndelivered(allocator);
+    const source_task = source_task_message.load_finished.changes.source;
     const reads: CanonicalPublicationReads = .{
         .source_identity = source_task.identity,
         .source_read_epoch = source_task.read_epoch,
@@ -860,9 +866,6 @@ fn takeCanonicalPublicationReads(
         .branch_generation = branch_task.generation,
         .branch_cycle_id = branch_task.background_cycle_id,
     };
-    StatusLoadTask.destroy(status_task, allocator);
-    BranchStatusLoadTask.destroy(branch_task, allocator);
-    DiffLoadTask.destroy(source_task, allocator);
     return reads;
 }
 
@@ -988,15 +991,11 @@ fn takeCanonicalPublicationProjectionRequest(
     ctx: *chasen.Ctx(ReadHarness.Msg),
     allocator: std.mem.Allocator,
 ) !app_changes_projection.Request {
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const task: *ChangesProjectionTask = @ptrCast(@alignCast(entries[0].ctx));
-    const request = task.request;
-    task.request = undefined;
-    task.environment.deinit();
-    task.root.deinit();
-    allocator.destroy(task);
-    return request;
+    const message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    // Move the owned request out; the static failure has no separate allocation.
+    return message.load_finished.changes.projection.request;
 }
 
 fn canonicalPublicationFinalBundle(
@@ -1425,7 +1424,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
     }
 
     try app.changesRead().ensureProjection(&ctx);
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 0), entries.len);
     try finishCanonicalPublicationBranch(&app, &ctx, allocator, repo_root, reads);
 
@@ -1619,29 +1618,6 @@ fn syncTestActivation(app: *ReadHarness) void {
     );
 }
 
-fn clearPendingStatusTasks(ctx: *chasen.Ctx(ReadHarness.Msg), allocator: std.mem.Allocator) void {
-    // finishStageHunk queues a status refresh. These tests assert the ReadHarness-side
-    // state transition only, so clean up the queued task context explicitly.
-    for (ctx.takePendingTasksWith()) |entry| {
-        const task: *StatusLoadTask = @ptrCast(@alignCast(entry.ctx));
-        StatusLoadTask.destroy(task, allocator);
-    }
-}
-
-fn clearPendingRepositoryTasks(ctx: *chasen.Ctx(ReadHarness.Msg), allocator: std.mem.Allocator) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}
-
-fn clearPendingStatusAndDiffTasks(ctx: *chasen.Ctx(ReadHarness.Msg), allocator: std.mem.Allocator) void {
-    for (ctx.takePendingTasksWith()) |entry| {
-        var message = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-        message.deinitUndelivered(allocator);
-    }
-}
-
 fn testCombinedHunkBundle(allocator: std.mem.Allocator) !app_changes_projection.CombinedHunkBundle {
     var cached_bundle = try app_load.buildLoadedBundle(allocator, app_test_support.diff_cached_projection);
     errdefer cached_bundle.deinit();
@@ -1789,7 +1765,7 @@ test "Changes revalidation startup retains intent through two queue rejections a
 
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{
         ._allocator = allocator,
-        ._pending_tasks_with_len = 16,
+        ._pending_tasks_len = 16,
     };
     defer ctx.runtimeClearPendingEffectCopies();
     const terminal_returned_normally = finishTestAction(
@@ -1800,17 +1776,17 @@ test "Changes revalidation startup retains intent through two queue rejections a
         .stage_file,
     ) catch false;
     const generation_after_rejections = app.pages.changes.load.generation;
-    ctx._pending_tasks_with_len = 0;
-    defer clearPendingRepositoryTasks(&ctx, allocator);
+    ctx._pending_tasks_len = 0;
+    defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
 
     try runReadCoordinationTail(&app, &ctx);
-    const accepted = ctx.takePendingTasksWith();
+    const accepted = ctx.takePendingTasks();
     const accepted_count = accepted.len;
     const generation_after_acceptance = app.pages.changes.load.generation;
     var completions: [3]ReadHarness.Msg = undefined;
     if (accepted.len == completions.len) {
         for (accepted, 0..) |entry, index| {
-            completions[index] = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+            completions[index] = entry.failed(error.ConcurrencyUnavailable, allocator);
         }
         for (&completions) |*completion| {
             try finishOwnedChangesRead(&app, &ctx, completion.*);
@@ -1818,11 +1794,10 @@ test "Changes revalidation startup retains intent through two queue rejections a
         }
     } else {
         for (accepted) |entry| {
-            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-            completion.deinitUndelivered(allocator);
+            entry.discard(allocator);
         }
     }
-    const duplicate_count_after_terminal = ctx._pending_tasks_with_len;
+    const duplicate_count_after_terminal = ctx._pending_tasks_len;
 
     try std.testing.expect(fence_closed);
     try std.testing.expect(epoch_advanced);
@@ -1855,7 +1830,7 @@ test "Changes revalidation startup lets retained intent reach manual universal a
 
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{
         ._allocator = allocator,
-        ._pending_tasks_with_len = 16,
+        ._pending_tasks_len = 16,
     };
     defer ctx.runtimeClearPendingEffectCopies();
     const terminal_returned_normally = finishTestAction(
@@ -1874,20 +1849,20 @@ test "Changes revalidation startup lets retained intent reach manual universal a
     try runReadCoordinationTail(&app, &ctx);
     const generation_after_later_rejection = app.pages.changes.load.generation;
 
-    ctx._pending_tasks_with_len = 0;
-    defer clearPendingRepositoryTasks(&ctx, allocator);
+    ctx._pending_tasks_len = 0;
+    defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
     switch (app.changesRead().prepareManualReload()) {
         .blocked => {},
         .ready => try app.changesRead().startPreparedManualReload(&ctx),
     }
     try runReadCoordinationTail(&app, &ctx);
-    const accepted = ctx.takePendingTasksWith();
+    const accepted = ctx.takePendingTasks();
     const accepted_count = accepted.len;
     const generation_after_manual_acceptance = app.pages.changes.load.generation;
     var completions: [3]ReadHarness.Msg = undefined;
     if (accepted.len == completions.len) {
         for (accepted, 0..) |entry, index| {
-            completions[index] = entry.failed(entry.ctx, .runtime_abandoned, allocator);
+            completions[index] = entry.failed(error.ConcurrencyUnavailable, allocator);
         }
         for (&completions) |*completion| {
             try finishOwnedChangesRead(&app, &ctx, completion.*);
@@ -1895,11 +1870,10 @@ test "Changes revalidation startup lets retained intent reach manual universal a
         }
     } else {
         for (accepted) |entry| {
-            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-            completion.deinitUndelivered(allocator);
+            entry.discard(allocator);
         }
     }
-    const duplicate_count_after_terminal = ctx._pending_tasks_with_len;
+    const duplicate_count_after_terminal = ctx._pending_tasks_len;
 
     try std.testing.expect(terminal_returned_normally);
     try std.testing.expectEqual(
@@ -1945,7 +1919,7 @@ test "Changes revalidation startup drains partial auxiliaries before one replace
     const saturated_slots: usize = 14;
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{
         ._allocator = allocator,
-        ._pending_tasks_with_len = saturated_slots,
+        ._pending_tasks_len = saturated_slots,
     };
     const terminal_returned_normally = finishTestAction(
         &app,
@@ -1955,58 +1929,26 @@ test "Changes revalidation startup drains partial auxiliaries before one replace
         .stage_file,
     ) catch false;
 
-    const accepted_tail_len = ctx._pending_tasks_with_len - saturated_slots;
+    const accepted_tail_len = ctx._pending_tasks_len - saturated_slots;
     var status_message: ?ReadHarness.Msg = null;
     var branch_message: ?ReadHarness.Msg = null;
     if (accepted_tail_len == 2) {
-        const status_task: *StatusLoadTask =
-            @ptrCast(@alignCast(ctx._pending_tasks_with[saturated_slots].ctx));
-        var changed_status =
-            try git_status.StatusBundle.parseOwned(allocator, " M new.zig\x00");
-        status_message = ReadHarness.Msg.loadFinished(.{ .changes = .{ .status = .{
-            .identity = status_task.identity,
-            .read_epoch = status_task.read_epoch,
-            .generation = status_task.generation,
-            .background_cycle_id = status_task.background_cycle_id,
-            .repo_root = status_task.repo_root,
-            .result = .{ .loaded = changed_status },
-        } } });
-        status_task.repo_root = &.{};
-        status_task.environment.deinit();
-        status_task.root.deinit();
-        allocator.destroy(status_task);
-        changed_status = undefined;
-
-        const branch_task: *BranchStatusLoadTask =
-            @ptrCast(@alignCast(ctx._pending_tasks_with[saturated_slots + 1].ctx));
-        var changed_branch = try branchStatusBundleForTest(allocator, .{
-            .oid = "new-oid",
-            .branch = "new-branch",
-        });
-        branch_message = ReadHarness.Msg.loadFinished(.{ .changes = .{ .branch_status = .{
-            .identity = branch_task.identity,
-            .read_epoch = branch_task.read_epoch,
-            .generation = branch_task.generation,
-            .background_cycle_id = branch_task.background_cycle_id,
-            .repo_root = branch_task.repo_root,
-            .result = .{ .loaded = changed_branch },
-        } } });
-        branch_task.repo_root = &.{};
-        BranchStatusLoadTask.destroy(branch_task, allocator);
-        changed_branch = undefined;
+        status_message = ctx._pending_tasks[saturated_slots].failed(error.ConcurrencyUnavailable, allocator);
+        status_message.?.load_finished.changes.status.result = .{ .loaded = try git_status.StatusBundle.parseOwned(allocator, " M new.zig\x00") };
+        branch_message = ctx._pending_tasks[saturated_slots + 1].failed(error.ConcurrencyUnavailable, allocator);
+        branch_message.?.load_finished.changes.branch_status.result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .oid = "new-oid", .branch = "new-branch" }) };
     } else {
-        for (ctx._pending_tasks_with[saturated_slots..ctx._pending_tasks_with_len]) |entry| {
-            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-            completion.deinitUndelivered(allocator);
+        for (ctx._pending_tasks[saturated_slots..ctx._pending_tasks_len]) |entry| {
+            entry.discard(allocator);
         }
     }
-    ctx._pending_tasks_with_len = 0;
-    defer clearPendingRepositoryTasks(&ctx, allocator);
+    ctx._pending_tasks_len = 0;
+    defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
 
     if (status_message) |message| try finishOwnedChangesRead(&app, &ctx, message);
-    const replacement_before_branch = ctx._pending_tasks_with_len;
+    const replacement_before_branch = ctx._pending_tasks_len;
     if (branch_message) |message| try finishOwnedChangesRead(&app, &ctx, message);
-    const replacement_count = ctx._pending_tasks_with_len;
+    const replacement_count = ctx._pending_tasks_len;
     const status_retained =
         app.pages.changes.git_status.document.entries.len == 1 and
         std.mem.eql(
@@ -2052,7 +1994,7 @@ test "Changes revalidation startup detaches mismatched runtime failure" {
     try std.testing.expect(fence_closed);
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expectEqualStrings(roots.b, app.repoSessionView().activeRoot().?);
 }
 
@@ -2072,14 +2014,12 @@ test "Changes revalidation startup preserves only ordinary intent after mismatch
     app.pages.changes.activation.queueRevalidation();
 
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator };
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
     try std.testing.expect(try finishTestAction(&app, &ctx, pending, roots.a, null));
 
-    const entries = ctx._pending_tasks_with[0..ctx._pending_tasks_with_len];
-    const current_source_root = if (entries.len == 3) blk: {
-        const source_task: *DiffLoadTask = @ptrCast(@alignCast(entries[2].ctx));
-        break :blk source_task.request.repo_root;
-    } else null;
+    const entries = ctx.takePendingTasks();
+    defer for (entries) |entry| entry.discard(allocator);
+    const current_source_root = app.repo_session.view().activeRoot();
 
     try std.testing.expect(fence_closed);
     try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -2115,7 +2055,7 @@ test "Changes revalidation startup retries repository discovery after detached t
 
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{
         ._allocator = allocator,
-        ._pending_tasks_with_len = 16,
+        ._pending_tasks_len = 16,
     };
     defer ctx.runtimeClearPendingEffectCopies();
     const terminal_returned_normally = finishTestAction(
@@ -2125,23 +2065,20 @@ test "Changes revalidation startup retries repository discovery after detached t
         roots.a,
         null,
     ) catch false;
-    ctx._pending_tasks_with_len = 0;
-    defer clearPendingRepositoryTasks(&ctx, allocator);
+    ctx._pending_tasks_len = 0;
+    defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
 
     try runReadCoordinationTail(&app, &ctx);
-    const retry_count = ctx._pending_tasks_with_len;
-    const retry_task: *RepoDiscoveryTask = @ptrCast(@alignCast(ctx._pending_tasks_with[0].ctx));
-
+    const retry_count = ctx._pending_tasks_len;
+    const retry_entries = ctx.takePendingTasks();
+    var retry_message = retry_entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    defer retry_message.deinitUndelivered(allocator);
     try std.testing.expect(fence_closed);
     try std.testing.expect(terminal_returned_normally);
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expectEqual(@as(u8, 1), retry_count);
-    try std.testing.expectEqualStrings(
-        "preserved",
-        retry_task.environment.borrow().get("GITFRAME_S1_CANARY").?,
-    );
-    try std.testing.expect(retry_task.environment.borrow().get("gIt_retry_selector") == null);
+    try std.testing.expectEqual(app.pages.changes.activation.currentIdentity().?, retry_message.load_finished.coordinator.repo_discovery.identity);
 }
 
 test "Changes revalidation startup discards inactive terminal fallback" {
@@ -2170,7 +2107,7 @@ test "Changes revalidation startup discards inactive terminal fallback" {
     try std.testing.expect(inactive_fence_closed);
     try std.testing.expect(!inactive.action_runtime.view().hasPending());
     try std.testing.expect(inactive.pages.changes.repository_read_authority.mayStartRepositoryRead());
-    try std.testing.expectEqual(@as(u8, 0), inactive_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(u8, 0), inactive_ctx._pending_tasks_len);
 }
 
 test "Changes revalidation startup retains both intents after status-only rejection" {
@@ -2194,7 +2131,7 @@ test "Changes revalidation startup retains both intents after status-only reject
 
         var ctx: chasen.Ctx(ReadHarness.Msg) = .{
             ._allocator = allocator,
-            ._pending_tasks_with_len = 16,
+            ._pending_tasks_len = 16,
         };
         defer ctx.runtimeClearPendingEffectCopies();
         const terminal_returned_normally = finishTestAction(
@@ -2209,11 +2146,11 @@ test "Changes revalidation startup retains both intents after status-only reject
                 .session_mark_mutation = .none,
             } },
         ) catch false;
-        ctx._pending_tasks_with_len = 0;
-        defer clearPendingRepositoryTasks(&ctx, allocator);
+        ctx._pending_tasks_len = 0;
+        defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
 
         try runReadCoordinationTail(&app, &ctx);
-        const later_full_count = ctx._pending_tasks_with_len;
+        const later_full_count = ctx._pending_tasks_len;
 
         try std.testing.expect(fence_closed);
         try std.testing.expect(terminal_returned_normally);
@@ -2239,7 +2176,7 @@ test "Changes revalidation startup retains both intents after status-only reject
 
         var ctx: chasen.Ctx(ReadHarness.Msg) = .{
             ._allocator = allocator,
-            ._pending_tasks_with_len = 16,
+            ._pending_tasks_len = 16,
         };
         defer ctx.runtimeClearPendingEffectCopies();
         const terminal_returned_normally = finishTestAction(
@@ -2256,11 +2193,11 @@ test "Changes revalidation startup retains both intents after status-only reject
         ) catch false;
         const ordinary_retained =
             app.pages.changes.activation.revalidation_requested == activation_id;
-        ctx._pending_tasks_with_len = 0;
-        defer clearPendingRepositoryTasks(&ctx, allocator);
+        ctx._pending_tasks_len = 0;
+        defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
 
         try runReadCoordinationTail(&app, &ctx);
-        const later_full_count = ctx._pending_tasks_with_len;
+        const later_full_count = ctx._pending_tasks_len;
 
         try std.testing.expect(terminal_returned_normally);
         try std.testing.expect(ordinary_retained);
@@ -2298,24 +2235,22 @@ test "Changes revalidation startup keeps ordinary full intent after status-only 
             .session_mark_mutation = .none,
         } },
     ));
-    const status_entries = ctx.takePendingTasksWith();
+    const status_entries = ctx.takePendingTasks();
     const status_only_count = status_entries.len;
     var status_terminal: ?ReadHarness.Msg = null;
     if (status_entries.len == 1) {
         status_terminal = status_entries[0].failed(
-            status_entries[0].ctx,
-            .runtime_abandoned,
+            error.ConcurrencyUnavailable,
             allocator,
         );
     } else {
         for (status_entries) |entry| {
-            var completion = entry.failed(entry.ctx, .runtime_abandoned, allocator);
-            completion.deinitUndelivered(allocator);
+            entry.discard(allocator);
         }
     }
-    defer clearPendingStatusAndDiffTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
     if (status_terminal) |message| try finishOwnedChangesRead(&app, &ctx, message);
-    const full_count_after_status_terminal = ctx._pending_tasks_with_len;
+    const full_count_after_status_terminal = ctx._pending_tasks_len;
 
     try std.testing.expect(fence_closed);
     try std.testing.expectEqual(@as(usize, 1), status_only_count);
@@ -2367,12 +2302,12 @@ test "read task spawn failure rejects status branch and projection page state" {
     status_app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer status_app.repo_session.repo_state.deinit(allocator);
     _ = status_app.pageCoordinator().activateChanges();
-    var status_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
+    var status_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_len = 16 };
     try std.testing.expectError(
         error.TaskLimitExceeded,
         changes_read.testing.startStatusLoadTracked(status_app.changesRead(), &status_ctx, roots.a, .foreground, null, null),
     );
-    status_ctx._pending_tasks_with_len = 0;
+    status_ctx._pending_tasks_len = 0;
     try std.testing.expect(status_app.pages.changes.status_load.pending == null);
     try std.testing.expectEqualStrings("could not start status load task", status_app.pages.changes.status.text());
 
@@ -2383,9 +2318,9 @@ test "read task spawn failure rejects status branch and projection page state" {
     branch_app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer branch_app.repo_session.repo_state.deinit(allocator);
     _ = branch_app.pageCoordinator().activateChanges();
-    var branch_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
+    var branch_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_len = 16 };
     _ = changes_read.testing.startBranchStatusLoad(branch_app.changesRead(), &branch_ctx, roots.a, null);
-    branch_ctx._pending_tasks_with_len = 0;
+    branch_ctx._pending_tasks_len = 0;
     try std.testing.expect(branch_app.pages.changes.branch_status_load.pending == null);
     try std.testing.expectEqualStrings("could not start branch status load task", branch_app.pages.changes.status.text());
 
@@ -2407,9 +2342,9 @@ test "read task spawn failure rejects status branch and projection page state" {
     defer projection_app.pages.changes.git_status.deinit();
     var staged = try git_status.StatusBundle.parseOwned(allocator, "MM a\x00");
     try projection_app.pages.changes.git_status.replace(roots.a, &staged);
-    var projection_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_with_len = 16 };
+    var projection_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_len = 16 };
     try std.testing.expectError(error.TaskLimitExceeded, projection_app.changesRead().ensureProjection(&projection_ctx));
-    projection_ctx._pending_tasks_with_len = 0;
+    projection_ctx._pending_tasks_len = 0;
     try std.testing.expect(projection_app.pages.changes.changes_projection.pending == null);
 }
 
@@ -2437,7 +2372,7 @@ test "action refresh closes source rejection after its already-started status me
     // generation and close only when that already-started member terminates.
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{
         ._allocator = allocator,
-        ._pending_tasks_with_len = 15,
+        ._pending_tasks_len = 15,
     };
     try std.testing.expectError(error.TaskLimitExceeded, changes_read.testing.startDiffLoadWithRepoRoot(
         app.changesRead(),
@@ -2454,9 +2389,9 @@ test "action refresh closes source rejection after its already-started status me
     try std.testing.expectEqual(changes_page.action_cursor.Terminal.rejected_spawn, basis.memberState(.source).?.terminal);
     try std.testing.expectEqual(changes_page.action_cursor.Terminal.pending, basis.memberState(.status).?.terminal);
 
-    const status_entry = ctx._pending_tasks_with[15];
-    ctx._pending_tasks_with_len = 0;
-    const status_failure = status_entry.failed(status_entry.ctx, .runtime_abandoned, allocator);
+    const status_entry = ctx._pending_tasks[15];
+    ctx._pending_tasks_len = 0;
+    const status_failure = status_entry.failed(error.ConcurrencyUnavailable, allocator);
     try finishOwnedChangesRead(&app, &ctx, status_failure);
 
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
@@ -2500,7 +2435,7 @@ test "read task allocation failure rejects source status branch and projection p
     try std.testing.expect(source_app.pages.changes.pending_reload == null);
     try std.testing.expect(source_app.pages.changes.canonical_publication == null);
     try std.testing.expect(!source_app.pages.changes.action_cursor.hasOwner());
-    try std.testing.expectEqual(@as(usize, 0), source_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), source_ctx.takePendingTasks().len);
 
     // Source request/root, canonical root/path, and status display root consume
     // four allocations. Fail the following non-empty environment clone after
@@ -2534,7 +2469,7 @@ test "read task allocation failure rejects source status branch and projection p
     try std.testing.expect(status_app.pages.changes.canonical_publication == null);
     try std.testing.expect(status_app.pages.changes.status_load.pending == null);
     try std.testing.expect(!status_app.pages.changes.action_cursor.hasOwner());
-    try std.testing.expectEqual(@as(usize, 0), status_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), status_ctx.takePendingTasks().len);
 
     var branch_failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = 1 });
     var branch_app: ReadHarness = .{
@@ -2706,7 +2641,7 @@ test "generated projection syntax start failures preserve plain display and rema
     try app.changesRead().ensureProjection(&prepare_ctx);
     app.allocator = allocator;
     try std.testing.expect(!app.pages.changes.changes_projection.hasSyntaxPending());
-    try std.testing.expectEqual(@as(usize, 0), prepare_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), prepare_ctx.takePendingTasks().len);
     try expectGeneratedProjectionEligible(&app);
 
     // Four string allocations build the page/task request clones. Fail the
@@ -2717,33 +2652,31 @@ test "generated projection syntax start failures preserve plain display and rema
     try app.changesRead().ensureProjection(&allocation_ctx);
     app.allocator = allocator;
     try std.testing.expect(!app.pages.changes.changes_projection.hasSyntaxPending());
-    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasksWith().len);
+    try std.testing.expectEqual(@as(usize, 0), allocation_ctx.takePendingTasks().len);
     try expectGeneratedProjectionEligible(&app);
 
     const DummyTask = struct {
-        fn run(_: std.mem.Allocator, _: std.Io) ReadHarness.Msg {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!ReadHarness.Msg {
             return .quit;
         }
-        fn failed(_: chasen.TaskFailure) ReadHarness.Msg {
+        fn failed(_: chasen.TaskStartError) ReadHarness.Msg {
             return .quit;
         }
     };
     var spawn_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._io = io };
-    for (0..16) |_| try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    for (0..16) |_| _ = try spawn_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
     try app.changesRead().ensureProjection(&spawn_ctx);
     try std.testing.expect(!app.pages.changes.changes_projection.hasSyntaxPending());
-    try std.testing.expectEqual(@as(usize, 0), spawn_ctx.takePendingTasksWith().len);
     try std.testing.expectEqual(@as(usize, 16), spawn_ctx.takePendingTasks().len);
     try expectGeneratedProjectionEligible(&app);
 
     var retry_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._io = io };
     try app.changesRead().ensureProjection(&retry_ctx);
-    const queued = retry_ctx.takePendingTasksWith();
+    const queued = retry_ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
     try std.testing.expect(app.pages.changes.changes_projection.hasSyntaxPending());
     try expectGeneratedProjectionEligible(&app);
-    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    queued[0].discard(allocator);
 }
 
 test "combined projection target is requested for mixed modified unstaged files" {
@@ -3267,10 +3200,10 @@ test "Changes canonical publication startup and status failure retain last good 
         const prior_hunks = prior.displayFile().hunks.ptr;
         var ctx: chasen.Ctx(ReadHarness.Msg) = .{
             ._allocator = allocator,
-            ._pending_tasks_with_len = 16,
+            ._pending_tasks_len = 16,
         };
         try finishCanonicalPublicationAction(&app, &ctx, allocator, .stage_file, roots.a);
-        ctx._pending_tasks_with_len = 0;
+        ctx._pending_tasks_len = 0;
         try expectRetainedCanonicalPublication(&app, prior_hunks);
         try std.testing.expect(app.pages.changes.pending_reload == null);
         try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
@@ -3395,9 +3328,9 @@ test "Changes canonical publication startup and status failure retain last good 
         try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
         try expectRetainedCanonicalPublication(&app, prior_hunks);
 
-        ctx._pending_tasks_with_len = 16;
+        ctx._pending_tasks_len = 16;
         try std.testing.expectError(error.TaskLimitExceeded, app.changesRead().ensureProjection(&ctx));
-        ctx._pending_tasks_with_len = 0;
+        ctx._pending_tasks_len = 0;
         try std.testing.expect(app.pages.changes.deferred_source_apply == null);
         const failed_cycle = app.pages.changes.auto_reload.background_cycle orelse
             return error.ExpectedBackgroundCycle;
@@ -4503,10 +4436,9 @@ test "file search selection remains authoritative through successor projection a
     try std.testing.expectEqual(@as(u64, 2), pending.id);
     try std.testing.expectEqualStrings("b", pending.path_key);
 
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    queued[0].discard(allocator);
 
     const result_request = try app_changes_projection.testing.cloneRequestWithRootIdentity(
         allocator,
@@ -5081,8 +5013,8 @@ test "status refresh path skips identical snapshot without rebuilding active tre
 
     _ = try changes_read.testing.startStatusLoadTracked(app.changesRead(), &ctx, roots.a, .foreground, null, null);
     try std.testing.expect(app.pages.changes.git_status.repo_root != null);
-    try std.testing.expectEqual(@as(usize, 1), ctx._pending_tasks_with[0..ctx._pending_tasks_with_len].len);
-    clearPendingStatusTasks(&ctx, allocator);
+    try std.testing.expectEqual(@as(usize, 1), ctx._pending_tasks[0..ctx._pending_tasks_len].len);
+    chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
 
     const same = try git_status.StatusBundle.parseOwned(allocator, "?? aa\x00");
     try app.changesRead().finishStatusLoad(ctx.allocator(), .{
@@ -5113,7 +5045,7 @@ test "status refresh drops snapshot when repo root changes" {
     try app.pages.changes.git_status.replace(roots.a, &current);
 
     _ = try changes_read.testing.startStatusLoadTracked(app.changesRead(), &ctx, roots.b, .foreground, null, null);
-    defer clearPendingStatusTasks(&ctx, allocator);
+    defer chasen.testing.discardPendingTasks(ReadHarness.Msg, &ctx);
 
     try std.testing.expect(app.pages.changes.git_status.repo_root == null);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.git_status.document.entries.len);
@@ -5201,7 +5133,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     app.pages.changes.status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
     var status_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
     try app.changesRead().autoReloadTick(&status_ctx);
-    try std.testing.expectEqual(@as(usize, 0), status_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(usize, 0), status_ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.pages.changes.status_load.pending = null;
@@ -5209,7 +5141,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     var branch_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
     app.redraw_plan = .{};
     try app.changesRead().autoReloadTick(&branch_ctx);
-    try std.testing.expectEqual(@as(usize, 0), branch_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(usize, 0), branch_ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.pages.changes.branch_status_load.pending = null;
@@ -5227,7 +5159,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     var projection_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
     app.redraw_plan = .{};
     try app.changesRead().autoReloadTick(&projection_ctx);
-    try std.testing.expectEqual(@as(usize, 0), projection_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(usize, 0), projection_ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
     app.pages.changes.changes_projection.clearPending(std.testing.allocator);
 
@@ -5235,7 +5167,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     var selection_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
     app.redraw_plan = .{};
     try app.changesRead().autoReloadTick(&selection_ctx);
-    try std.testing.expectEqual(@as(usize, 0), selection_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(usize, 0), selection_ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.pages.changes.selection_owner = .none;
@@ -5243,7 +5175,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     var action_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
     app.redraw_plan = .{};
     try app.changesRead().autoReloadTick(&action_ctx);
-    try std.testing.expectEqual(@as(usize, 0), action_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(usize, 0), action_ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     try std.testing.expect(app.acceptActionTerminal(pending));
@@ -5253,7 +5185,7 @@ test "auto reload tick skips while auxiliary cycle members or mouse selection ar
     var action_refresh_ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
     app.redraw_plan = .{};
     try app.changesRead().autoReloadTick(&action_refresh_ctx);
-    try std.testing.expectEqual(@as(usize, 0), action_refresh_ctx._pending_tasks_with_len);
+    try std.testing.expectEqual(@as(usize, 0), action_refresh_ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
     try std.testing.expect(app.pages.changes.action_cursor.hasOwner());
 }
@@ -5704,7 +5636,7 @@ test "diff task start failure invalidates accepted source and next watch cannot 
     defer app.changesReload().clearLoadedDiff(app.allocator);
     app.pages.changes.auto_reload.acceptSource(fingerprint);
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    ctx._pending_tasks_with_len = 16;
+    ctx._pending_tasks_len = 16;
 
     try std.testing.expectError(error.TaskLimitExceeded, changes_read.testing.startDiffLoadWithRepoRoot(app.changesRead(), &ctx, null, .{
         .clear_visible_state = true,
@@ -5713,17 +5645,18 @@ test "diff task start failure invalidates accepted source and next watch cannot 
     try std.testing.expect(app.pages.changes.auto_reload.accepted_source == null);
     try std.testing.expect(app.pages.changes.load.state == .failed);
 
-    ctx._pending_tasks_with_len = 0;
+    ctx._pending_tasks_len = 0;
     try changes_read.testing.startDiffLoadWithRepoRoot(app.changesRead(), &ctx, null, .{
         .clear_visible_state = false,
         .kind = .watch,
     });
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const task: *DiffLoadTask = @ptrCast(@alignCast(entries[0].ctx));
-    try std.testing.expect(task.expected_fingerprint == null);
+    var task_message = entries[0].failed(error.ConcurrencyUnavailable, std.testing.allocator);
+    defer task_message.deinitUndelivered(std.testing.allocator);
+    const task = task_message.load_finished.changes.source;
+    try std.testing.expect(app.pages.changes.auto_reload.accepted_source == null);
     const generation = task.generation;
-    DiffLoadTask.destroy(task, std.testing.allocator);
 
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.changesRead().finishDiffLoad(ctx.allocator(), .{
@@ -6191,12 +6124,13 @@ test "clean loaded status tears down status-only session after empty diff" {
         .clear_visible_state = false,
         .kind = .watch,
     });
-    const entries = ctx.takePendingTasksWith();
+    const entries = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const task: *DiffLoadTask = @ptrCast(@alignCast(entries[0].ctx));
-    try std.testing.expect(task.expected_fingerprint.?.eql(empty_fingerprint));
+    var task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    defer task_message.deinitUndelivered(allocator);
+    const task = task_message.load_finished.changes.source;
+    try std.testing.expect(app.pages.changes.auto_reload.accepted_source.?.fingerprint.eql(empty_fingerprint));
     const generation = task.generation;
-    DiffLoadTask.destroy(task, allocator);
 
     try app.changesRead().finishDiffLoad(ctx.allocator(), .{
         .identity = page.RequestIdentity.changes(0, 1),
@@ -7229,10 +7163,9 @@ test "final hunk stage retains exact path through cached projection acceptance" 
     try std.testing.expectEqualStrings("a", pending.path_key);
     try std.testing.expectEqualStrings("a", app.changesNavigationView().selectedStagePathKey().?);
 
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), queued.len);
-    var abandoned = queued[0].failed(queued[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    queued[0].discard(allocator);
 
     const result_request = try app_changes_projection.testing.cloneRequestWithRootIdentity(
         allocator,
@@ -7559,17 +7492,15 @@ test "queued Changes Git reads retain the accepted root across path replacement"
     app.env_map = &parent_environment;
     var ctx: chasen.Ctx(ReadHarness.Msg) = .{ ._allocator = allocator, ._io = io };
     try app.changesRead().startDiffLoad(&ctx, .manual);
-    const queued = ctx.takePendingTasksWith();
+    const queued = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 3), queued.len);
 
     try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
     try tmp.dir.rename("replacement", tmp.dir, "slot", io);
 
-    const branch_task: *BranchStatusLoadTask = @ptrCast(@alignCast(queued[1].ctx));
-    const branch_root_observer = branch_task.root;
-    const status_message = queued[0].run(queued[0].ctx, allocator, io);
-    const branch_message = queued[1].run(queued[1].ctx, allocator, io);
-    const source_message = queued[2].run(queued[2].ctx, allocator, io);
+    const status_message = try queued[0].run(allocator, io);
+    const branch_message = try queued[1].run(allocator, io);
+    const source_message = try queued[2].run(allocator, io);
 
     var status_finished = switch (status_message) {
         .load_finished => |load| switch (load) {
@@ -7648,9 +7579,4 @@ test "queued Changes Git reads retain the accepted root across path replacement"
     };
     try std.testing.expectEqualStrings("main", branch_bundle.status.branchName().?);
     try std.testing.expect(!std.mem.eql(u8, "replacement", branch_bundle.status.branchName().?));
-    if (branch_root_observer.duplicate()) |unexpected_value| {
-        var unexpected = unexpected_value;
-        unexpected.deinit();
-        return error.ExpectedClosedRootCapability;
-    } else |err| try std.testing.expectEqual(error.InvalidRootCapability, err);
 }

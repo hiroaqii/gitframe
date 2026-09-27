@@ -134,7 +134,6 @@ pub const FailureReason = enum {
     malformed_output,
     allocation,
     task_start,
-    runtime_abandoned,
 };
 
 pub const DetailResult = union(enum) {

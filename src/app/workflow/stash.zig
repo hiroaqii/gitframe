@@ -173,7 +173,7 @@ pub const Controller = struct {
         errdefer ctx.allocator().destroy(task);
         const generation = self.state.load_generation + 1;
         task.* = .{ .snapshot = owned_snapshot, .generation = generation, .root = owned_root, .environment = environment };
-        try ctx.task().spawnWith(.{ .ctx = task, .run = Task.run, .failed = Task.failed });
+        _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
         self.state.deinit(ctx.allocator());
         self.state.load_generation = generation;
         self.state.catalog = .{ .snapshot = snapshot, .pending = generation };

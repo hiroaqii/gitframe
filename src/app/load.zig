@@ -578,28 +578,22 @@ pub fn RepoDiscoveryTask(comptime Msg: type) type {
         background_cycle_id: ?u64 = null,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runDiscovery(&task.environment, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runDiscovery(&task.environment, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             task.environment.deinit();
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: RepoDiscoveryTaskResult) Msg {
-            defer allocator.destroy(task);
-            defer task.environment.deinit();
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: RepoDiscoveryTaskResult) Msg {
             return Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = RepoDiscoveryFinished{
                 .identity = task.identity,
                 .generation = task.generation,
@@ -630,29 +624,23 @@ pub fn RepoPathDiscoveryTask(comptime Msg: type) type {
         generation: u64,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runPathDiscovery(task.path, &task.environment, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runPathDiscovery(task.path, &task.environment, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases every
-        /// field accepted by the queued task without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(task.path);
             task.environment.deinit();
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: RepoPathDiscoveryTaskResult) Msg {
-            defer allocator.destroy(task);
-            defer task.environment.deinit();
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: RepoPathDiscoveryTaskResult) Msg {
             const submitted_path = task.path;
             task.path = &.{};
             return Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = RepoPathDiscoveryFinished{
@@ -696,9 +684,8 @@ pub fn DiffLoadTask(comptime Msg: type) type {
         expected_fingerprint: ?content_fingerprint.Fingerprint = null,
         background_cycle_id: ?u64 = null,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runLoadExpectedWithContext(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runLoadExpectedWithContext(
                 task.request,
                 task.authority.borrowed(),
                 task.expected_fingerprint,
@@ -707,27 +694,19 @@ pub fn DiffLoadTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             task.request.deinit(allocator);
             task.authority.deinit();
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: DiffLoadTaskResult) Msg {
-            defer {
-                diff_source.freeLoadRequest(allocator, task.request);
-                task.authority.deinit();
-                allocator.destroy(task);
-            }
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: DiffLoadTaskResult) Msg {
             return Msg.loadFinished(.{ .changes = .{ .source = DiffLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
@@ -750,9 +729,8 @@ pub fn StatusLoadTask(comptime Msg: type) type {
         origin: git_read.ReadOrigin = .foreground,
         background_cycle_id: ?u64 = null,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runStatusLoadWithOrigin(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runStatusLoadWithOrigin(
                 task.repo_root,
                 .{ .cwd = task.root.dir(), .environment = &task.environment },
                 task.origin,
@@ -761,13 +739,11 @@ pub fn StatusLoadTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(task.repo_root);
             task.environment.deinit();
@@ -775,14 +751,8 @@ pub fn StatusLoadTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: StatusLoadTaskResult) Msg {
-            defer {
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: StatusLoadTaskResult) Msg {
             const finished = StatusLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
@@ -807,22 +777,19 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
         generation: u64,
         background_cycle_id: ?u64 = null,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runBranchStatusLoad(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runBranchStatusLoad(
                 .{ .cwd = task.root.dir(), .environment = &task.environment },
                 allocator,
                 io,
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(task.repo_root);
             task.environment.deinit();
@@ -830,14 +797,8 @@ pub fn BranchStatusLoadTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchStatusLoadTaskResult) Msg {
-            defer {
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: BranchStatusLoadTaskResult) Msg {
             const finished = BranchStatusLoadFinished{
                 .identity = task.identity,
                 .read_epoch = task.read_epoch,
@@ -866,30 +827,32 @@ pub const StashListLoadFinished = struct {
 
 pub fn StashListLoadTask(comptime Msg: type) type {
     return struct {
-        snapshot: @import("stash.zig").Snapshot,
+        snapshot: ?@import("stash.zig").Snapshot,
         generation: u64,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const result = @import("../git/stash.zig").list(allocator, io, .{ .cwd = task.root.dir(), .environment = &task.environment }) catch |err|
                 @import("../git/stash.zig").ListResult{ .failed_static = @errorName(err) };
-            return task.finish(allocator, result);
+            return task.finish(result);
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: @import("../git/stash.zig").ListResult) Msg {
-            defer {
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
-            return Msg.loadFinished(.{ .shell = .{ .stash_list = .{ .snapshot = task.snapshot, .generation = task.generation, .result = result } } });
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.snapshot) |*owned| owned.deinit(allocator);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: @import("../git/stash.zig").ListResult) Msg {
+            const snapshot = task.snapshot.?;
+            task.snapshot = null;
+            return Msg.loadFinished(.{ .shell = .{ .stash_list = .{ .snapshot = snapshot, .generation = task.generation, .result = result } } });
         }
     };
 }
@@ -904,22 +867,19 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
         environment: git_command.LocalGitEnvironment,
         generation: u64,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runBranchListLoad(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runBranchListLoad(
                 .{ .cwd = task.root.dir(), .environment = &task.environment },
                 allocator,
                 io,
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(task.repo_root);
             task.environment.deinit();
@@ -927,14 +887,8 @@ pub fn BranchListLoadTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchListLoadTaskResult) Msg {
-            defer {
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: BranchListLoadTaskResult) Msg {
             const finished = BranchListLoadFinished{
                 .origin = task.origin,
                 .repo_epoch = task.repo_epoch,
@@ -983,9 +937,8 @@ pub fn CompareLoadTask(comptime Msg: type) type {
             };
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runCompareLoad(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runCompareLoad(
                 task.root.dir(),
                 task.target,
                 &task.environment,
@@ -994,9 +947,8 @@ pub fn CompareLoadTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
@@ -1004,11 +956,7 @@ pub fn CompareLoadTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: CompareLoadTaskResult) Msg {
-            defer {
-                task.deinitOwned(allocator);
-                allocator.destroy(task);
-            }
+        fn finish(task: *@This(), result: CompareLoadTaskResult) Msg {
             return Msg.loadFinished(.{ .compare = .{ .source = CompareLoadFinished{
                 .identity = task.identity,
                 .generation = task.generation,
@@ -1057,8 +1005,7 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
             };
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const context: git_command.DirectoryContext = .{
                 .cwd = task.root.dir(),
                 .environment = &task.environment,
@@ -1078,12 +1025,11 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
                 branch_commit_time.sampleUnixSeconds(io)
             else
                 null;
-            return task.finish(allocator, result, render_now_unix);
+            return task.finish(result, render_now_unix);
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failure = .git_command_failed }, null);
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failure = .git_command_failed }, null);
         }
 
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
@@ -1094,11 +1040,9 @@ pub fn HistoryCatalogTask(comptime Msg: type) type {
 
         fn finish(
             task: *@This(),
-            allocator: std.mem.Allocator,
             result: git_history.LoadResult,
             render_now_unix: ?i64,
         ) Msg {
-            defer task.destroy(allocator);
             return Msg.loadFinished(.{ .history = .{ .catalog = .{
                 .identity = task.identity,
                 .root_identity = task.root.identity,
@@ -1144,13 +1088,12 @@ pub fn HistoryDiffTask(comptime Msg: type) type {
             };
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const context: git_command.DirectoryContext = .{
                 .cwd = task.root.dir(),
                 .environment = &task.environment,
             };
-            return task.finish(allocator, runHistoryDiffLoad(
+            return task.finish(runHistoryDiffLoad(
                 allocator,
                 io,
                 context,
@@ -1158,9 +1101,8 @@ pub fn HistoryDiffTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
@@ -1169,8 +1111,7 @@ pub fn HistoryDiffTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: HistoryDiffTaskResult) Msg {
-            defer task.destroy(allocator);
+        fn finish(task: *@This(), result: HistoryDiffTaskResult) Msg {
             return Msg.loadFinished(.{ .history = .{ .diff = .{
                 .identity = task.identity,
                 .root_identity = task.root.identity,
@@ -1188,24 +1129,20 @@ pub fn HistoryPreviewDebounceTask(comptime Msg: type) type {
     return struct {
         stamp: history_preview.DebounceStamp,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            io.sleep(.fromMilliseconds(75), .awake) catch
-                return task.finish(allocator, .{ .failed = .runtime_abandoned });
-            return task.finish(allocator, .elapsed);
+        pub fn run(task: *@This(), _: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            try io.sleep(.fromMilliseconds(75), .awake);
+            return task.finish(.elapsed);
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed = historyPreviewTaskFailure(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed = historyPreviewTaskFailure(failure) });
         }
 
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             allocator.destroy(task);
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: history_preview.DebounceResult) Msg {
-            defer task.destroy(allocator);
+        fn finish(task: *@This(), result: history_preview.DebounceResult) Msg {
             return Msg.loadFinished(.{ .history = .{ .preview = .{ .debounce = .{
                 .stamp = task.stamp,
                 .result = result,
@@ -1244,9 +1181,8 @@ pub fn HistoryPreviewReadTask(comptime Msg: type) type {
             };
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, git_history_preview.readPreview(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(git_history_preview.readPreview(
                 allocator,
                 io,
                 .{
@@ -1257,9 +1193,8 @@ pub fn HistoryPreviewReadTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .rejected = .{
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .rejected = .{
                 .failed = historyPreviewTaskFailure(failure),
             } });
         }
@@ -1270,8 +1205,7 @@ pub fn HistoryPreviewReadTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_history_preview.PreviewReadResult) Msg {
-            defer task.destroy(allocator);
+        fn finish(task: *@This(), result: git_history_preview.PreviewReadResult) Msg {
             return Msg.loadFinished(.{ .history = .{ .preview = .{ .read = .{
                 .key = task.key,
                 .result = result,
@@ -1280,11 +1214,8 @@ pub fn HistoryPreviewReadTask(comptime Msg: type) type {
     };
 }
 
-fn historyPreviewTaskFailure(failure: chasen.TaskFailure) git_history_preview.FailureReason {
-    return switch (failure) {
-        .start_failed => .task_start,
-        .runtime_abandoned => .runtime_abandoned,
-    };
+fn historyPreviewTaskFailure(_: chasen.TaskStartError) git_history_preview.FailureReason {
+    return .task_start;
 }
 
 /// Compare-owned asynchronous branch-list read. The task snapshots the
@@ -1310,9 +1241,8 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
             };
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runCompareBranchListLoad(
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runCompareBranchListLoad(
                 task.root.dir(),
                 task.env_map,
                 allocator,
@@ -1320,9 +1250,8 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
@@ -1330,9 +1259,7 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
             allocator.destroy(task);
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: BranchListLoadTaskResult) Msg {
-            defer allocator.destroy(task);
-            task.root.deinit();
+        fn finish(task: *@This(), result: BranchListLoadTaskResult) Msg {
             return Msg.loadFinished(.{ .compare = .{ .branch_list = .{
                 .identity = task.identity,
                 .generation = task.generation,
@@ -1344,37 +1271,30 @@ pub fn CompareBranchListLoadTask(comptime Msg: type) type {
 
 pub fn ChangesProjectionTask(comptime Msg: type) type {
     return struct {
-        request: changes_projection.Request,
+        request: ?changes_projection.Request,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runChangesProjectionLoad(task.request, task.root, &task.environment, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runChangesProjectionLoad(task.request.?, task.root, &task.environment, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = actions.taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
         }
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            task.request.deinit(allocator);
+            if (task.request) |*request| request.deinit(allocator);
             task.environment.deinit();
             task.root.deinit();
             allocator.destroy(task);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: changes_projection.TaskResult) Msg {
-            defer allocator.destroy(task);
-            defer task.environment.deinit();
-            defer task.root.deinit();
-            const request = task.request;
-            task.request = undefined;
+        /// Move result-owned fields out; Chasen invokes destroy afterward.
+        fn finish(task: *@This(), result: changes_projection.TaskResult) Msg {
+            const request = task.request.?;
+            task.request = null;
             return Msg.loadFinished(.{ .changes = .{ .projection = ChangesProjectionFinished{
                 .request = request,
                 .result = result,
@@ -1388,24 +1308,18 @@ pub fn ChangesProjectionTask(comptime Msg: type) type {
 /// (plain display) instead of a failure-string variant of the success result.
 pub fn GeneratedSyntaxTask(comptime Msg: type) type {
     return struct {
-        request: changes_projection.GeneratedSyntaxRequest,
+        request: ?changes_projection.GeneratedSyntaxRequest,
         root: root_capability.RootCapability,
 
-        /// Spawn-failure counterpart of the terminal epilogue: releases the
-        /// task-owned payload without producing a Msg.
+        /// Cleanup for rejected admission or any accepted task terminal.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            task.request.deinit(allocator);
+            if (task.request) |*request| request.deinit(allocator);
             task.root.deinit();
             allocator.destroy(task);
         }
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.root.deinit();
-
-            const request = task.request;
-            task.request = undefined;
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            const request = task.request.?;
             var snapshot_fingerprint: ?content_fingerprint.Fingerprint = null;
             var result: changes_projection.GeneratedSyntaxResult = .{ .terminal_plain = .provider_unavailable };
 
@@ -1433,6 +1347,7 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
                 }
             }
 
+            task.request = null;
             return Msg.loadFinished(.{ .changes = .{ .projection_syntax = .{
                 .request = request,
                 .snapshot_fingerprint = snapshot_fingerprint,
@@ -1440,13 +1355,9 @@ pub fn GeneratedSyntaxTask(comptime Msg: type) type {
             } } });
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, _: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            defer allocator.destroy(task);
-            defer task.root.deinit();
-
-            const request = task.request;
-            task.request = undefined;
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            const request = task.request.?;
+            task.request = null;
             return Msg.loadFinished(.{ .changes = .{ .projection_syntax = .{
                 .request = request,
                 .snapshot_fingerprint = null,
@@ -3910,7 +3821,8 @@ test "CompareLoadTask owns cloned target and routes failed terminal to Compare" 
     const task = try allocator.create(Task);
     task.* = try Task.init(page.RequestIdentity.compare(9, 4), 17, root, target, null, allocator);
     try std.testing.expect(task.target.?.full_ref.ptr != target.full_ref.ptr);
-    const message = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
+    const message = Task.failed(task, error.OutOfMemory, allocator);
+    Task.destroy(task, allocator);
     var finished = switch (message.load) {
         .compare => |compare| switch (compare) {
             .source => |payload| payload,
@@ -3921,7 +3833,7 @@ test "CompareLoadTask owns cloned target and routes failed terminal to Compare" 
     defer finished.deinit(allocator);
     try std.testing.expectEqual(page.RequestIdentity.compare(9, 4), finished.identity);
     try std.testing.expectEqual(@as(u64, 17), finished.generation);
-    try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |value| value,
         else => return error.UnexpectedResult,
     });
@@ -3978,7 +3890,8 @@ test "CompareBranchListLoadTask routes its terminal and destroy closes descripto
 
     const terminal_task = try allocator.create(Task);
     terminal_task.* = try Task.init(page.RequestIdentity.compare(7, 8), 9, root, null);
-    const message = Task.failed(terminal_task, .{ .start_failed = "SystemResources" }, allocator);
+    const message = Task.failed(terminal_task, error.OutOfMemory, allocator);
+    Task.destroy(terminal_task, allocator);
     var finished = switch (message.load) {
         .compare => |compare| switch (compare) {
             .branch_list => |payload| payload,
@@ -3989,7 +3902,7 @@ test "CompareBranchListLoadTask routes its terminal and destroy closes descripto
     defer finished.deinit(allocator);
     try std.testing.expectEqual(page.RequestIdentity.compare(7, 8), finished.identity);
     try std.testing.expectEqual(@as(u64, 9), finished.generation);
-    try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |value| value,
         else => return error.UnexpectedResult,
     });
@@ -4036,7 +3949,9 @@ test "CompareBranchListLoadTask keeps physical root and controlled environment a
     defer replacement.close(io);
     try replacement.writeFile(io, .{ .sub_path = ".git", .data = "invalid replacement gitfile\n" });
 
-    const message = Task.run(task, allocator, io);
+    const message = try Task.run(task, allocator, io);
+
+    Task.destroy(task, allocator);
     var finished = switch (message.load) {
         .compare => |compare| switch (compare) {
             .branch_list => |payload| payload,
@@ -4149,7 +4064,9 @@ test "CompareLoadTask duplicate retains physical root after path replacement" {
     defer replacement.close(io);
     try replacement.writeFile(io, .{ .sub_path = ".git", .data = "invalid replacement gitfile\n" });
 
-    const message = Task.run(task, allocator, io);
+    const message = try Task.run(task, allocator, io);
+
+    Task.destroy(task, allocator);
     var finished = switch (message.load) {
         .compare => |compare| switch (compare) {
             .source => |payload| payload,
@@ -4188,7 +4105,9 @@ test "StatusLoadTask failed preserves read epoch generation and moves repo root"
         .generation = 42,
     };
 
-    const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
+    const msg = Task.failed(task, error.OutOfMemory, allocator);
+
+    Task.destroy(task, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
             .changes => |changes| switch (changes) {
@@ -4204,7 +4123,7 @@ test "StatusLoadTask failed preserves read epoch generation and moves repo root"
     try std.testing.expectEqual(page.RequestIdentity.changes(7, 11), finished.identity);
     try std.testing.expect(finished.read_epoch.eql(.{ .value = 19 }));
     try std.testing.expectEqualStrings("/repo", finished.repo_root);
-    try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
@@ -4249,7 +4168,9 @@ test "DiffLoadTask failed frees request and preserves read epoch generation" {
     };
     authority = .none;
 
-    const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
+    const msg = Task.failed(task, error.OutOfMemory, allocator);
+
+    Task.destroy(task, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
             .changes => |changes| switch (changes) {
@@ -4302,7 +4223,9 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
     environment = undefined;
     const root_observer = task.root;
 
-    const msg = Task.failed(task, .{ .start_failed = "SystemResources" }, allocator);
+    const msg = Task.failed(task, error.OutOfMemory, allocator);
+
+    Task.destroy(task, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
             .changes => |changes| switch (changes) {
@@ -4318,7 +4241,7 @@ test "BranchStatusLoadTask failed preserves read epoch generation and moves repo
     try std.testing.expectEqual(page.RequestIdentity.changes(5, 13), finished.identity);
     try std.testing.expect(finished.read_epoch.eql(.{ .value = 29 }));
     try std.testing.expectEqualStrings("/repo", finished.repo_root);
-    try std.testing.expectEqualStrings("SystemResources", switch (finished.result) {
+    try std.testing.expectEqualStrings("OutOfMemory", switch (finished.result) {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
@@ -4362,7 +4285,9 @@ test "ChangesProjectionTask failed preserves request identity and read epoch" {
         .environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null),
     };
 
-    const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
+    const msg = Task.failed(task, error.OutOfMemory, allocator);
+
+    Task.destroy(task, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
             .changes => |changes| switch (changes) {
@@ -4426,7 +4351,8 @@ test "GeneratedSyntaxTask rereads pinned matching source and retains read epoch"
         },
         .root = try root.duplicate(),
     };
-    const msg = Task.run(task, allocator, io);
+    const msg = try Task.run(task, allocator, io);
+    Task.destroy(task, allocator);
     var finished = switch (msg) {
         .load => |load| switch (load) {
             .changes => |changes| switch (changes) {
@@ -4484,7 +4410,9 @@ test "History preview reader failure releases its duplicated root and stays unde
     task.* = try Task.init(key, request, &root, null, allocator);
     const root_observer = task.root;
 
-    const message = Task.failed(task, .runtime_abandoned, allocator);
+    const message = Task.failed(task, error.ConcurrencyUnavailable, allocator);
+
+    Task.destroy(task, allocator);
     var finished = switch (message) {
         .load => |load_finished| switch (load_finished) {
             .history => |history_finished| switch (history_finished) {
@@ -4500,7 +4428,7 @@ test "History preview reader failure releases its duplicated root and stays unde
     defer finished.deinit(allocator);
     try std.testing.expect(finished.key.eql(key));
     try std.testing.expectEqual(
-        git_history_preview.FailureReason.runtime_abandoned,
+        git_history_preview.FailureReason.task_start,
         finished.result.rejected.failed,
     );
     if (root_observer.duplicate()) |unexpected_value| {

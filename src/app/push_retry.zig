@@ -207,22 +207,21 @@ pub fn startInspection(
         target.* = task.target.take();
         ctx.allocator().destroy(task);
     }
-    try ctx.task().spawnWith(.{ .ctx = task, .run = TaskType.run, .failed = TaskType.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = TaskType.run, .failed = TaskType.failed, .cleanup = TaskType.destroy });
 }
 
 pub fn InspectionTask(comptime Msg: type) type {
     return struct {
         metadata: Inspecting,
-        root: root_capability.RootCapability,
+        root: ?root_capability.RootCapability,
         environment: git_remote.OwnedRemoteEnvironment,
         target: app_state.PushRetryTarget,
 
         const Self = @This();
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *Self = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *Self, allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const result = git_remote.inspectForegroundPush(allocator, io, .{
-                .root = &task.root,
+                .root = &task.root.?,
                 .environment = &task.environment,
                 .control = .{ .deadline = std.Io.Clock.Timestamp.fromNow(io, .{
                     .raw = inspection_timeout,
@@ -236,7 +235,7 @@ pub fn InspectionTask(comptime Msg: type) type {
                     .oid = task.target.oid,
                 },
             });
-            return Msg.pushInspectionFinished(task.finish(allocator, .{
+            return Msg.pushInspectionFinished(task.finish(.{
                 .outcome = switch (result.outcome) {
                     .ready => .ready,
                     .branch_changed => .branch_changed,
@@ -247,10 +246,8 @@ pub fn InspectionTask(comptime Msg: type) type {
             }));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            _ = failure;
-            const task: *Self = @ptrCast(@alignCast(ctx_ptr));
-            return Msg.pushInspectionFinished(task.finish(allocator, .{
+        pub fn failed(task: *Self, _: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return Msg.pushInspectionFinished(task.finish(.{
                 .outcome = .{ .failed = .spawn_failed },
                 .warnings = task.environment.warnings,
             }));
@@ -261,16 +258,21 @@ pub fn InspectionTask(comptime Msg: type) type {
             warnings: git_remote.RemoteWarningSet,
         };
 
-        fn finish(task: *Self, allocator: std.mem.Allocator, result: TaskResult) Finished {
-            defer {
-                task.environment.deinit();
-                allocator.destroy(task);
-            }
+        pub fn destroy(task: *Self, allocator: std.mem.Allocator) void {
+            if (task.root) |*root| root.deinit();
+            task.target.deinit(allocator);
+            task.environment.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *Self, result: TaskResult) Finished {
+            const root = task.root.?;
+            task.root = null;
             return .{
                 .identity = task.metadata.identity,
                 .origin = task.metadata.origin,
                 .target_identity = task.metadata.target_identity,
-                .root = task.root,
+                .root = root,
                 .target = task.target.take(),
                 .warnings = result.warnings,
                 .outcome = result.outcome,
@@ -311,7 +313,7 @@ pub fn startFinalization(
         target.* = task.target.take();
         ctx.allocator().destroy(task);
     }
-    try ctx.task().spawnWith(.{ .ctx = task, .run = TaskType.run, .failed = TaskType.failed });
+    _ = try ctx.task().spawnOwned(task, .{ .run = TaskType.run, .failed = TaskType.failed, .cleanup = TaskType.destroy });
 }
 
 pub fn FinalizeTask(comptime Msg: type) type {
@@ -324,8 +326,7 @@ pub fn FinalizeTask(comptime Msg: type) type {
 
         const Self = @This();
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *Self = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *Self, allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const outcome = git_remote.finalizePushUpstream(allocator, io, .{
                 .root = &task.root,
                 .environment = &task.environment,
@@ -338,22 +339,21 @@ pub fn FinalizeTask(comptime Msg: type) type {
                 .remote_branch = task.target.remote_branch,
                 .oid = task.target.oid,
             });
-            return Msg.pushUpstreamFinalizeFinished(task.finish(allocator, outcome));
+            return Msg.pushUpstreamFinalizeFinished(task.finish(outcome));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            _ = failure;
-            const task: *Self = @ptrCast(@alignCast(ctx_ptr));
-            return Msg.pushUpstreamFinalizeFinished(task.finish(allocator, .config_write_failed));
+        pub fn failed(task: *Self, _: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return Msg.pushUpstreamFinalizeFinished(task.finish(.config_write_failed));
         }
 
-        fn finish(task: *Self, allocator: std.mem.Allocator, outcome: git_remote.PushUpstreamFinalizeOutcome) FinalizeFinished {
-            defer {
-                task.root.deinit();
-                task.environment.deinit();
-                task.target.deinit(allocator);
-                allocator.destroy(task);
-            }
+        pub fn destroy(task: *Self, allocator: std.mem.Allocator) void {
+            task.root.deinit();
+            task.environment.deinit();
+            task.target.deinit(allocator);
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *Self, outcome: git_remote.PushUpstreamFinalizeOutcome) FinalizeFinished {
             return .{
                 .identity = task.metadata.identity,
                 .outcome = outcome,

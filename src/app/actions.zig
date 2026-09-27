@@ -76,36 +76,38 @@ pub const CreateStashFinished = struct {
 pub fn CreateStashTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
-        snapshot: app_stash.Snapshot,
+        snapshot: ?app_stash.Snapshot,
         scope: git_stash.Scope,
         message: []u8,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const result = git_stash.create(allocator, io, .{ .cwd = task.root.dir(), .environment = &task.environment }, .{
-                .branch = task.snapshot.branch,
-                .oid = task.snapshot.oid,
+                .branch = task.snapshot.?.branch,
+                .oid = task.snapshot.?.oid,
                 .scope = task.scope,
                 .message = task.message,
             }) catch |err| git_stash.CreateResult{ .operation = .{ .failed_static = @errorName(err) } };
-            return task.finish(allocator, result);
+            return task.finish(result);
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .operation = .{ .failed_static = taskFailureMessage(failure) } });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .operation = .{ .failed_static = taskFailureMessage(failure) } });
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_stash.CreateResult) Msg {
-            defer {
-                allocator.free(task.message);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
-            return Msg.actionFinished(.{ .create_stash = .{ .pending = task.pending, .snapshot = task.snapshot, .scope = task.scope, .result = result } });
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.snapshot) |*owned| owned.deinit(allocator);
+            allocator.free(task.message);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: git_stash.CreateResult) Msg {
+            const snapshot = task.snapshot.?;
+            task.snapshot = null;
+            return Msg.actionFinished(.{ .create_stash = .{ .pending = task.pending, .snapshot = snapshot, .scope = task.scope, .result = result } });
         }
     };
 }
@@ -125,13 +127,12 @@ pub const StashSelectionFinished = struct {
 pub fn StashSelectionTask(comptime Msg: type) type {
     return struct {
         pending: PendingAction,
-        confirmation: app_stash.Selection,
+        confirmation: ?app_stash.Selection,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            const target = task.confirmation;
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            const target = task.confirmation.?;
             const result = git_stash.performSelection(allocator, io, .{ .cwd = task.root.dir(), .environment = &task.environment }, .{
                 .action = target.action,
                 .branch = target.snapshot.branch,
@@ -139,21 +140,24 @@ pub fn StashSelectionTask(comptime Msg: type) type {
                 .selector = target.selector,
                 .stash_oid = target.oid,
             });
-            return task.finish(allocator, result);
+            return task.finish(result);
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .operation = .{ .failed_static = taskFailureMessage(failure) } });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .operation = .{ .failed_static = taskFailureMessage(failure) } });
         }
 
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_stash.SelectionResult) Msg {
-            defer {
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
-            return Msg.actionFinished(.{ .stash_selection = .{ .pending = task.pending, .confirmation = task.confirmation, .result = result } });
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.confirmation) |*owned| owned.deinit(allocator);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: git_stash.SelectionResult) Msg {
+            const confirmation = task.confirmation.?;
+            task.confirmation = null;
+            return Msg.actionFinished(.{ .stash_selection = .{ .pending = task.pending, .confirmation = confirmation, .result = result } });
         }
     };
 }
@@ -451,27 +455,25 @@ pub fn StageFileTask(comptime Msg: type) type {
         label: []u8,
         target_kind: git_ops.TargetKind,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runStageTarget(task.directoryContext(), task.path, task.target_kind, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runStageTarget(task.directoryContext(), task.path, task.target_kind, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                if (task.label.len > 0) allocator.free(task.label);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            if (task.path.len > 0) allocator.free(task.path);
+            if (task.label.len > 0) allocator.free(task.label);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const path = task.label;
             task.label = &.{};
             const repo_root = task.repo_root;
@@ -505,27 +507,25 @@ pub fn UnstageFileTask(comptime Msg: type) type {
         label: []u8,
         target_kind: git_ops.TargetKind,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runUnstageTarget(task.directoryContext(), task.path, task.target_kind, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runUnstageTarget(task.directoryContext(), task.path, task.target_kind, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                if (task.label.len > 0) allocator.free(task.label);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            if (task.path.len > 0) allocator.free(task.path);
+            if (task.label.len > 0) allocator.free(task.label);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const path = task.label;
             task.label = &.{};
             const repo_root = task.repo_root;
@@ -559,27 +559,25 @@ pub fn StageHunkTask(comptime Msg: type) type {
         hunk_index: usize,
         session_mark_mutation: git_ops.SessionHunkMarkMutation,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runStageHunk(task.directoryContext(), task.patch, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runStageHunk(task.directoryContext(), task.patch, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                allocator.free(task.patch);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            if (task.path.len > 0) allocator.free(task.path);
+            allocator.free(task.patch);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const repo_root = task.repo_root;
             const path = task.path;
             task.repo_root = &.{};
@@ -613,27 +611,25 @@ pub fn UnstageHunkTask(comptime Msg: type) type {
         session_mark_mutation: git_ops.SessionHunkMarkMutation,
         reload_after_success: bool = false,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runUnstageHunk(task.directoryContext(), task.patch, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runUnstageHunk(task.directoryContext(), task.patch, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                allocator.free(task.patch);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            if (task.path.len > 0) allocator.free(task.path);
+            allocator.free(task.patch);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const repo_root = task.repo_root;
             const path = task.path;
             task.repo_root = &.{};
@@ -667,26 +663,24 @@ pub fn DiscardFileTask(comptime Msg: type) type {
         environment: git_command.LocalGitEnvironment,
         path: []u8,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runDiscardFile(task.directoryContext(), task.path, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runDiscardFile(task.directoryContext(), task.path, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                allocator.free(task.repo_root);
-                if (task.path.len > 0) allocator.free(task.path);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            allocator.free(task.repo_root);
+            if (task.path.len > 0) allocator.free(task.path);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const repo_root = task.repo_root;
             const path = task.path;
             task.repo_root = &.{};
@@ -718,27 +712,25 @@ pub fn CommitTask(comptime Msg: type) type {
         subject: []u8,
         body: ?[]u8,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runCommit(task.directoryContext(), task.subject, task.body, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runCommit(task.directoryContext(), task.subject, task.body, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                allocator.free(task.subject);
-                if (task.body) |body| allocator.free(body);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            allocator.free(task.subject);
+            if (task.body) |body| allocator.free(body);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const repo_root = task.repo_root;
             task.repo_root = &.{};
             return Msg.actionFinished(.{ .commit = CommitFinished{
@@ -764,27 +756,25 @@ pub fn AmendTask(comptime Msg: type) type {
         subject: []u8,
         body: ?[]u8,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runAmend(task.directoryContext(), task.subject, task.body, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runAmend(task.directoryContext(), task.subject, task.body, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                allocator.free(task.subject);
-                if (task.body) |body| allocator.free(body);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            allocator.free(task.subject);
+            if (task.body) |body| allocator.free(body);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const repo_root = task.repo_root;
             task.repo_root = &.{};
             return Msg.actionFinished(.{ .amend = AmendFinished{
@@ -818,8 +808,7 @@ pub fn PushTask(comptime Msg: type) type {
         environment: ?git_remote.OwnedRemoteEnvironment = null,
         cancellation: ?process_runner.CancellationView = null,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const root = if (task.root) |*owned| owned else @panic("background push requires root authority");
             const environment = if (task.environment) |*owned| owned else @panic("background push requires an environment");
             const result = runBackgroundPush(
@@ -834,29 +823,27 @@ pub fn PushTask(comptime Msg: type) type {
                 allocator,
                 io,
             );
-            return task.finish(allocator, result);
+            return task.finish(result);
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            _ = failure;
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) Msg {
             const result = remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{});
-            return task.finish(allocator, result);
+            return task.finish(result);
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_remote.RemoteOperationResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.branch.len > 0) allocator.free(task.branch);
-                if (task.remote.len > 0) allocator.free(task.remote);
-                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
-                allocator.free(task.oid);
-                if (task.root) |*root| root.deinit();
-                if (task.environment) |*environment| environment.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            if (task.branch.len > 0) allocator.free(task.branch);
+            if (task.remote.len > 0) allocator.free(task.remote);
+            if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+            allocator.free(task.oid);
+            if (task.root) |*root| root.deinit();
+            if (task.environment) |*environment| environment.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: git_remote.RemoteOperationResult) Msg {
             const mode = task.mode;
             const repo_root = task.repo_root;
             const branch = task.branch;
@@ -901,11 +888,10 @@ pub fn PullTask(comptime Msg: type) type {
         environment: ?git_remote.OwnedRemoteEnvironment = null,
         cancellation: ?process_runner.CancellationView = null,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const root = if (task.root) |*owned| owned else @panic("background pull requires root authority");
             const environment = if (task.environment) |*owned| owned else @panic("background pull requires an environment");
-            return task.finish(allocator, runBackgroundPull(
+            return task.finish(runBackgroundPull(
                 root,
                 environment,
                 task.cancellation orelse @panic("background pull requires cancellation authority"),
@@ -918,25 +904,23 @@ pub fn PullTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            _ = failure;
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{}));
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{}));
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_remote.RemoteOperationResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.branch.len > 0) allocator.free(task.branch);
-                if (task.remote.len > 0) allocator.free(task.remote);
-                if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
-                allocator.free(task.oid);
-                if (task.root) |*root| root.deinit();
-                if (task.environment) |*environment| environment.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            if (task.branch.len > 0) allocator.free(task.branch);
+            if (task.remote.len > 0) allocator.free(task.remote);
+            if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+            allocator.free(task.oid);
+            if (task.root) |*root| root.deinit();
+            if (task.environment) |*environment| environment.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: git_remote.RemoteOperationResult) Msg {
             const repo_root = task.repo_root;
             const branch = task.branch;
             const remote = task.remote;
@@ -976,11 +960,10 @@ pub fn FetchTask(comptime Msg: type) type {
         environment: ?git_remote.OwnedRemoteEnvironment = null,
         cancellation: ?process_runner.CancellationView = null,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
             const root = if (task.root) |*owned| owned else @panic("background fetch requires root authority");
             const environment = if (task.environment) |*owned| owned else @panic("background fetch requires an environment");
-            return task.finish(allocator, runBackgroundFetch(
+            return task.finish(runBackgroundFetch(
                 root,
                 environment,
                 task.cancellation orelse @panic("background fetch requires cancellation authority"),
@@ -990,22 +973,20 @@ pub fn FetchTask(comptime Msg: type) type {
             ));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            _ = failure;
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{}));
+        pub fn failed(task: *@This(), _: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(remoteTaskSpawnFailure(if (task.environment) |environment| environment.warnings else .{}));
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: git_remote.RemoteOperationResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                allocator.free(task.remote);
-                if (task.root) |*root| root.deinit();
-                if (task.environment) |*environment| environment.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            allocator.free(task.remote);
+            if (task.root) |*root| root.deinit();
+            if (task.environment) |*environment| environment.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: git_remote.RemoteOperationResult) Msg {
             const repo_root = task.repo_root;
             const remote = task.remote;
             task.repo_root = &.{};
@@ -1032,29 +1013,27 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
         target_branch: []u8,
         target_oid: []u8,
 
-        pub fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, io: std.Io) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, runSwitchBranch(task.directoryContext(), task.expected_branch, task.expected_oid, task.target_branch, task.target_oid, allocator, io));
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
+            return task.finish(runSwitchBranch(task.directoryContext(), task.expected_branch, task.expected_oid, task.target_branch, task.target_oid, allocator, io));
         }
 
-        pub fn failed(ctx_ptr: *anyopaque, failure: chasen.TaskFailure, allocator: std.mem.Allocator) Msg {
-            const task: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            return task.finish(allocator, .{ .failed_static = taskFailureMessage(failure) });
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
+            return task.finish(.{ .failed_static = taskFailureMessage(failure) });
         }
 
-        /// Terminal epilogue shared by run and failed; owned-field release,
-        /// moves, and destroy live only here.
-        fn finish(task: *@This(), allocator: std.mem.Allocator, result: FileActionTaskResult) Msg {
-            defer {
-                if (task.repo_root.len > 0) allocator.free(task.repo_root);
-                if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
-                allocator.free(task.expected_oid);
-                if (task.target_branch.len > 0) allocator.free(task.target_branch);
-                allocator.free(task.target_oid);
-                task.environment.deinit();
-                task.root.deinit();
-                allocator.destroy(task);
-            }
+        /// Release all fields not moved into the result.
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            if (task.repo_root.len > 0) allocator.free(task.repo_root);
+            if (task.expected_branch.len > 0) allocator.free(task.expected_branch);
+            allocator.free(task.expected_oid);
+            if (task.target_branch.len > 0) allocator.free(task.target_branch);
+            allocator.free(task.target_oid);
+            task.environment.deinit();
+            task.root.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: FileActionTaskResult) Msg {
             const repo_root = task.repo_root;
             const old_branch = task.expected_branch;
             const new_branch = task.target_branch;
@@ -1076,11 +1055,8 @@ pub fn SwitchBranchTask(comptime Msg: type) type {
     };
 }
 
-pub fn taskFailureMessage(failure: chasen.TaskFailure) []const u8 {
-    return switch (failure) {
-        .start_failed => |message| message,
-        .runtime_abandoned => "runtime shutting down",
-    };
+pub fn taskFailureMessage(failure: chasen.TaskStartError) []const u8 {
+    return @errorName(failure);
 }
 
 pub fn runStageFile(context: git_command.DirectoryContext, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
@@ -1358,7 +1334,10 @@ test "StageFileTask run frees borrowed command path and moves label" {
     const task = try makeStageFileTaskForTest(allocator, .{ .generation = 11, .kind = .stage_file });
     const root_observer = task.root;
 
-    var finished = expectStageFileFinished(Task.run(task, allocator, std.testing.io));
+    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    const entries = ctx.takePendingTasks();
+    var finished = expectStageFileFinished(try entries[0].run(allocator, std.testing.io));
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 11), finished.pending.generation);
@@ -1375,14 +1354,17 @@ test "StageFileTask failed frees borrowed command path and moves label" {
     const task = try makeStageFileTaskForTest(allocator, .{ .generation = 12, .kind = .stage_file });
     const root_observer = task.root;
 
-    var finished = expectStageFileFinished(Task.failed(task, .runtime_abandoned, allocator));
+    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    const entries = ctx.takePendingTasks();
+    var finished = expectStageFileFinished(entries[0].failed(error.ConcurrencyUnavailable, allocator));
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 12), finished.pending.generation);
     try std.testing.expectEqual(ActionKind.stage_file, finished.pending.kind);
     try std.testing.expectEqualStrings("/__gitframe_missing_repo__", finished.repo_root);
     try std.testing.expectEqualStrings("src/main.zig", finished.path);
-    try std.testing.expectEqualStrings("runtime shutting down", switch (finished.result) {
+    try std.testing.expectEqualStrings("ConcurrencyUnavailable", switch (finished.result) {
         .failed_static => |message| message,
         else => return error.UnexpectedResult,
     });
@@ -1395,7 +1377,10 @@ test "UnstageFileTask run frees borrowed command path and moves label" {
     const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 13, .kind = .unstage_file });
     const root_observer = task.root;
 
-    var finished = expectUnstageFileFinished(Task.run(task, allocator, std.testing.io));
+    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    const entries = ctx.takePendingTasks();
+    var finished = expectUnstageFileFinished(try entries[0].run(allocator, std.testing.io));
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 13), finished.pending.generation);
@@ -1412,7 +1397,10 @@ test "UnstageFileTask failed frees borrowed command path and moves label" {
     const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 14, .kind = .unstage_file });
     const root_observer = task.root;
 
-    var finished = expectUnstageFileFinished(Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator));
+    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
+    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    const entries = ctx.takePendingTasks();
+    var finished = expectUnstageFileFinished(entries[0].failed(error.OutOfMemory, allocator));
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 14), finished.pending.generation);
@@ -1469,7 +1457,9 @@ test "StageHunkTask failed preserves identity and transfers moved fields" {
     authority_consumed = true;
     const root_observer = task.root;
 
-    const msg = Task.failed(task, .{ .start_failed = "OutOfMemory" }, allocator);
+    const msg = Task.failed(task, error.OutOfMemory, allocator);
+
+    Task.destroy(task, allocator);
     var finished = switch (msg) {
         .action => |action| switch (action) {
             .stage_hunk => |payload| payload,
@@ -1524,4 +1514,24 @@ test "runOperationMapped preserves action failure prefixes" {
         else => return error.UnexpectedResult,
     };
     try std.testing.expect(std.mem.startsWith(u8, commit_message, "Commit failed: "));
+}
+
+test "owned StageFileTask discard and queued cancellation release without a message" {
+    const allocator = std.testing.allocator;
+    const Task = StageFileTask(FileTaskTestMsg);
+    for ([_]bool{ false, true }) |cancel| {
+        const task = try makeStageFileTaskForTest(allocator, .{ .generation = 15, .kind = .stage_file });
+        const root_observer = task.root;
+        var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
+        const id = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+        if (cancel) {
+            ctx.task().requestCancel(id);
+            const entries = ctx.takePendingTasks();
+            try std.testing.expectError(error.Canceled, entries[0].run(allocator, std.testing.io));
+        } else {
+            chasen.testing.discardPendingTasks(FileTaskTestMsg, &ctx);
+        }
+        try expectRootCapabilityClosedForTest(root_observer);
+        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    }
 }

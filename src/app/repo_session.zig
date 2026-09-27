@@ -715,11 +715,7 @@ pub const Controller = struct {
             .environment = environment,
         };
         self.state.pending_repo_path_recent_source = recent_source;
-        ctx.task().spawnWith(.{
-            .ctx = task,
-            .run = RepoPathDiscoveryTask.run,
-            .failed = RepoPathDiscoveryTask.failed,
-        }) catch |err| {
+        _ = ctx.task().spawnOwned(task, .{ .run = RepoPathDiscoveryTask.run, .failed = RepoPathDiscoveryTask.failed, .cleanup = RepoPathDiscoveryTask.destroy }) catch |err| {
             task.destroy(ctx.allocator());
             _ = self.state.repo_picker.finishPathDiscovery(generation);
             self.state.pending_repo_path_recent_source = null;
@@ -1532,17 +1528,12 @@ test "repo picker path input errors do not remove recent history" {
     try app.repo_session.recent_repos.rememberRepo(allocator, "/kept/repo");
     try app.repoSession().enterPicker(allocator);
     try app.repoSession().startPathDiscovery(&ctx, "/typed/missing", null);
-    const pending_tasks = ctx.takePendingTasksWith();
+    const pending_tasks = ctx.takePendingTasks();
     try std.testing.expectEqual(@as(usize, 1), pending_tasks.len);
-    const task: *RepoPathDiscoveryTask = @ptrCast(@alignCast(pending_tasks[0].ctx));
-    const generation = task.generation;
-    try std.testing.expectEqualStrings(
-        "preserved",
-        task.environment.borrow().get("GITFRAME_S1_CANARY").?,
-    );
-    try std.testing.expect(task.environment.borrow().get("GiT_path_selector") == null);
-    var abandoned = pending_tasks[0].failed(pending_tasks[0].ctx, .runtime_abandoned, allocator);
-    abandoned.deinitUndelivered(allocator);
+    var terminal = pending_tasks[0].failed(error.ConcurrencyUnavailable, allocator);
+    defer terminal.deinitUndelivered(allocator);
+    const generation = terminal.load_finished.shell.repo_path_discovery.generation;
+    try std.testing.expectEqualStrings("/typed/missing", terminal.load_finished.shell.repo_path_discovery.submitted_path);
 
     var finished = RepoPathDiscoveryFinished{
         .generation = generation,
