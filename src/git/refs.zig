@@ -132,18 +132,24 @@ pub fn loadBranchStatus(
         else => return branchStatusCommandFailure(allocator, "git rev-parse HEAD", oid_result),
     }
 
-    const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
+    if (builder.status.branchName() == null or builder.status.oid == null) return .{ .ok = builder.finish() };
+    const local_ref = trimLineEnd(head_result.stdout);
+    const upstream_argv = [_][]const u8{ "git", "for-each-ref", git_branch_status.upstream_format, "--", local_ref };
     const upstream_result = try runBranchCommand(allocator, io, request.context, &upstream_argv, .limited(4 * 1024));
     defer upstream_result.deinit(allocator);
     var has_upstream = false;
     switch (upstream_result.term) {
         .exited => |code| if (code == 0) {
-            has_upstream = true;
-            try builder.setUpstream(trimLineEnd(upstream_result.stdout));
+            const upstream = git_branch_status.parseUpstreamRecord(upstream_result.stdout, local_ref) catch
+                return .{ .failed_static = "invalid upstream record" };
+            if (upstream) |value| {
+                has_upstream = true;
+                try builder.setUpstream(value);
+            }
         } else {
-            // No upstream is a normal local-branch/detached state.
+            return branchStatusCommandFailure(allocator, "git for-each-ref upstream", upstream_result);
         },
-        else => return branchStatusCommandFailure(allocator, "git rev-parse upstream", upstream_result),
+        else => return branchStatusCommandFailure(allocator, "git for-each-ref upstream", upstream_result),
     }
 
     if (has_upstream) {
@@ -676,16 +682,19 @@ test "refs loads branch status without upstream" {
 
     const io = std.testing.io;
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
+    defer environment.deinit();
+    const request: BranchStatusRequest = .{ .context = .{ .cwd = tmp.dir, .environment = &environment } };
+    const unborn = try loadBranchStatus(std.testing.allocator, io, request);
+    defer unborn.deinit(std.testing.allocator);
+    try std.testing.expect(unborn == .ok);
+    try std.testing.expectEqualStrings("main", unborn.ok.status.branchName().?);
+    try std.testing.expect(unborn.ok.status.oid == null and unborn.ok.status.upstream == null);
     try tmp.dir.writeFile(io, .{ .sub_path = "README.md", .data = "hello\n" });
     try runTestGit(io, &.{ "git", "add", "README.md" }, tmp.dir);
     try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial" }, tmp.dir);
     try runTestGit(io, &.{ "git", "tag", "main" }, tmp.dir);
-    var environment = try git_command.LocalGitEnvironment.initFromParent(std.testing.allocator, null);
-    defer environment.deinit();
-
-    const result = try loadBranchStatus(std.testing.allocator, io, .{
-        .context = .{ .cwd = tmp.dir, .environment = &environment },
-    });
+    const result = try loadBranchStatus(std.testing.allocator, io, request);
     defer result.deinit(std.testing.allocator);
 
     const status = switch (result) {
@@ -696,6 +705,31 @@ test "refs loads branch status without upstream" {
     try std.testing.expect(status.oid != null);
     try std.testing.expect(status.upstream == null);
     try std.testing.expect(status.ahead_behind == null);
+    try runTestGit(io, &.{ "git", "switch", "--detach" }, tmp.dir);
+    const detached = try loadBranchStatus(std.testing.allocator, io, request);
+    defer detached.deinit(std.testing.allocator);
+    try std.testing.expect(detached == .ok);
+    try std.testing.expect(detached.ok.status.head == .detached);
+    try std.testing.expect(detached.ok.status.oid != null and detached.ok.status.upstream == null);
+
+    // An unborn ref may name a prefix containing other refs. Do not enumerate
+    // those descendants merely to discover that the unborn branch has no tip.
+    for (0..220) |index| {
+        const ref = try std.fmt.allocPrint(std.testing.allocator, "refs/heads/future/{d}", .{index});
+        defer std.testing.allocator.free(ref);
+        try runTestGit(io, &.{ "git", "update-ref", ref, "HEAD" }, tmp.dir);
+    }
+    try runTestGit(io, &.{ "git", "symbolic-ref", "HEAD", "refs/heads/future" }, tmp.dir);
+    const descendants = try gitOutputAlloc(io, tmp.dir, &.{ "git", "for-each-ref", git_branch_status.upstream_format, "--", "refs/heads/future" });
+    defer std.testing.allocator.free(descendants);
+    try std.testing.expect(descendants.len > 4 * 1024);
+    const prefixed_unborn = try loadBranchStatus(std.testing.allocator, io, request);
+    defer prefixed_unborn.deinit(std.testing.allocator);
+    try std.testing.expect(prefixed_unborn == .ok);
+    try std.testing.expectEqualStrings("future", prefixed_unborn.ok.status.branchName().?);
+    try std.testing.expect(prefixed_unborn.ok.status.oid == null);
+    try std.testing.expect(prefixed_unborn.ok.status.upstream == null);
+    try std.testing.expect(prefixed_unborn.ok.status.ahead_behind == null);
 }
 
 test "refs loads branch status with upstream" {

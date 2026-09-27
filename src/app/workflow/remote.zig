@@ -305,6 +305,7 @@ pub const Controller = struct {
             .branch = owned.branch,
             .remote = owned.remote,
             .remote_branch = owned.remote_branch,
+            .upstream_ref = owned.upstream_ref,
             .oid = owned.oid,
             .ahead = owned.ahead,
             .behind = owned.behind,

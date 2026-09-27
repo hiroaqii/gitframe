@@ -44,7 +44,7 @@ fn branchStatusBundleForRemoteRootTest(
     allocator: std.mem.Allocator,
     oid: []const u8,
     branch: []const u8,
-    upstream: []const u8,
+    upstream: git_branch_status.Upstream,
 ) !git_branch_status.BranchStatusBundle {
     var builder = git_branch_status.Builder.init(allocator);
     errdefer builder.deinit();
@@ -652,7 +652,7 @@ test "remote request preparation failures clear prior local confirmation" {
         allocator,
         "abc123",
         "feature",
-        "origin/main",
+        .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
     );
     try failure_app.pages.changes.branch_status.replace(roots.a, &branch);
     _ = failure_app.pages.changes.activation.activate(failure_app.repo_session.repo_epoch, .fresh, .fresh, .fresh);
@@ -1030,7 +1030,7 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
 
     // Simulate the branch refresh; file status may still be pending when b reopens.
     chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    var branch = try branchStatusBundleForRemoteRootTest(allocator, "abc123", "main", "origin/main");
+    var branch = try branchStatusBundleForRemoteRootTest(allocator, "abc123", "main", .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" });
     try app.pages.changes.branch_status.replace(roots.a, &branch);
     _ = app.pages.changes.activation.activate(app.repo_session.repo_epoch, .fresh, .pending, .fresh);
     const reopen = app.handleEvent(.{ .key_press = .{ .codepoint = 'b' } }) orelse return error.ExpectedReopenPicker;

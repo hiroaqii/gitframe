@@ -24,7 +24,7 @@ const App = app_mod.App;
 const BranchStatusBundleSpec = struct {
     oid: ?[]const u8 = null,
     branch: ?[]const u8 = null,
-    upstream: ?[]const u8 = null,
+    upstream: ?git_branch_status.Upstream = null,
     ahead: ?u32 = null,
     behind: ?u32 = null,
 };
@@ -284,7 +284,7 @@ test "clean empty state shows branch status chrome" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature/topic",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 0,
     });
@@ -320,7 +320,7 @@ test "clean empty state hides stale branch status chrome" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature/topic",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 0,
     });
@@ -356,7 +356,7 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "main",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 0,
     });
@@ -402,7 +402,7 @@ test "clean empty state shows bound fetch key from effective keymap" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "main",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 0,
     });
@@ -437,7 +437,7 @@ test "clean empty state omits fetch hint when unbound or target is not ready" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "main",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 0,
     });
@@ -486,7 +486,7 @@ test "clean empty patch source does not advertise remote actions" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "main",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 0,
     });

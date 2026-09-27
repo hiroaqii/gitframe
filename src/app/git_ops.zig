@@ -193,6 +193,7 @@ pub const PullTarget = struct {
     branch: []const u8,
     remote: []const u8,
     remote_branch: []const u8,
+    upstream_ref: []const u8,
     oid: []const u8,
     ahead: u32,
     behind: u32,
@@ -390,6 +391,7 @@ pub fn pullTarget(ctx: PullActionContext) PullTargetResult {
         .branch = branch,
         .remote = upstream.remote,
         .remote_branch = upstream.remote_branch,
+        .upstream_ref = upstream.full_ref,
         .oid = oid,
         .ahead = ahead_behind.ahead,
         .behind = ahead_behind.behind,
@@ -817,7 +819,7 @@ test "pushTarget requires a fresh upstream branch with outgoing commits" {
     const status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{ .ahead = 2, .behind = 0 },
     };
 
@@ -868,7 +870,7 @@ test "pullTarget requires behind-only branch and clean status" {
     const status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{ .ahead = 0, .behind = 2 },
     };
 
@@ -895,7 +897,7 @@ test "fetchTarget requires a fresh remote upstream branch" {
     const status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
     };
 
     switch (fetchTarget(.{
@@ -936,7 +938,7 @@ test "pushTarget rejects unsafe or incomplete branch states" {
     const ready_status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{ .ahead = 1, .behind = 0 },
     };
 
@@ -983,7 +985,7 @@ test "pushTarget rejects unsafe or incomplete branch states" {
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
             .oid = "abc123",
             .head = .{ .branch = "feature" },
-            .upstream = .{ .name = "origin", .remote = "origin", .remote_branch = "" },
+            .upstream = .{ .name = "origin", .full_ref = "refs/remotes/origin", .remote = "origin", .remote_branch = "" },
             .ahead_behind = .{ .ahead = 1, .behind = 0 },
         } },
     }));
@@ -1031,7 +1033,7 @@ test "pullTarget rejects unsafe branch and worktree states" {
     const ready_status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{ .ahead = 0, .behind = 1 },
     };
 
@@ -1119,7 +1121,7 @@ test "fetchTarget rejects unsafe or unsupported branch states" {
     const ready_status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
     };
 
     try std.testing.expectEqual(FetchTargetResult.unavailable_source, fetchTarget(.{
@@ -1155,7 +1157,7 @@ test "fetchTarget rejects unsafe or unsupported branch states" {
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = .{
             .oid = "abc123",
             .head = .{ .branch = "feature" },
-            .upstream = .{ .name = "origin", .remote = "origin", .remote_branch = "" },
+            .upstream = .{ .name = "origin", .full_ref = "refs/remotes/origin", .remote = "origin", .remote_branch = "" },
         } },
     }));
 }

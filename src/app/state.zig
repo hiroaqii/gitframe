@@ -233,6 +233,7 @@ pub const PullConfirmation = struct {
     branch: []u8,
     remote: []u8,
     remote_branch: []u8,
+    upstream_ref: []u8,
     oid: []u8,
     ahead: u32,
     behind: u32,
@@ -242,6 +243,7 @@ pub const PullConfirmation = struct {
         allocator.free(self.branch);
         allocator.free(self.remote);
         allocator.free(self.remote_branch);
+        allocator.free(self.upstream_ref);
         allocator.free(self.oid);
         self.* = undefined;
     }

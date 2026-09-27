@@ -302,7 +302,7 @@ fn branchBundleForTest(name: []const u8) !git_branch_status.BranchStatusBundle {
     errdefer builder.deinit();
     try builder.setOid("0123456789abcdef");
     try builder.setBranchHead(name);
-    try builder.setUpstream("origin/main");
+    try builder.setUpstream(.{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" });
     builder.setAheadBehind(2, 1);
     return builder.finish();
 }

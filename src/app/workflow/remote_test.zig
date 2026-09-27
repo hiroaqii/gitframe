@@ -285,7 +285,7 @@ const RemoteHarness = struct {
 const BranchStatusBundleSpec = struct {
     oid: ?[]const u8 = null,
     branch: ?[]const u8 = null,
-    upstream: ?[]const u8 = null,
+    upstream: ?git_branch_status.Upstream = null,
     ahead: ?u32 = null,
     behind: ?u32 = null,
 };
@@ -514,7 +514,7 @@ fn installFetchTargetForTest(
     var bundle = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
         .branch = "main",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 0,
     });
@@ -693,7 +693,7 @@ test "requestPush snapshots the active branch target" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 2,
         .behind = 0,
     });
@@ -753,7 +753,7 @@ test "requestPull snapshots the active branch target" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 0,
         .behind = 2,
     });
@@ -786,7 +786,7 @@ test "requestPull opens confirmation before remote refresh regardless of stale a
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 1,
         .behind = 0,
     });
@@ -1312,7 +1312,7 @@ test "requestPush clears previous push error details" {
     var bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc123",
         .branch = "feature",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 2,
         .behind = 0,
     });
@@ -1364,6 +1364,7 @@ test "requestPull rejects while another action is pending" {
             .branch = try std.testing.allocator.dupe(u8, "old-feature"),
             .remote = try std.testing.allocator.dupe(u8, "origin"),
             .remote_branch = try std.testing.allocator.dupe(u8, "old-main"),
+            .upstream_ref = try std.testing.allocator.dupe(u8, "refs/remotes/origin/main"),
             .oid = try std.testing.allocator.dupe(u8, "old123"),
             .ahead = 0,
             .behind = 1,
@@ -1538,7 +1539,7 @@ test "confirmPush rejects a proposal after repository authority changes" {
     var bundle = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
         .branch = "feature",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 1,
         .behind = 0,
     });
@@ -1568,7 +1569,7 @@ test "confirmPush rejects a proposal with a stale root identity" {
     var bundle = try branchStatusBundleForTest(allocator, .{
         .oid = "abc123",
         .branch = "feature",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 1,
         .behind = 0,
     });
@@ -1646,6 +1647,7 @@ test "confirmPull keeps confirmation when another action is pending" {
             .branch = try std.testing.allocator.dupe(u8, "feature"),
             .remote = try std.testing.allocator.dupe(u8, "origin"),
             .remote_branch = try std.testing.allocator.dupe(u8, "main"),
+            .upstream_ref = try std.testing.allocator.dupe(u8, "refs/remotes/origin/main"),
             .oid = try std.testing.allocator.dupe(u8, "abc123"),
             .ahead = 0,
             .behind = 1,
@@ -2633,5 +2635,165 @@ test "interactive push foreground root survives repository replacement and close
         try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
         try expectRootCapabilityClosed(foreground_root_observer);
         try expectRootCapabilityOpen(app.repoSessionView().activeCapability().?.*);
+    }
+}
+
+test "structured upstream selects the exact slash remote for push fetch and pull" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const git_command = @import("../../git/command.zig");
+    for ([_]bool{ false, true }) |coexisting_remote| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const fixture = try setupPushRetryRepoForTest(allocator, io, &tmp);
+        defer allocator.free(fixture.repo_root);
+        defer allocator.free(fixture.oid);
+        var work = try tmp.dir.openDir(io, "work", .{});
+        defer work.close(io);
+        var remote = try tmp.dir.openDir(io, "remote.git", .{});
+        defer remote.close(io);
+        try runAppTestGit(allocator, io, &.{ "git", "init", "--bare", "other.git" }, tmp.dir);
+        var other = try tmp.dir.openDir(io, "other.git", .{});
+        defer other.close(io);
+        try runAppTestGit(allocator, io, &.{ "git", "remote", "rename", "origin", "team/origin" }, work);
+        try runAppTestGit(allocator, io, &.{ "git", "push", "-u", "team/origin", "main" }, work);
+        try runAppTestGit(allocator, io, &.{ "git", "push", "../other.git", "main:refs/heads/origin/main" }, work);
+        const tracking_ref = if (coexisting_remote) "refs/remotes/selected/main" else "refs/remotes/team/origin/main";
+        if (coexisting_remote) {
+            // remote add rejects these overlapping names; existing config can contain them.
+            try runAppTestGit(allocator, io, &.{ "git", "config", "remote.team.url", "../other.git" }, work);
+            try runAppTestGit(allocator, io, &.{ "git", "config", "remote.team.fetch", "+refs/heads/*:refs/remotes/team/*" }, work);
+            try runAppTestGit(allocator, io, &.{ "git", "config", "remote.team/origin.fetch", "+refs/heads/*:refs/remotes/selected/*" }, work);
+            try runAppTestGit(allocator, io, &.{ "git", "fetch", "team/origin" }, work);
+        }
+        try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "local tip" }, work);
+        try work.writeFile(io, .{ .sub_path = "README.md", .data = "staged guard\n" });
+        try runAppTestGit(allocator, io, &.{ "git", "add", "README.md" }, work);
+        try work.writeFile(io, .{ .sub_path = "README.md", .data = "worktree guard\n" });
+        var local_environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+        defer local_environment.deinit();
+        var environment = try git_remote.buildRemoteEnvironment(allocator, null, .background);
+        defer environment.deinit();
+        var root = try repo_root_capability.RootCapability.openCanonical(fixture.repo_root);
+        defer root.deinit();
+        const loaded = try git_refs.loadBranchStatus(allocator, io, .{
+            .context = .{ .cwd = work, .environment = &local_environment },
+        });
+        defer loaded.deinit(allocator);
+        try std.testing.expect(loaded == .ok);
+        const status = loaded.ok.status;
+        try std.testing.expectEqualStrings("team/origin", status.upstream.?.remote);
+        try std.testing.expectEqualStrings("main", status.upstream.?.remote_branch);
+        try std.testing.expectEqualStrings(tracking_ref, status.upstream.?.full_ref);
+        const context: git_ops.RemoteActionContext = .{
+            .source = .unstaged,
+            .repo_root = fixture.repo_root,
+            .branch_status = .{ .repo_root = fixture.repo_root, .loading = false, .status = status },
+        };
+        const push_gate = git_ops.pushTarget(context);
+        try std.testing.expect(push_gate == .ready);
+        const push = push_gate.ready;
+        const pushed = git_remote.runOperation(allocator, io, .{
+            .root = &root,
+            .environment = &environment,
+            .control = .{},
+            .kind = .{ .push = .{ .mode = push.mode, .branch = push.branch, .remote = push.remote, .remote_branch = push.remote_branch, .oid = push.oid } },
+        });
+        try std.testing.expect(pushed.outcome == .ok);
+        const sent_oid = try appGitOutputAlloc(allocator, io, remote, &.{ "git", "rev-parse", "refs/heads/main" });
+        defer allocator.free(sent_oid);
+        try std.testing.expectEqualStrings(push.oid, std.mem.trimEnd(u8, sent_oid, "\n"));
+
+        // Advance only the remote; the saved local branch stays at the pushed tip.
+        const next_oid = try appGitOutputAlloc(allocator, io, work, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "remote tip" });
+        defer allocator.free(next_oid);
+        const refspec = try std.fmt.allocPrint(allocator, "{s}:refs/heads/main", .{std.mem.trimEnd(u8, next_oid, "\n")});
+        defer allocator.free(refspec);
+        try runAppTestGit(allocator, io, &.{ "git", "push", "../remote.git", refspec }, work);
+        const fetch_gate = git_ops.fetchTarget(context);
+        try std.testing.expect(fetch_gate == .ready);
+        const fetched = git_remote.runOperation(allocator, io, .{
+            .root = &root,
+            .environment = &environment,
+            .control = .{},
+            .kind = .{ .fetch = .{ .remote = fetch_gate.ready.remote } },
+        });
+        try std.testing.expect(fetched.outcome == .ok);
+        const fetched_oid = try appGitOutputAlloc(allocator, io, work, &.{ "git", "rev-parse", tracking_ref });
+        defer allocator.free(fetched_oid);
+        try std.testing.expectEqualStrings(next_oid, fetched_oid);
+        const staged = try appGitOutputAlloc(allocator, io, work, &.{ "git", "show", ":README.md" });
+        defer allocator.free(staged);
+        try std.testing.expectEqualStrings("staged guard\n", staged);
+        const unstaged = try work.readFileAlloc(io, "README.md", allocator, .limited(1024));
+        defer allocator.free(unstaged);
+        try std.testing.expectEqualStrings("worktree guard\n", unstaged);
+
+        // Pull preserves a clean, unrelated file, as required by its existing gate.
+        try runAppTestGit(allocator, io, &.{ "git", "restore", "--staged", "--worktree", "--", "README.md" }, work);
+        if (coexisting_remote) {
+            const stale_tracking = git_remote.runOperation(allocator, io, .{
+                .root = &root,
+                .environment = &environment,
+                .control = .{},
+                .kind = .{ .pull_refresh_ff_only = .{
+                    .branch = "main",
+                    .remote = "team/origin",
+                    .remote_branch = "main",
+                    .upstream_ref = "refs/remotes/team/origin/main",
+                    .oid = push.oid,
+                } },
+            });
+            try std.testing.expect(stale_tracking.outcome == .failed);
+            const unchanged_head = try appGitOutputAlloc(allocator, io, work, &.{ "git", "rev-parse", "HEAD" });
+            defer allocator.free(unchanged_head);
+            try std.testing.expectEqualStrings(push.oid, std.mem.trimEnd(u8, unchanged_head, "\n"));
+        }
+        var pull_loaded = try git_refs.loadBranchStatus(allocator, io, .{
+            .context = .{ .cwd = work, .environment = &local_environment },
+        });
+        defer pull_loaded.deinit(allocator);
+        try std.testing.expect(pull_loaded == .ok);
+        var app: RemoteHarness = .{ .allocator = allocator };
+        try installActiveRepoForTest(&app, allocator, fixture.repo_root);
+        defer app.repo_session.repo_state.deinit(allocator);
+        defer app.pages.changes.branch_status.deinit();
+        defer app.pages.changes.git_status.deinit();
+        defer app.cancelPullConfirmation(allocator);
+        try app.pages.changes.branch_status.replace(fixture.repo_root, &pull_loaded.ok);
+        var clean_status = try git_status.StatusBundle.parseOwned(allocator, "");
+        try app.pages.changes.git_status.replace(fixture.repo_root, &clean_status);
+        syncTestActivation(&app);
+        try app.requestPull(allocator);
+        try std.testing.expectEqualStrings(tracking_ref, app.remote_workflow.pull_confirmation.?.upstream_ref);
+        var ctx: chasen.Ctx(RemoteHarness.Msg) = .{ ._allocator = allocator };
+        defer chasen.testing.discardPendingTasks(RemoteHarness.Msg, &ctx);
+        try app.confirmPull(&ctx);
+        const tasks = ctx.takePendingTasks();
+        try std.testing.expectEqual(@as(usize, 1), tasks.len);
+        var result = try tasks[0].run(allocator, io);
+        defer result.deinitUndelivered(allocator);
+        try std.testing.expect(result.action_finished.pull.result.outcome == .ok);
+        const head = try appGitOutputAlloc(allocator, io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(head);
+        try std.testing.expectEqualStrings(next_oid, head);
+        const current_branch = try appGitOutputAlloc(allocator, io, work, &.{ "git", "symbolic-ref", "HEAD" });
+        defer allocator.free(current_branch);
+        try std.testing.expectEqualStrings("refs/heads/main\n", current_branch);
+        const final_index = try appGitOutputAlloc(allocator, io, work, &.{ "git", "show", ":README.md" });
+        defer allocator.free(final_index);
+        try std.testing.expectEqualStrings("hello\n", final_index);
+        const final_file = try work.readFileAlloc(io, "README.md", allocator, .limited(1024));
+        defer allocator.free(final_file);
+        try std.testing.expectEqualStrings("hello\n", final_file);
+        const other_oid = try appGitOutputAlloc(allocator, io, other, &.{ "git", "rev-parse", "refs/heads/origin/main" });
+        defer allocator.free(other_oid);
+        try std.testing.expectEqualStrings(fixture.oid, std.mem.trimEnd(u8, other_oid, "\n"));
+        const config_remote = try appGitOutputAlloc(allocator, io, work, &.{ "git", "config", "branch.main.remote" });
+        defer allocator.free(config_remote);
+        try std.testing.expectEqualStrings("team/origin\n", config_remote);
+        const config_merge = try appGitOutputAlloc(allocator, io, work, &.{ "git", "config", "branch.main.merge" });
+        defer allocator.free(config_merge);
+        try std.testing.expectEqualStrings("refs/heads/main\n", config_merge);
     }
 }

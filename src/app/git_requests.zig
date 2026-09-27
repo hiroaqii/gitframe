@@ -331,6 +331,7 @@ pub fn startPull(
         .branch = confirmation.branch,
         .remote = confirmation.remote,
         .remote_branch = confirmation.remote_branch,
+        .upstream_ref = confirmation.upstream_ref,
         .oid = confirmation.oid,
         .root = root.* orelse @panic("background pull requires an owned root"),
         .environment = environment.* orelse @panic("background pull requires an owned environment"),
@@ -347,6 +348,7 @@ pub fn startPull(
         .branch = &.{},
         .remote = &.{},
         .remote_branch = &.{},
+        .upstream_ref = &.{},
         .oid = &.{},
         .ahead = 0,
         .behind = 0,
@@ -528,6 +530,7 @@ fn consumePullConfirmation(allocator: std.mem.Allocator, confirmation: *app_stat
     if (confirmation.branch.len > 0) allocator.free(confirmation.branch);
     if (confirmation.remote.len > 0) allocator.free(confirmation.remote);
     if (confirmation.remote_branch.len > 0) allocator.free(confirmation.remote_branch);
+    if (confirmation.upstream_ref.len > 0) allocator.free(confirmation.upstream_ref);
     if (confirmation.oid.len > 0) allocator.free(confirmation.oid);
     confirmation.* = .{
         .repository_identity = .{
@@ -538,6 +541,7 @@ fn consumePullConfirmation(allocator: std.mem.Allocator, confirmation: *app_stat
         .branch = &.{},
         .remote = &.{},
         .remote_branch = &.{},
+        .upstream_ref = &.{},
         .oid = &.{},
         .ahead = 0,
         .behind = 0,

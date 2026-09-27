@@ -435,7 +435,7 @@ fn promoteTestActionCursorWithRequirement(
 const BranchStatusBundleSpec = struct {
     oid: ?[]const u8 = null,
     branch: ?[]const u8 = null,
-    upstream: ?[]const u8 = null,
+    upstream: ?git_branch_status.Upstream = null,
     ahead: ?u32 = null,
     behind: ?u32 = null,
 };
@@ -2520,7 +2520,7 @@ test "stale branch status result is ignored" {
 
     const bundle = try branchStatusBundleForTest(std.testing.allocator, .{
         .branch = "stale",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 1,
         .behind = 0,
     });
@@ -2543,7 +2543,7 @@ test "Changes page header identical branch recovery redraws fresh terminal" {
     var current = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc",
         .branch = "main",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 1,
         .behind = 0,
     });
@@ -2574,7 +2574,7 @@ test "Changes page header identical branch recovery redraws fresh terminal" {
     const same = try branchStatusBundleForTest(std.testing.allocator, .{
         .oid = "abc",
         .branch = "main",
-        .upstream = "origin/main",
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead = 1,
         .behind = 0,
     });

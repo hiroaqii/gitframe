@@ -882,6 +882,7 @@ pub fn PullTask(comptime Msg: type) type {
         branch: []u8,
         remote: []u8,
         remote_branch: []u8,
+        upstream_ref: []u8,
         oid: []u8,
         env_map: ?*const std.process.Environ.Map = null,
         root: ?root_capability.RootCapability = null,
@@ -898,6 +899,7 @@ pub fn PullTask(comptime Msg: type) type {
                 task.branch,
                 task.remote,
                 task.remote_branch,
+                task.upstream_ref,
                 task.oid,
                 allocator,
                 io,
@@ -914,6 +916,7 @@ pub fn PullTask(comptime Msg: type) type {
             if (task.branch.len > 0) allocator.free(task.branch);
             if (task.remote.len > 0) allocator.free(task.remote);
             if (task.remote_branch.len > 0) allocator.free(task.remote_branch);
+            allocator.free(task.upstream_ref);
             allocator.free(task.oid);
             if (task.root) |*root| root.deinit();
             if (task.environment) |*environment| environment.deinit();
@@ -1173,6 +1176,7 @@ pub fn runBackgroundPull(
     branch: []const u8,
     remote: []const u8,
     remote_branch: []const u8,
+    upstream_ref: []const u8,
     oid: []const u8,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1185,6 +1189,7 @@ pub fn runBackgroundPull(
             .branch = branch,
             .remote = remote,
             .remote_branch = remote_branch,
+            .upstream_ref = upstream_ref,
             .oid = oid,
         } },
     });

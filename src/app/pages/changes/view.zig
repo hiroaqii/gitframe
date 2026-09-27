@@ -409,7 +409,7 @@ test "Changes page header admits only exact-root branch snapshots" {
     var builder = git_branch_status.Builder.init(std.testing.allocator);
     errdefer builder.deinit();
     try builder.setBranchHead("feature/header");
-    try builder.setUpstream("origin/main");
+    try builder.setUpstream(.{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" });
     builder.setAheadBehind(2, 0);
     var bundle = builder.finish();
     var branch_status: git_branch_status.State = .{};

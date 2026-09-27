@@ -3052,7 +3052,7 @@ test "page bar shows remote actions alongside loaded Changes diff totals" {
             .repo_root = "/repo",
             .status = .{
                 .head = .{ .branch = "main" },
-                .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+                .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
                 .ahead_behind = .{ .ahead = 2, .behind = 0 },
             },
         },

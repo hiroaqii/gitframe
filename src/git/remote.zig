@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const git_push = @import("push.zig");
 const git_command = @import("command.zig");
 const git_ref = @import("ref.zig");
+const git_branch_status = @import("branch_status.zig");
 const process_runner = @import("../process/runner.zig");
 const root_capability = @import("../repo/root_capability.zig");
 
@@ -164,6 +165,7 @@ pub const PreparedForegroundPush = struct {
 };
 
 pub const PullRequest = struct {
+    upstream_ref: []const u8,
     branch: []const u8,
     remote: []const u8,
     remote_branch: []const u8,
@@ -1304,10 +1306,7 @@ fn runSecureGitPull(
         .failed => |failure| return remoteFailureResult(failure, warnings),
     }
 
-    const remote_ref = std.fmt.allocPrint(allocator, "refs/remotes/{s}/{s}", .{ request.remote, request.remote_branch }) catch
-        return remoteFailureResult(.failed, warnings);
-    defer allocator.free(remote_ref);
-    const spec = std.fmt.allocPrint(allocator, "HEAD...{s}", .{remote_ref}) catch
+    const spec = std.fmt.allocPrint(allocator, "HEAD...{s}", .{request.upstream_ref}) catch
         return remoteFailureResult(.failed, warnings);
     defer allocator.free(spec);
     const ahead_behind_argv = [_][]const u8{ "git", "rev-list", "--left-right", "--count", spec };
@@ -1324,7 +1323,7 @@ fn runSecureGitPull(
         return remoteSuccessResult(.already_up_to_date, warnings);
     if (ahead_behind.ahead != 0) return remoteFailureResult(.failed, warnings);
 
-    const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", remote_ref };
+    const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", request.upstream_ref };
     var merge = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &merge_argv);
     defer merge.deinit();
     if (commandFailure(&merge, false)) |failure| return remoteFailureResult(failure, warnings);
@@ -1343,17 +1342,19 @@ fn securePullPreconditionsMatch(
         .failed => |failure| return .{ .failed = failure },
     }
 
-    const upstream_argv = [_][]const u8{ "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}" };
+    const local_ref = std.fmt.allocPrint(allocator, "refs/heads/{s}", .{request.branch}) catch return .{ .failed = .failed };
+    defer allocator.free(local_ref);
+    const upstream_argv = [_][]const u8{ "git", "for-each-ref", git_branch_status.upstream_format, "--", local_ref };
     var upstream = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &upstream_argv);
     defer upstream.deinit();
     if (commandFailure(&upstream, false)) |failure| return .{ .failed = failure };
     const actual = switch (upstream) {
-        .completed => |*result| trimLineEnd(result.stdout.bytes()),
+        .completed => |*result| (git_branch_status.parseUpstreamRecord(result.stdout.bytes(), local_ref) catch return .{ .failed = .failed }) orelse return .mismatch,
         else => unreachable,
     };
-    const expected = std.fmt.allocPrint(allocator, "{s}/{s}", .{ request.remote, request.remote_branch }) catch return .{ .failed = .failed };
-    defer allocator.free(expected);
-    if (!std.mem.eql(u8, actual, expected)) return .mismatch;
+    if (!std.mem.eql(u8, actual.remote, request.remote) or
+        !std.mem.eql(u8, actual.remote_branch, request.remote_branch) or
+        !std.mem.eql(u8, actual.full_ref, request.upstream_ref)) return .mismatch;
 
     const status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
     var status = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &status_argv);

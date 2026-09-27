@@ -982,7 +982,7 @@ fn reviewAppBasisFailureFinished(
 const BranchStatusBundleSpec = struct {
     oid: ?[]const u8 = null,
     branch: ?[]const u8 = null,
-    upstream: ?[]const u8 = null,
+    upstream: ?git_branch_status.Upstream = null,
     ahead: ?u32 = null,
     behind: ?u32 = null,
 };

@@ -597,7 +597,7 @@ test "ChangesPageState deinit releases loaded snapshots and file filter" {
     errdefer branch_builder.deinit();
     try branch_builder.setOid("abc123");
     try branch_builder.setBranchHead("main");
-    try branch_builder.setUpstream("origin/main");
+    try branch_builder.setUpstream(.{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" });
     var branch_bundle = branch_builder.finish();
     errdefer branch_bundle.deinit();
     try state.branch_status.replace("/repo", &branch_bundle);

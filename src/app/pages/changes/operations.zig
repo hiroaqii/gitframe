@@ -97,6 +97,7 @@ pub const OwnedPullProposal = struct {
     branch: []u8,
     remote: []u8,
     remote_branch: []u8,
+    upstream_ref: []u8,
     oid: []u8,
     ahead: u32,
     behind: u32,
@@ -106,6 +107,7 @@ pub const OwnedPullProposal = struct {
         allocator.free(self.branch);
         allocator.free(self.remote);
         allocator.free(self.remote_branch);
+        allocator.free(self.upstream_ref);
         allocator.free(self.oid);
         self.* = undefined;
     }
@@ -871,11 +873,14 @@ fn clonePullProposal(allocator: std.mem.Allocator, target: git_ops.PullTarget) !
     errdefer allocator.free(remote);
     const remote_branch = try allocator.dupe(u8, target.remote_branch);
     errdefer allocator.free(remote_branch);
+    const upstream_ref = try allocator.dupe(u8, target.upstream_ref);
+    errdefer allocator.free(upstream_ref);
     return .{
         .repo_root = repo_root,
         .branch = branch,
         .remote = remote,
         .remote_branch = remote_branch,
+        .upstream_ref = upstream_ref,
         .oid = try allocator.dupe(u8, target.oid),
         .ahead = target.ahead,
         .behind = target.behind,
@@ -1351,7 +1356,7 @@ test "mutation fence makes retained Changes operation targets inert" {
     errdefer branch_builder.deinit();
     try branch_builder.setOid("abc123");
     try branch_builder.setBranchHead("main");
-    try branch_builder.setUpstream("origin/main");
+    try branch_builder.setUpstream(.{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" });
     branch_builder.setAheadBehind(1, 0);
     var branch = branch_builder.finish();
     defer branch.deinit();
@@ -1434,7 +1439,7 @@ test "pull remains gated by pending and stale file status" {
     errdefer builder.deinit();
     try builder.setOid("abc123");
     try builder.setBranchHead("main");
-    try builder.setUpstream("origin/main");
+    try builder.setUpstream(.{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" });
     builder.setAheadBehind(0, 1);
     var branch = builder.finish();
     defer branch.deinit();

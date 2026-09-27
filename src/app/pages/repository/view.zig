@@ -2430,7 +2430,7 @@ test "Repository tree omits duplicate branch row and starts one row earlier" {
     defer state.deinit(allocator);
     installRepositoryBranchSnapshotForTest(&state, .{
         .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{ .ahead = 0, .behind = 2 },
     }, .fresh);
 
@@ -2463,7 +2463,7 @@ test "Repository page header requires matching epoch and physical root" {
     defer state.deinit(allocator);
     installRepositoryBranchSnapshotForTest(&state, .{
         .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{ .ahead = 1, .behind = 0 },
     }, .validating);
     const context: ViewContext = .{ .page_state = &state, .palette = .default() };
@@ -2559,7 +2559,7 @@ test "Repository file search keeps tree chrome and hides with the tree" {
     defer state.deinit(allocator);
     installRepositoryBranchSnapshotForTest(&state, .{
         .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{},
     }, .fresh);
 
@@ -2600,7 +2600,7 @@ test "Repository compact tree keeps Files on row one" {
     defer state.deinit(allocator);
     installRepositoryBranchSnapshotForTest(&state, .{
         .head = .{ .branch = "main" },
-        .upstream = .{ .name = "origin/main", .remote = "origin", .remote_branch = "main" },
+        .upstream = .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" },
         .ahead_behind = .{},
     }, .fresh);
 
