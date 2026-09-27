@@ -465,7 +465,9 @@ fn validObjectId(oid: []const u8) bool {
     return true;
 }
 
-const git_diff_unstaged = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" };
+// Changes displays the same byte-preserving diff used by hunk operations.
+const git_diff_args = [_][]const u8{ "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/" };
+const git_diff_unstaged = [_][]const u8{"git"} ++ git_diff_args;
 const foreground_status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
 const background_status_argv = [_][]const u8{ "git", "--no-optional-locks", "status", "--porcelain=v1", "-z", "-uall" };
 const repository_manifest_argv = [_][]const u8{
@@ -596,18 +598,18 @@ fn loadGitDiff(allocator: std.mem.Allocator, io: std.Io, context: git_command.Di
 }
 
 fn loadGitDiffRange(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, range: []const u8) git_command.Error!LoadResult {
-    const argv = [_][]const u8{ "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range };
+    const argv = git_diff_unstaged ++ [_][]const u8{range};
     return loadGitDiff(allocator, io, context, &argv);
 }
 
 fn loadGitFileDiff(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, request: FileDiffRequest) git_command.Error!LoadResult {
     return switch (request.base) {
         .unstaged => {
-            const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
+            const argv = git_command.literal_pathspec_prefix ++ git_diff_args ++ [_][]const u8{ "--", request.path };
             return loadGitDiff(allocator, io, context, &argv);
         },
         .cached => {
-            const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "diff", "--cached", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", request.path };
+            const argv = git_command.literal_pathspec_prefix ++ git_diff_args ++ [_][]const u8{ "--cached", "--", request.path };
             return loadGitDiff(allocator, io, context, &argv);
         },
     };

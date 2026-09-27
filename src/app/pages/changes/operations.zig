@@ -1031,6 +1031,7 @@ test "Changes raw hunk bytes reach and leave the Git index without collateral ch
         old: []const u8,
         new: []const u8,
         worktree: ?[]const u8 = null,
+        textconv: bool = false,
     };
     const cases = [_]Case{
         .{ .old = "old\n", .new = "new\n" },
@@ -1039,13 +1040,19 @@ test "Changes raw hunk bytes reach and leave the Git index without collateral ch
         .{ .old = "old", .new = "new" },
         .{ .old = "old\r", .new = "new\r" },
         .{ .old = "old\n", .new = "new\n", .worktree = "new\r\n" },
+        // The first converted patch applies successfully with the wrong bytes;
+        // the second is rejected because its converted old side differs too.
+        .{ .old = "BEFORE\n", .new = "after\n", .textconv = true },
+        .{ .old = "before\n", .new = "after\n", .textconv = true },
     };
     for (cases) |case| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "init", "--initial-branch=main" }));
         allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "config", "core.autocrlf", "false" }));
-        try tmp.dir.writeFile(io, .{ .sub_path = ".gitattributes", .data = if (case.worktree != null) "a text eol=crlf\n" else "a -text\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = ".gitattributes", .data = if (case.textconv) "a -text diff=upper\n" else if (case.worktree != null) "a text eol=crlf\n" else "a -text\n" });
+        if (case.textconv)
+            allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "config", "diff.upper.textconv", "tr a-z A-Z <" }));
         try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = case.old });
         try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "base\n" });
         allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "add", "--all" }));
@@ -1054,6 +1061,11 @@ test "Changes raw hunk bytes reach and leave the Git index without collateral ch
         allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "add", "--", "sentinel" }));
         try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "worktree sentinel\n" });
         try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = case.worktree orelse case.new });
+        if (case.textconv) {
+            const converted = try pathTestCommand(tmp.dir, &.{ "git", "diff", "--textconv", "--", "a" });
+            defer allocator.free(converted);
+            try std.testing.expect(std.mem.indexOf(u8, converted, "+AFTER\n") != null);
+        }
         var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
         defer environment.deinit();
         const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
@@ -1123,6 +1135,25 @@ test "Changes raw hunk bytes reach and leave the Git index without collateral ch
             const sentinel_worktree = try tmp.dir.readFileAlloc(io, "sentinel", allocator, .limited(1024));
             defer allocator.free(sentinel_worktree);
             try std.testing.expectEqualStrings("worktree sentinel\n", sentinel_worktree);
+            if (case.textconv and !reverse) {
+                const cached = try git_read.loadDiff(allocator, io, .{ .context = context, .kind = .{ .file = .{ .base = .cached, .path = "a" } } });
+                defer cached.deinit(allocator);
+                try std.testing.expect(cached == .ok);
+                try std.testing.expect(std.mem.indexOf(u8, cached.ok, "+after\n") != null);
+            }
+        }
+        if (case.textconv) {
+            // Unstage restored the original index, so both readers have a real
+            // target diff again. The ordinary reader is proved by the writes above.
+            for ([_]git_read.GitDiffKind{
+                .{ .file = .{ .base = .unstaged, .path = "a" } },
+                .{ .range = "HEAD" },
+            }) |kind| {
+                const read = try git_read.loadDiff(allocator, io, .{ .context = context, .kind = kind });
+                defer read.deinit(allocator);
+                try std.testing.expect(read == .ok);
+                try std.testing.expect(std.mem.indexOf(u8, read.ok, "+after\n") != null);
+            }
         }
     }
 }

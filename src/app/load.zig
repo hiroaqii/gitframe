@@ -3737,7 +3737,7 @@ test "runCompareLoad clean committed projection preserves text binary add delete
     });
     defer allocator.free(legacy_range);
     const legacy_argv = [_][]const u8{
-        "git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", legacy_range,
+        "git", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", legacy_range,
     };
     const legacy_result = try git_command.runCaptured(allocator, io, .{ .cwd = tmp.dir, .environment = &environment }, .{
         .argv = &legacy_argv,
