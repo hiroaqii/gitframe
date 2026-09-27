@@ -242,7 +242,7 @@ test "buildFragment reconstructs side-specific hunk text and line map" {
         .new_count = 2,
         .section = "",
         .lines = &.{
-            .{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 },
+            .{ .kind = .context, .text = "same\r", .old_line = 1, .new_line = 1 },
             .{ .kind = .removed, .text = "old", .old_line = 2 },
             .{ .kind = .added, .text = "new", .new_line = 2 },
         },
@@ -250,15 +250,18 @@ test "buildFragment reconstructs side-specific hunk text and line map" {
 
     const old_fragment = try buildFragment(std.testing.allocator, hunk, .old);
     defer old_fragment.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("same\nold\n", old_fragment.text);
+    try std.testing.expectEqualStrings("same\r\nold\n", old_fragment.text);
     try std.testing.expectEqual(@as(usize, 0), old_fragment.lines[0].line_index);
     try std.testing.expectEqual(@as(usize, 1), old_fragment.lines[1].line_index);
 
     const new_fragment = try buildFragment(std.testing.allocator, hunk, .new);
     defer new_fragment.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("same\nnew\n", new_fragment.text);
+    try std.testing.expectEqualStrings("same\r\nnew\n", new_fragment.text);
     try std.testing.expectEqual(@as(usize, 0), new_fragment.lines[0].line_index);
     try std.testing.expectEqual(@as(usize, 2), new_fragment.lines[1].line_index);
+    try std.testing.expectEqual(@as(usize, 5), new_fragment.lines[0].end);
+    try std.testing.expectEqual(@as(usize, 6), new_fragment.lines[1].start);
+    try std.testing.expectEqual(@as(usize, 9), new_fragment.lines[1].end);
 }
 
 test "appendRangeSpans maps fragment byte ranges to line-local spans" {

@@ -1077,24 +1077,8 @@ test "hunk projection orders cached new-side and unstaged old-side coordinates" 
     var projection_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer projection_arena.deinit();
 
-    const cached = try parseOneFile(&cached_arena,
-        \\diff --git a/src/app.zig b/src/app.zig
-        \\--- a/src/app.zig
-        \\+++ b/src/app.zig
-        \\@@ -30,1 +30,1 @@
-        \\-old staged
-        \\+new staged
-        \\
-    );
-    const unstaged = try parseOneFile(&unstaged_arena,
-        \\diff --git a/src/app.zig b/src/app.zig
-        \\--- a/src/app.zig
-        \\+++ b/src/app.zig
-        \\@@ -40,1 +40,1 @@
-        \\-old unstaged
-        \\+new unstaged
-        \\
-    );
+    const cached = try parseOneFile(&cached_arena, "--- a/src/app.zig\n+++ b/src/app.zig\n@@ -30,1 +30,1 @@\n-old staged\r\n+new staged\r\n");
+    const unstaged = try parseOneFile(&unstaged_arena, "--- a/src/app.zig\n+++ b/src/app.zig\n@@ -40,1 +40,1 @@\n-old unstaged\r\n+new unstaged\n");
 
     const projection = try build(projection_arena.allocator(), cached, unstaged);
     try std.testing.expectEqual(@as(usize, 2), projection.presentation.file.hunks.len);
@@ -1104,6 +1088,9 @@ test "hunk projection orders cached new-side and unstaged old-side coordinates" 
     try std.testing.expectEqualDeep(PresentationSyntaxOrigin{ .unstaged = 0 }, projection.presentation.presentation_syntax_origins[1]);
     try std.testing.expectEqualDeep(HunkActionOrigin{ .cached = 0 }, projection.authority.hunk_action_origins[0]);
     try std.testing.expectEqualDeep(HunkActionOrigin{ .unstaged = 0 }, projection.authority.hunk_action_origins[1]);
+    try std.testing.expectEqualStrings("new staged\r", projection.presentation.file.hunks[0].lines[1].text);
+    try std.testing.expectEqualStrings("old unstaged\r", projection.presentation.file.hunks[1].lines[0].text);
+    try std.testing.expectEqualStrings("new unstaged", projection.presentation.file.hunks[1].lines[1].text);
 }
 
 test "hunk projection keeps presentation and authority in separate allocation domains" {

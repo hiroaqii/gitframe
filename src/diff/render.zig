@@ -4280,6 +4280,23 @@ test "header selection highlights path without highlighting stats" {
     try std.testing.expect(!stats_cell.style.bg.eql(selection_bg));
 }
 
+test "raw hunk bytes render without carriage return cells" {
+    var ts: chasen.testing.TestSurface = undefined;
+    try ts.init(40, 8);
+    defer ts.deinit();
+    const document = try diff_parser.parse(std.testing.allocator, "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\r\n+new\r\n");
+    defer document.deinit(std.testing.allocator);
+    try renderFile(&ts.surface, document.files[0], .{ .requested_mode = .unified });
+    try ts.expectCellText(14, 4, "o");
+    try ts.expectCellText(16, 4, "d");
+    try ts.expectCellText(17, 4, " ");
+    try ts.expectCellText(14, 5, "n");
+    for (0..8) |y| for (0..40) |x| {
+        const cell = ts.surface.readCell(@intCast(x), @intCast(y)).?;
+        try std.testing.expect(std.mem.indexOfScalar(u8, cell.char.grapheme, '\r') == null);
+    };
+}
+
 test "unified horizontal scroll keeps line numbers and prefix fixed" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(32, 5);

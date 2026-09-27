@@ -58,8 +58,8 @@ pub const Hunk = struct {
 
 pub const DiffLine = struct {
     kind: Kind,
-    /// Hunk text without the unified diff prefix for content lines. Metadata
-    /// lines keep their original text because their syntax varies.
+    /// Content bytes without the unified prefix or separating LF; CR is kept,
+    /// including for external patches. Metadata keeps its structural text.
     text: []const u8,
     old_line: ?u32 = null,
     new_line: ?u32 = null,
@@ -128,7 +128,15 @@ const Parser = struct {
         while (start < text.len) {
             const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
             const raw_line = text[start..end];
-            const line = stripTrailingCarriageReturn(raw_line);
+            // CR belongs to the content on hunk body lines, including external
+            // patches. Only structural lines accept CRLF as syntax. Completion
+            // distinguishes a next-file `---` header from marker-looking body.
+            const is_content = if (self.current_hunk) |hunk|
+                !hunk.isComplete() and raw_line.len > 0 and
+                    (raw_line[0] == ' ' or raw_line[0] == '+' or raw_line[0] == '-')
+            else
+                false;
+            const line = if (is_content) raw_line else stripTrailingCarriageReturn(raw_line);
             try self.parseLine(line);
             start = if (end < text.len) end + 1 else text.len;
         }

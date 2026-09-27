@@ -733,9 +733,9 @@ test "copyText preserves side-specific lines and whitespace" {
             .new_count = 3,
             .section = "",
             .lines = &.{
-                .{ .kind = .context, .text = " same ", .old_line = 1, .new_line = 1 },
+                .{ .kind = .context, .text = " same \r", .old_line = 1, .new_line = 1 },
                 .{ .kind = .removed, .text = "", .old_line = 2 },
-                .{ .kind = .added, .text = "  new", .new_line = 2 },
+                .{ .kind = .added, .text = "  new\r", .new_line = 2 },
             },
         }},
     };
@@ -749,7 +749,7 @@ test "copyText preserves side-specific lines and whitespace" {
         .moved = true,
     });
     defer std.testing.allocator.free(old_text);
-    try std.testing.expectEqualStrings(" same \n\n", old_text);
+    try std.testing.expectEqualStrings(" same \r\n\n", old_text);
 
     const new_text = try copyText(std.testing.allocator, file, .{
         .identity = identity,
@@ -759,7 +759,7 @@ test "copyText preserves side-specific lines and whitespace" {
         .moved = true,
     });
     defer std.testing.allocator.free(new_text);
-    try std.testing.expectEqualStrings(" same \n  new\n", new_text);
+    try std.testing.expectEqualStrings(" same \r\n  new\r\n", new_text);
 }
 
 test "unified diff selection copies exact visible marker-prefixed logical rows" {
@@ -776,7 +776,7 @@ test "unified diff selection copies exact visible marker-prefixed logical rows" 
                 .section = "",
                 .lines = &.{
                     .{ .kind = .context, .text = "same", .old_line = 1, .new_line = 1 },
-                    .{ .kind = .removed, .text = "old", .old_line = 2 },
+                    .{ .kind = .removed, .text = "old\r", .old_line = 2 },
                     .{ .kind = .added, .text = "new", .new_line = 2 },
                     .{ .kind = .metadata, .text = "\\ No newline at end of file" },
                 },
@@ -810,7 +810,7 @@ test "unified diff selection copies exact visible marker-prefixed logical rows" 
     };
     const text = try copyTextFolded(std.testing.allocator, file, &.{ false, true, false }, selection);
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings(" same\n-old\n+new\n+last\n", text);
+    try std.testing.expectEqualStrings(" same\n-old\r\n+new\n+last\n", text);
 
     var owned = try buildUnifiedDiff(
         std.testing.allocator,

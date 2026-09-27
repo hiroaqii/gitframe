@@ -158,6 +158,26 @@ test "formatSingleHunkPatch preserves hunk metadata lines" {
     try std.testing.expect(std.mem.indexOf(u8, patch, "-old\n\\ No newline at end of file\n+new\n") != null);
 }
 
+test "raw hunk bytes survive CRLF structure and marker-looking body" {
+    // External transport CRLF is deliberately not guessed: body CR is content.
+    const text = "diff --git a/a b/a\r\n--- a/a\r\n+++ b/a\r\n@@ -1,2 +1,2 @@\r\n" ++
+        " keep\r\n--- old\r\r\n\\ No newline at end of file\r\n" ++
+        "+++ new\r\r\n\\ No newline at end of file\r\n" ++
+        "--- a/b\r\n+++ b/b\r\n@@ -1 +1 @@\r\n-old\n+new\n";
+    const document = try diff_parser.parse(std.testing.allocator, text);
+    defer document.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), document.files.len);
+    try std.testing.expectEqualStrings("b", document.files[1].new_path.?);
+    const patch = try formatSingleHunkPatch(std.testing.allocator, document.files[0], 0);
+    defer std.testing.allocator.free(patch);
+    try std.testing.expectEqualStrings(
+        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n" ++
+            " keep\r\n--- old\r\r\n\\ No newline at end of file\n" ++
+            "+++ new\r\r\n\\ No newline at end of file\n",
+        patch,
+    );
+}
+
 test "formatSingleHunkPatch rejects incomplete hunks accepted by parser" {
     const text =
         \\diff --git a/src/app.zig b/src/app.zig

@@ -1017,6 +1017,116 @@ test "Changes raw diff paths reach the Git index without touching namesakes" {
     try std.testing.expectEqual(@as(usize, 1), rename_rows);
 }
 
+test "Changes raw hunk bytes reach and leave the Git index without collateral changes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const git_command = @import("../../../git/command.zig");
+    const git_read = @import("../../../git/read.zig");
+    const backend = @import("../../../git/operations.zig");
+    const parser = @import("../../../diff/parser.zig");
+    const file_tree = @import("../../../file_tree.zig");
+    const git_status = @import("../../../git/status.zig");
+    const Case = struct {
+        old: []const u8,
+        new: []const u8,
+        worktree: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        .{ .old = "old\n", .new = "new\n" },
+        .{ .old = "old\r\n", .new = "new\r\n" },
+        .{ .old = "same\r\nold\n", .new = "same\r\nnew\r\n" },
+        .{ .old = "old", .new = "new" },
+        .{ .old = "old\r", .new = "new\r" },
+        .{ .old = "old\n", .new = "new\n", .worktree = "new\r\n" },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "init", "--initial-branch=main" }));
+        allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "config", "core.autocrlf", "false" }));
+        try tmp.dir.writeFile(io, .{ .sub_path = ".gitattributes", .data = if (case.worktree != null) "a text eol=crlf\n" else "a -text\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = case.old });
+        try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "base\n" });
+        allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "add", "--all" }));
+        allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }));
+        try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "staged sentinel\n" });
+        allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "add", "--", "sentinel" }));
+        try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "worktree sentinel\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = case.worktree orelse case.new });
+        var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+        defer environment.deinit();
+        const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+        const raw_diff = try git_read.loadDiff(allocator, io, .{ .context = context, .kind = .unstaged });
+        defer raw_diff.deinit(allocator);
+        try std.testing.expect(raw_diff == .ok);
+        const raw_status = try git_read.loadStatus(allocator, io, .{ .context = context });
+        defer raw_status.deinit(allocator);
+        try std.testing.expect(raw_status == .ok);
+        var status = try git_status.StatusBundle.parseOwned(allocator, raw_status.ok);
+        defer status.deinit();
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const document = try parser.parse(arena.allocator(), raw_diff.ok);
+        const tree = try file_tree.buildWithStatus(arena.allocator(), document, status.document);
+        var selected_node: ?usize = null;
+        for (tree.nodes, 0..) |node, index| {
+            if (node.kind == .file and std.mem.eql(u8, node.path_key, "a")) selected_node = index;
+        }
+        const target_file = tree.nodes[selected_node.?].target.diff_file;
+        try std.testing.expectEqual(@as(usize, 1), document.files[target_file].hunks.len);
+        var loaded = test_support.loadedDiffOne();
+        loaded.document = document;
+        loaded.file_text_eligibility = try @import("../../../diff/text_eligibility.zig").classifyDocument(arena.allocator(), document);
+        loaded.tree = tree;
+        var page: changes_page.ChangesPageState = .{
+            .load = test_support.loadState(loaded),
+            .viewer = .{
+                .selected_node = selected_node.?,
+                .selected_target = .{ .diff_file = target_file },
+                .diff_cursor = .{ .hunk_header = 0 },
+            },
+        };
+        defer page.git_status.deinit();
+        defer page.staged_hunks.deinit(allocator);
+        try page.git_status.replace("/repo", &status);
+        acceptTestSource(&page);
+        const view = testView(&page, .unstaged);
+        const stage = view.selectedHunkStageTarget(allocator);
+        try std.testing.expect(stage == .ready);
+        defer allocator.free(stage.ready.patch);
+        try std.testing.expectEqualStrings("a", stage.ready.path);
+
+        for ([_]bool{ false, true }) |reverse| {
+            const patch = if (reverse) blk: {
+                try page.staged_hunks.addExact(allocator, "/repo", "a", stage.ready.session_mark_mutation.add);
+                const unstage = view.selectedHunkUnstageTarget(allocator);
+                try std.testing.expect(unstage == .ready);
+                break :blk unstage.ready.patch;
+            } else stage.ready.patch;
+            defer if (reverse) allocator.free(patch);
+            const result = try backend.runOperation(allocator, io, .{ .context = context, .kind = if (reverse)
+                .{ .unstage_patch = .{ .patch = patch } }
+            else
+                .{ .stage_patch = .{ .patch = patch } } });
+            defer result.deinit(allocator);
+            try std.testing.expect(result == .ok);
+            const index = try pathTestCommand(tmp.dir, &.{ "git", "show", ":a" });
+            defer allocator.free(index);
+            try std.testing.expectEqualStrings(if (reverse) case.old else case.new, index);
+            const worktree = try tmp.dir.readFileAlloc(io, "a", allocator, .limited(1024));
+            defer allocator.free(worktree);
+            try std.testing.expectEqualStrings(case.worktree orelse case.new, worktree);
+            const sentinel_index = try pathTestCommand(tmp.dir, &.{ "git", "show", ":sentinel" });
+            defer allocator.free(sentinel_index);
+            try std.testing.expectEqualStrings("staged sentinel\n", sentinel_index);
+            const sentinel_worktree = try tmp.dir.readFileAlloc(io, "sentinel", allocator, .limited(1024));
+            defer allocator.free(sentinel_worktree);
+            try std.testing.expectEqualStrings("worktree sentinel\n", sentinel_worktree);
+        }
+    }
+}
+
 fn pathTestCommand(cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
     const allocator = std.testing.allocator;
     const result = try std.process.run(allocator, std.testing.io, .{
