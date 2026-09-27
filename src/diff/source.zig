@@ -20,6 +20,7 @@ pub const AutoReloadOverride = enum {
 pub const CliConfig = struct {
     source: SourceMode = .unstaged,
     auto_reload: AutoReloadOverride = .inherit,
+    transitions: bool = true,
     stats_summary: bool = false,
     version: bool = false,
 
@@ -137,6 +138,8 @@ pub fn parseArgs(args: []const []const u8) ParseArgsError!CliConfig {
         } else if (std.mem.eql(u8, arg, "--no-watch")) {
             if (config.auto_reload == .enabled) return error.ConflictingWatchOverride;
             config.auto_reload = .disabled;
+        } else if (std.mem.eql(u8, arg, "--no-transition")) {
+            config.transitions = false;
         } else if (std.mem.eql(u8, arg, "--stats-summary")) {
             config.stats_summary = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
@@ -241,6 +244,7 @@ test "parseArgs defaults to unstaged diff" {
 
     try std.testing.expect(config.source == .unstaged);
     try std.testing.expect(!config.version);
+    try std.testing.expect(config.transitions);
 }
 
 test "parseArgs accepts version with remaining startup options" {
@@ -248,8 +252,9 @@ test "parseArgs accepts version with remaining startup options" {
     const patch = try parseArgs(&.{ "gitframe", "--version", "--watch", "--stats-summary", "missing.patch" });
     try std.testing.expect(patch.version and patch.stats_summary);
     try std.testing.expect(patch.auto_reload == .enabled and patch.source == .patch_file);
-    const range = try parseArgs(&.{ "gitframe", "--range=HEAD..HEAD", "--no-watch", "--version" });
+    const range = try parseArgs(&.{ "gitframe", "--range=HEAD..HEAD", "--no-watch", "--no-transition", "--version" });
     try std.testing.expect(range.version and range.auto_reload == .disabled and range.source == .range);
+    try std.testing.expect(!range.transitions);
 }
 
 test "parseArgs validates all arguments before version output" {

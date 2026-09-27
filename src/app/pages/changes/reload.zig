@@ -1167,6 +1167,7 @@ pub const Controller = struct {
     pub fn failActiveMember(self: Controller, member: authority.Member) void {
         const identity = self.page.activation.currentIdentity() orelse return;
         _ = self.page.activation.finishMember(identity, member, .failed);
+        if (member == .source) self.page.transition_publication = .failed;
     }
 
     pub fn view(self: Controller) View {
@@ -1298,7 +1299,7 @@ pub const Controller = struct {
         return true;
     }
 
-    fn abortCanonicalPublication(self: Controller, allocator: std.mem.Allocator) void {
+    fn abortCanonicalPublication(self: Controller, allocator: std.mem.Allocator, publish_failure: bool) void {
         if (self.page.canonical_publication == null) return;
         self.page.canonical_publication.?.phase = .aborting;
         const gate_identity = self.page.canonical_publication.?.identity;
@@ -1353,6 +1354,7 @@ pub const Controller = struct {
 
         self.navigation.clearActionCursor(allocator);
         _ = self.page.activation.finishMember(gate_identity, .source, .failed);
+        if (publish_failure) self.page.transition_publication = .failed;
         _ = self.page.activation.finishMember(gate_identity, .status, .failed);
         var gate = self.page.canonical_publication.?;
         self.page.canonical_publication = null;
@@ -1375,7 +1377,7 @@ pub const Controller = struct {
         if (self.page.deferred_source_apply) |deferred| {
             std.debug.assert(deferred.mode == .canonical_publication);
         }
-        self.abortCanonicalPublication(allocator);
+        self.abortCanonicalPublication(allocator, false);
         std.debug.assert(self.page.canonical_publication == null);
         std.debug.assert(self.page.deferred_source_apply == null);
     }
@@ -1445,7 +1447,7 @@ pub const Controller = struct {
     }
 
     pub fn clearPendingReload(self: Controller, allocator: std.mem.Allocator) void {
-        self.abortCanonicalPublication(allocator);
+        self.abortCanonicalPublication(allocator, false);
         if (self.page.pending_reload) |*pending| pending.deinit(allocator);
         self.page.pending_reload = null;
     }
@@ -1497,7 +1499,7 @@ pub const Controller = struct {
     pub fn clearDeferredSourceApply(self: Controller, allocator: std.mem.Allocator) void {
         const current = self.page.deferred_source_apply orelse return;
         if (current.mode == .canonical_publication) {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, false);
             return;
         }
         var deferred = current;
@@ -1560,7 +1562,7 @@ pub const Controller = struct {
     ) !ChangesUpdate {
         try self.requireRepositoryReadStart();
         const identity = self.page.activation.currentIdentity() orelse return error.InactiveChangesPage;
-        self.abortCanonicalPublication(allocator);
+        self.abortCanonicalPublication(allocator, false);
         if (options.kind != .watch) self.clearDeferredSourceApply(allocator);
         if (options.kind == .repo_switch) self.page.auto_reload.clearAcceptedSource();
 
@@ -1576,7 +1578,7 @@ pub const Controller = struct {
         errdefer self.clearPendingReloadIfGeneration(allocator, generation);
         try self.beginCanonicalPublication(allocator, repo_root, options, identity, generation);
         errdefer if (self.page.canonical_publication) |gate| {
-            if (gate.source_generation == generation) self.abortCanonicalPublication(allocator);
+            if (gate.source_generation == generation) self.abortCanonicalPublication(allocator, true);
         };
 
         const expected_fingerprint = if (options.kind == .watch and !options.clear_visible_state)
@@ -1757,7 +1759,7 @@ pub const Controller = struct {
     pub fn rejectSourceSpawn(self: Controller, allocator: std.mem.Allocator, generation: u64) bool {
         if (self.page.canonical_publication) |gate| {
             if (gate.source_generation == generation) {
-                self.abortCanonicalPublication(allocator);
+                self.abortCanonicalPublication(allocator, true);
                 if (!self.page.load.hasPending() and self.page.load.state == .loading) {
                     self.page.load.state = .idle;
                 }
@@ -1873,7 +1875,7 @@ pub const Controller = struct {
         std.debug.assert(deferred.mode == .canonical_publication);
         std.debug.assert(deferred.finished.generation == gate.source_generation);
         if (!self.sourceTerminalOwnsPending(&deferred.finished)) {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return false;
         }
         const fingerprint = canonicalSourceFingerprint(&deferred);
@@ -1895,6 +1897,7 @@ pub const Controller = struct {
             .source,
             .fresh,
         );
+        self.page.transition_publication = .accepted;
         if (source_completion) |completion| {
             _ = self.page.action_cursor.finishCompletion(completion, true);
         }
@@ -1922,7 +1925,7 @@ pub const Controller = struct {
             deferred.finished.generation != gate.source_generation or
             !self.sourceTerminalOwnsPending(&deferred.finished))
         {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return;
         }
         const source_changes = self.canonicalSourceChanges(gate);
@@ -1938,7 +1941,7 @@ pub const Controller = struct {
             gate,
             &deferred,
         ) catch |err| {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return err;
         };
         defer prepared_source.deinit(allocator);
@@ -1947,7 +1950,7 @@ pub const Controller = struct {
                 allocator,
                 self.canonicalStatusDocument(gate),
             ) catch |err| {
-                self.abortCanonicalPublication(allocator);
+                self.abortCanonicalPublication(allocator, true);
                 return err;
             }
         else
@@ -2017,6 +2020,7 @@ pub const Controller = struct {
             .source,
             .fresh,
         );
+        self.page.transition_publication = .accepted;
         if (source_completion) |completion| {
             _ = self.page.action_cursor.finishCompletion(completion, true);
         }
@@ -2049,7 +2053,7 @@ pub const Controller = struct {
             deferred.finished.generation != gate.source_generation) return .{};
 
         const allocator = allocator_opt orelse return error.MissingAllocator;
-        errdefer self.abortCanonicalPublication(allocator);
+        errdefer self.abortCanonicalPublication(allocator, true);
         _ = try self.refreshCanonicalPath(allocator, gate);
         const source_changes = self.canonicalSourceChanges(gate);
         const status_changes = gate.status.changesSnapshot();
@@ -2458,7 +2462,7 @@ pub const Controller = struct {
         if (pending.id != request_id) return;
         if (self.page.canonical_publication) |gate| {
             if (gate.projection_request_id == request_id) {
-                self.abortCanonicalPublication(allocator);
+                self.abortCanonicalPublication(allocator, true);
                 return;
             }
         }
@@ -2697,10 +2701,12 @@ pub const Controller = struct {
             .failed => |message| {
                 try self.replaceSourceFailure(allocator, std.mem.trim(u8, message, " \t\r\n"));
                 _ = self.page.activation.finishMember(result.identity, .source, .failed);
+                self.page.transition_publication = .failed;
             },
             .failed_static => |message| {
                 try self.replaceSourceFailure(allocator, message);
                 _ = self.page.activation.finishMember(result.identity, .source, .failed);
+                self.page.transition_publication = .failed;
             },
         }
         return .{};
@@ -2717,6 +2723,7 @@ pub const Controller = struct {
         if (!has_repository) {
             self.clearSourceDisplay(allocator);
             self.page.load.replaceEmpty(allocator, .no_repository);
+            self.page.transition_publication = .failed;
             return .none;
         }
         if (!active) {
@@ -2740,6 +2747,7 @@ pub const Controller = struct {
             self.page.load.pending != null) return false;
         if (self.page.load.state == .loading) self.page.load.state = .idle;
         _ = self.page.activation.finishMember(identity, .source, .failed);
+        self.page.transition_publication = .failed;
         return true;
     }
 
@@ -2793,7 +2801,7 @@ pub const Controller = struct {
         }
         if (!owns_terminal) return .{ .skip_redraw = true };
         if (!publication_admitted) {
-            if (canonical_terminal) self.abortCanonicalPublication(allocator);
+            if (canonical_terminal) self.abortCanonicalPublication(allocator, true);
             return .{
                 .skip_redraw = true,
                 .terminal_admitted = drain_action_member,
@@ -2818,7 +2826,7 @@ pub const Controller = struct {
                     } else {
                         var candidate: git_status.GitStatusState = .{};
                         candidate.replace(result.repo_root, bundle) catch |err| {
-                            self.abortCanonicalPublication(allocator);
+                            self.abortCanonicalPublication(allocator, true);
                             return err;
                         };
                         self.page.canonical_publication.?.status = .{ .replacement = candidate };
@@ -2947,7 +2955,7 @@ pub const Controller = struct {
         message: []const u8,
     ) CompletionApply {
         const apply = self.finishStatusFailureTerminal(allocator, identity, message, .retain_existing);
-        self.abortCanonicalPublication(allocator);
+        self.abortCanonicalPublication(allocator, true);
         return apply;
     }
 
@@ -3289,7 +3297,7 @@ pub const Controller = struct {
         const gate = if (self.page.canonical_publication) |*value| value else return .{ .skip_redraw = true };
         if (gate.phase != .waiting_projection or
             gate.projection_request_id != result.request.id) return .{ .skip_redraw = true };
-        errdefer self.abortCanonicalPublication(allocator);
+        errdefer self.abortCanonicalPublication(allocator, true);
         if (try self.refreshCanonicalPath(allocator, gate)) {
             self.page.changes_projection.clearPending(allocator);
             gate.phase = .waiting_members;
@@ -3301,7 +3309,7 @@ pub const Controller = struct {
             @intFromBool(source_changes);
         const expected_status_revision = self.canonicalStatusRevision(gate);
         const expected_kind = self.canonicalProjectionKind(gate) orelse {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .skip_redraw = true };
         };
         if (!result.request.matchesBorrowed(
@@ -3318,7 +3326,7 @@ pub const Controller = struct {
         if (!self.acceptsIdentity(result.request.identity) or
             !self.page.repository_read_authority.acceptsRead(result.request.read_epoch))
         {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .skip_redraw = true };
         }
 
@@ -3336,7 +3344,7 @@ pub const Controller = struct {
             &result.result.reuse_candidate,
             .publication_snapshot,
         )) {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .skip_redraw = true };
         }
         if (staged_only_reuse and !self.admitStagedOnlyReuse(
@@ -3344,7 +3352,7 @@ pub const Controller = struct {
             &result.result.staged_only_reuse_candidate,
             .publication_snapshot,
         )) {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .skip_redraw = true };
         }
         var static_failure = switch (result.result) {
@@ -3373,17 +3381,17 @@ pub const Controller = struct {
         defer if (final_anchor) |*anchor| anchor.deinit(allocator);
 
         var deferred = self.page.deferred_source_apply orelse {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .skip_redraw = true };
         };
         if (deferred.mode != .canonical_publication or
             deferred.finished.generation != gate.source_generation)
         {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .skip_redraw = true };
         }
         if (!self.sourceTerminalOwnsPending(&deferred.finished)) {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .skip_redraw = true };
         }
         const fingerprint = canonicalSourceFingerprint(&deferred);
@@ -3392,7 +3400,7 @@ pub const Controller = struct {
             gate,
             &deferred,
         ) catch |err| {
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return err;
         };
         defer prepared_source.deinit(allocator);
@@ -3403,7 +3411,7 @@ pub const Controller = struct {
                 allocator,
                 self.canonicalStatusDocument(gate),
             ) catch |err| {
-                self.abortCanonicalPublication(allocator);
+                self.abortCanonicalPublication(allocator, true);
                 return err;
             }
         else
@@ -3481,6 +3489,7 @@ pub const Controller = struct {
             .source,
             .fresh,
         );
+        self.page.transition_publication = if (result.result == .failed or result.result == .failed_static) .failed else .accepted;
         if (source_completion) |completion| {
             _ = self.page.action_cursor.finishCompletion(completion, true);
         }
@@ -3829,14 +3838,14 @@ pub const Controller = struct {
         }
         if (canonical_terminal and (!owns_terminal or !publication_admitted)) {
             self.page.auto_reload.finishMember(finished.background_cycle_id, .source);
-            self.abortCanonicalPublication(allocator);
+            self.abortCanonicalPublication(allocator, true);
             return .{ .redraw = .skip };
         }
         if (canonical_terminal and owns_terminal and publication_admitted) {
             switch (finished.result) {
                 .empty, .unchanged, .loaded => {
                     if (self.page.deferred_source_apply != null) {
-                        self.abortCanonicalPublication(allocator);
+                        self.abortCanonicalPublication(allocator, true);
                         return .{ .redraw = .skip };
                     }
                     const cycle_id = finished.background_cycle_id orelse 0;
@@ -3846,7 +3855,7 @@ pub const Controller = struct {
                             .source,
                             .deferred_source_apply,
                         )) {
-                            self.abortCanonicalPublication(allocator);
+                            self.abortCanonicalPublication(allocator, true);
                             return .{ .redraw = .skip };
                         }
                     }
@@ -3862,6 +3871,7 @@ pub const Controller = struct {
                     var pending_reload = self.takeOwnedSourceTerminal(finished);
                     defer if (pending_reload) |*pending| pending.deinit(allocator);
                     _ = self.page.activation.finishMember(finished.identity, .source, .failed);
+                    self.page.transition_publication = .failed;
                     var outcome: SourceApply = .{
                         .redraw = .skip,
                         .terminal_admitted = true,
@@ -3874,7 +3884,7 @@ pub const Controller = struct {
                         };
                         self.recordWatchSourceFailure(&outcome, message);
                     }
-                    self.abortCanonicalPublication(allocator);
+                    self.abortCanonicalPublication(allocator, true);
                     return outcome;
                 },
             }
@@ -3914,11 +3924,13 @@ pub const Controller = struct {
                 }
                 outcome.recovered_failure = self.acceptSourceFingerprint(content_fingerprint.Fingerprint.init(""));
                 _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
+                self.page.transition_publication = .accepted;
                 can_project_status = true;
             },
             .unchanged => |fingerprint| {
                 outcome.recovered_failure = self.acceptSourceFingerprint(fingerprint);
                 _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
+                self.page.transition_publication = .accepted;
                 outcome.redraw = .skip_unless_recovered_failure_cleared;
                 return outcome;
             },
@@ -3933,6 +3945,7 @@ pub const Controller = struct {
                     .skip_rebuild_identical_text => {
                         outcome.recovered_failure = self.acceptSourceFingerprint(bundle.fingerprint);
                         _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
+                        self.page.transition_publication = .accepted;
                         const prefer_first = !had_loaded_before and !had_action_cursor;
                         if (prefer_first and self.page.status_load.isPending()) {
                             self.page.pending_initial_first_visible_selection = true;
@@ -3960,6 +3973,7 @@ pub const Controller = struct {
                 }
                 outcome.recovered_failure = self.acceptSourceFingerprint(bundle.fingerprint);
                 _ = self.page.activation.finishMember(finished.identity, .source, .fresh);
+                self.page.transition_publication = .accepted;
 
                 const active_loaded = self.navigation.activeLoadedDiff().?;
                 const restored_from_anchor = if (self.page.pending_display_navigation_restore) |*restore|
@@ -3990,12 +4004,14 @@ pub const Controller = struct {
             },
             .failed => |message| {
                 _ = self.page.activation.finishMember(finished.identity, .source, .failed);
+                self.page.transition_publication = .failed;
                 var failure = try self.applySourceFailure(allocator, pending_reload, std.mem.trim(u8, message, " \t\r\n"));
                 failure.terminal_admitted = true;
                 return failure;
             },
             .failed_static => |message| {
                 _ = self.page.activation.finishMember(finished.identity, .source, .failed);
+                self.page.transition_publication = .failed;
                 var failure = try self.applySourceFailure(allocator, pending_reload, message);
                 failure.terminal_admitted = true;
                 return failure;
@@ -4168,6 +4184,7 @@ pub const Controller = struct {
     pub fn replaceMissingRepository(self: Controller, allocator: std.mem.Allocator) void {
         self.clearSourceDisplay(allocator);
         self.page.load.replaceEmpty(allocator, .no_repository);
+        self.page.transition_publication = .failed;
     }
 
     /// Accepted replacement transition: keep failure provenance until the new

@@ -275,6 +275,7 @@ const SelectionActionHit = union(enum) {
 /// Page-owned state for the read-only current working-tree browser. The zero
 /// value allocates nothing and is safe to deinitialize before first activation.
 pub const RepositoryPageState = struct {
+    transition_publication: @import("../screen_transition.zig").Publication = .none,
     initialized: bool = false,
     active: bool = false,
     activation_id: u64 = 0,
@@ -677,7 +678,10 @@ pub const RepositoryPageState = struct {
         outcome: ApplyOutcome,
         body_size: chasen.Size,
     ) ApplyOutcome {
-        if (!self.resolveIncomingManifest(allocator, body_size)) return outcome;
+        const resolved = self.resolveIncomingManifest(allocator, body_size);
+        // This helper is reached only after successful manifest admission.
+        if (self.selected_path == null) self.transition_publication = .accepted;
+        if (!resolved) return outcome;
         return switch (outcome) {
             .unchanged => .changed,
             .discarded, .changed, .failed => outcome,
@@ -1040,6 +1044,7 @@ pub const RepositoryPageState = struct {
     /// stale rejection must not consume a newer successor.
     pub fn rejectSpawn(self: *RepositoryPageState, generation: u64) void {
         if (self.pending_generation != generation) return;
+        self.transition_publication = .failed;
         self.pending_generation = null;
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
@@ -1049,6 +1054,7 @@ pub const RepositoryPageState = struct {
 
     pub fn rejectDocumentSpawn(self: *RepositoryPageState, generation: u64) void {
         if (!self.clearPendingDocumentAuthorityIfGeneration(generation)) return;
+        self.transition_publication = .failed;
         self.invalidateDisplayedDocumentAuthority();
         _ = self.file_search_source_focus.clearGeneration(generation);
         self.setReadStatus(.document, "Could not start selected file task", .{});
@@ -1137,6 +1143,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn markRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
+        self.transition_publication = .failed;
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
         self.setReadStatus(.manifest, "Could not prepare repository manifest: {s}", .{@errorName(err)});
@@ -1151,6 +1158,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn markDocumentRequestPreparationFailed(self: *RepositoryPageState, err: anyerror) void {
+        self.transition_publication = .failed;
         self.file_search_source_focus.clear();
         self.invalidateDisplayedDocumentAuthority();
         self.setReadStatus(.document, "Could not prepare selected file: {s}", .{@errorName(err)});
@@ -1158,6 +1166,7 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn markDocumentCapabilityUnavailable(self: *RepositoryPageState) void {
+        self.transition_publication = .failed;
         self.file_search_source_focus.clear();
         self.invalidateDisplayedDocumentAuthority();
         // Capability lookup used to be an inert retry edge for ordinary
@@ -1331,12 +1340,14 @@ pub const RepositoryPageState = struct {
         const expected_root = self.root_identity orelse {
             _ = self.file_search_source_focus.clearGeneration(finished.generation);
             _ = self.terminalizeIncomingOwnerWithoutSuccessor();
+            self.transition_publication = .failed;
             return .failed;
         };
         if (!expected_root.eql(finished.root_identity)) {
             _ = self.file_search_source_focus.clearGeneration(finished.generation);
             self.setReadStatus(.document, "Repository root changed", .{});
             _ = self.terminalizeIncomingOwnerWithoutSuccessor();
+            self.transition_publication = .failed;
             return .failed;
         }
         const selected = self.selected_path orelse {
@@ -1400,6 +1411,13 @@ pub const RepositoryPageState = struct {
         // inconsistent contextual owner names a different revision/generation.
         // Keep the accepted source, but never leave that owner unbounded.
         _ = self.terminalizeIncomingOwnerWithoutSuccessor();
+        self.transition_publication = switch (self.displayed_document.?.value) {
+            .source => .accepted,
+            .inert => |inert| switch (inert) {
+                .unreadable, .missing_or_changed, .unsupported_platform => .failed,
+                else => .accepted,
+            },
+        };
         return .changed;
     }
 
@@ -1656,6 +1674,7 @@ pub const RepositoryPageState = struct {
     }
 
     fn acceptFailure(self: *RepositoryPageState, message: []const u8) void {
+        self.transition_publication = .failed;
         self.freshness = .failed;
         if (self.bundle == null) self.load_state = .failed;
         self.setReadStatus(.manifest, "{s}", .{message});
@@ -9660,5 +9679,52 @@ test "repository read completions clear only owned status and preserve newer ope
             _ = state.applyDocumentFinished(allocator, &document);
             try std.testing.expectEqualStrings(if (newer_message) "Clipboard failed" else "", state.status.text());
         }
+    }
+}
+
+test "screen transition Repository waits for selected document and consumes read failure" {
+    const allocator = std.testing.allocator;
+    const transition = @import("../screen_transition.zig");
+    var root = try TestRoot.init();
+    defer root.deinit();
+    for ([_]enum { text, binary, unreadable, no_selection }{ .text, .binary, .unreadable, .no_selection }) |terminal| {
+        var state = try selectionStateForTest("main.zig\x00", "retained source\n");
+        defer state.deinit(allocator);
+        state.root_identity = root.capability.identity;
+        state.freshness = .fresh;
+        state.requestReload(true, .branch_switch);
+        if (terminal == .no_selection) {
+            state.selected_path = null;
+        }
+        var manifest_request = try state.prepareRequest(allocator, root.path, &root.capability);
+        defer manifest_request.deinit(allocator);
+        var effect: transition.State = .idle;
+        effect.arm(manifest_request.identity);
+        var manifest_finished: repository_tasks.ManifestFinished = .{
+            .identity = manifest_request.identity,
+            .root_identity = manifest_request.root.identity,
+            .generation = manifest_request.generation,
+            .result = .{ .unchanged = state.bundle.?.document.fingerprint },
+        };
+        defer manifest_finished.deinit(allocator);
+        _ = state.applyFinished(allocator, &manifest_finished, test_body_size);
+        try std.testing.expectEqual(terminal == .no_selection, effect.publish(manifest_request.identity, state.transition_publication));
+        if (terminal == .no_selection) continue;
+        try std.testing.expect(effect == .waiting);
+        try std.testing.expect(state.currentSource() != null);
+        try std.testing.expect(state.displayed_document.?.authority == .revalidation_required);
+        var request = try state.prepareDocumentRequest(allocator, &root.capability);
+        defer request.deinit(allocator);
+        var finished = try fileSearchDocumentFinishedForTest(allocator, &request, if (terminal == .text) "new source\n" else null);
+        defer finished.deinit(allocator);
+        if (terminal == .unreadable) finished.value = .{ .inert = .unreadable };
+        finished.generation -%= 1;
+        try std.testing.expectEqual(ApplyOutcome.discarded, state.applyDocumentFinished(allocator, &finished));
+        try std.testing.expect(!effect.publish(request.identity, state.transition_publication));
+        try std.testing.expect(effect == .waiting);
+        finished.generation = request.generation;
+        try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
+        try std.testing.expectEqual(terminal != .unreadable, effect.publish(request.identity, state.transition_publication));
+        try std.testing.expect(if (terminal == .unreadable) effect == .idle else effect == .running);
     }
 }

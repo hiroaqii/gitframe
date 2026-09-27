@@ -983,6 +983,7 @@ test "finishSwitchBranch success clears repo-local changes state and reloads mat
         .result = .ok,
     } } }, &ctx);
 
+    try std.testing.expect(app.screen_transition == .waiting);
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(!try app.pages.changes.reviewed_store.containsFile(allocator, app.repo_session.view().activeRoot(), app_test_support.files_two[0]));
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.staged_hunks.items.items.len);
@@ -1028,6 +1029,7 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
         .result = .{ .failed = try allocator.dupe(u8, details) },
     } } }, &ctx);
 
+    try std.testing.expect(app.screen_transition == .idle);
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.overlay.isRemoteError());
     try std.testing.expect(!app.remote_workflow.branch_switch.hasState());
@@ -1901,6 +1903,7 @@ test "Repository branch switch terminals reload only their caller without activa
         try std.testing.expectEqual(@as(?u64, 9), app.pages.repository.pending_generation);
         try std.testing.expectEqual(@as(u64, 8), app.pages.repository.branch.pending.?.generation);
         try std.testing.expect(app.pages.repository.branch.freshness == .validating);
+        try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
         if (!success) try std.testing.expect(app.overlay.isRemoteError());
     }
 }
@@ -2068,12 +2071,14 @@ test "worktree completion uses repository replacement from every branch picker c
         try std.testing.expect(app.pages.history.current_view == .picker);
         try std.testing.expect(app.pages.compare.base_target == null);
         try std.testing.expectEqualStrings(roots.b, app.repo_session.recent_repos.entries.items[0].path);
+        try std.testing.expect(app.screen_transition == .waiting);
         // Read failure after commitment stays at the destination.
         for (ctx.takePendingTasksWith()) |entry| {
             try app.update(entry.failed(entry.ctx, .runtime_abandoned, allocator), &ctx);
         }
         try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
         try std.testing.expectEqual(caller, app.active_page);
+        try std.testing.expect(app.screen_transition == .idle);
     }
 }
 
@@ -2245,6 +2250,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
             try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
             try std.testing.expect(!app.action_runtime.view().hasPending());
             try std.testing.expect(diff.selection_owner == .none);
+            try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
             if (!success) {
                 try std.testing.expectEqual(owner, app.overlay.owner_page.?);
                 try std.testing.expectEqualStrings("checkout refused", app.remote_workflow.remote_error_message.?);
@@ -2266,6 +2272,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                     .result = .{ .failed_static = "old diff" },
                 } } } }, &ctx);
                 try std.testing.expectEqual(probe.generation, history.pending.?.catalog.generation);
+                try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
                 try app.update(.{ .load_finished = .{ .history = .{ .catalog = .{
                     .identity = probe.identity,
                     .root_identity = root_identity,
@@ -2276,6 +2283,38 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 try std.testing.expect(history.currentHeadContext().?.head.?.eql(&new_head));
                 try std.testing.expect(history.accepted.?.request.basis.after.eql(&selected));
                 try std.testing.expectEqual(history_page.CurrentView.diff, history.current_view);
+                try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
+                const initial = history.pending.?.catalog;
+                try app.update(.{ .load_finished = .{ .history = .{ .catalog = .{
+                    .identity = initial.identity,
+                    .root_identity = root_identity,
+                    .generation = initial.generation,
+                    .request = initial.request,
+                    .result = .{ .loaded = .{ .snapshot = .{ .object_format = .sha1, .head = new_head, .display = .{ .branch = try allocator.dupe(u8, "feature") } } } },
+                } } } }, &ctx);
+                try std.testing.expect(if (success) app.screen_transition == .running else app.screen_transition == .idle);
+                // A second successful checkout followed by a failed probe keeps
+                // the immutable diff but consumes its new animation wait.
+                const next = beginAcceptedTestAction(&app, .switch_branch);
+                try app.update(.{ .action_finished = .{ .switch_branch = .{
+                    .pending = next,
+                    .repo_root = try allocator.dupe(u8, roots.a),
+                    .old_branch = try allocator.dupe(u8, "feature"),
+                    .new_branch = try allocator.dupe(u8, "main"),
+                    .result = .ok,
+                } } }, &ctx);
+                const failed_probe = history.pending.?.catalog;
+                try std.testing.expect(app.screen_transition == .waiting);
+                try app.update(.{ .load_finished = .{ .history = .{ .catalog = .{
+                    .identity = failed_probe.identity,
+                    .root_identity = root_identity,
+                    .generation = failed_probe.generation,
+                    .request = failed_probe.request,
+                    .result = .{ .failure = .git_command_failed },
+                } } } }, &ctx);
+                try std.testing.expect(history.current_view == .diff);
+                try std.testing.expect(history.load_state == .loaded or history.load_state == .empty);
+                try std.testing.expect(app.screen_transition == .idle);
             } else {
                 try std.testing.expect(compare.deferred_load_apply == null);
                 try std.testing.expectEqualStrings("refs/heads/main", compare.base_target.?.full_ref);
@@ -2284,12 +2323,25 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 const generation = compare.refresh_generation;
                 try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, 10, before, selected, patch) } } }, &ctx);
                 try std.testing.expectEqual(generation, compare.refresh_generation);
+                try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
+                diff.selection_owner = .{ .diff = .{
+                    .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "file.txt" } },
+                    .content = .{ .source_side = .{ .side = .new } },
+                    .anchor = .{ .hunk_index = 0, .line_index = 0 },
+                    .focus = .{ .hunk_index = 0, .line_index = 0 },
+                    .moved = true,
+                } };
                 try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, generation, before, new_head, patch) } } }, &ctx);
+                try std.testing.expect(compare.deferred_load_apply != null);
+                try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
+                diff.selection_owner = .none;
+                try app.update(.git_action_spinner_tick, &ctx);
+                try std.testing.expect(if (success) app.screen_transition == .running else app.screen_transition == .idle);
                 try std.testing.expect(compare.basis.?.target.head_oid.eql(&new_head));
                 try std.testing.expectEqualStrings("refs/heads/main", compare.base_target.?.full_ref);
                 try std.testing.expect(compare.diff.reload_anchor == null);
             }
-            if (!success) try std.testing.expect(app.overlay.isRemoteError());
+            if (!success and owner == .compare) try std.testing.expect(app.overlay.isRemoteError());
         }
     }
 }

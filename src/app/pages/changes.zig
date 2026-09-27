@@ -193,6 +193,7 @@ pub const DeferredProjectionApply = struct {
 };
 
 pub const ChangesPageState = struct {
+    transition_publication: @import("../screen_transition.zig").Publication = .none,
     activation: authority.Lifecycle = .init(.changes),
     repository_read_authority: repository_read_authority.ChangesRepositoryReadAuthority = .{},
     status: app_state.StatusMessage = .{},

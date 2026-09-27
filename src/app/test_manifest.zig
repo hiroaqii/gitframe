@@ -18,6 +18,7 @@ pub fn include() void {
     _ = @import("pages/changes/navigation_app_test.zig");
     _ = @import("pages/changes/read_coordinator_test.zig");
     _ = @import("tests/page_transition.zig");
+    _ = @import("tests/screen_transition.zig");
     _ = @import("tests/canonical_publication.zig");
     _ = @import("tests/local_workflow.zig");
     _ = @import("tests/stash.zig");

@@ -281,6 +281,7 @@ pub const BasisFailureState = struct {
 };
 
 pub const ComparePageState = struct {
+    transition_publication: @import("../screen_transition.zig").Publication = .none,
     activation: diff_surface.authority.Lifecycle = .init(.compare),
     status: app_state.StatusMessage = .{},
     diff: committed_diff.State = .{},
@@ -372,6 +373,7 @@ pub const ComparePageState = struct {
                 try self.commitLoaded(allocator, repo_epoch, repo_root, root_identity, bundle);
                 finished.result = .empty;
                 _ = self.activation.finishMember(finished.identity, .source, .fresh);
+                self.transition_publication = .accepted;
                 break :result .loaded;
             },
             .basis_failed => |failure| result: {
@@ -380,20 +382,24 @@ pub const ComparePageState = struct {
                 finished.result = .empty;
                 self.clearLoadFailure(allocator);
                 _ = self.activation.finishMember(finished.identity, .source, .failed);
+                self.transition_publication = .failed;
                 break :result .basis_failed;
             },
             .failed => |message| result: {
                 self.replaceLoadFailure(allocator, message) catch {};
                 _ = self.activation.finishMember(finished.identity, .source, .failed);
+                self.transition_publication = .failed;
                 break :result .failed;
             },
             .failed_static => |message| result: {
                 self.replaceLoadFailure(allocator, message) catch {};
                 _ = self.activation.finishMember(finished.identity, .source, .failed);
+                self.transition_publication = .failed;
                 break :result .failed;
             },
             .empty => result: {
                 _ = self.activation.finishMember(finished.identity, .source, .failed);
+                self.transition_publication = .failed;
                 break :result .failed;
             },
         };
@@ -403,6 +409,7 @@ pub const ComparePageState = struct {
         if (request.generation != self.refresh_generation or
             !self.activation.acceptsPageInstance(request.identity, repo_epoch)) return false;
         _ = self.activation.finishMember(request.identity, .source, .failed);
+        self.transition_publication = .failed;
         return true;
     }
 
@@ -426,6 +433,7 @@ pub const ComparePageState = struct {
         self.clearRefreshFailure(allocator);
         if (self.activation.currentIdentity()) |identity| {
             _ = self.activation.finishMember(identity, .source, .failed);
+            self.transition_publication = .failed;
         }
     }
 

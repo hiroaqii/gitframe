@@ -7,6 +7,7 @@
 //! this root back.
 
 const std = @import("std");
+const screen_transition = @import("app/screen_transition.zig");
 const chasen = @import("chasen");
 const initial_selection = @import("app/initial_selection.zig");
 const command_line = @import("app/command_line.zig");
@@ -135,6 +136,7 @@ pub const App = struct {
     shell_effects_state: shell_effects.State = .{},
     drag_auto_scroll: drag_auto_scroll.State = .{},
     command_session: CommandSession = .inactive,
+    screen_transition: screen_transition.State = .idle,
 
     const PopupCopyTarget = struct {
         label: []const u8,
@@ -148,6 +150,7 @@ pub const App = struct {
         self.local_workflow = workflow_local.LocalState.init(ctx.allocator());
         self.pages.changes.init(self.config.auto_reload, self.user_config.reload);
         _ = self.pageCoordinator().activateChanges();
+        if (self.config.transitions) self.screen_transition.arm(self.transitionIdentity().?);
         if (self.pages.changes.auto_reload.enabled()) {
             try ctx.timer().every(auto_reload_timer_id, self.pages.changes.auto_reload.interval_ns, .auto_reload_tick);
         }
@@ -159,6 +162,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
+        _ = self.screen_transition.cancel();
         if (self.allocator == null) self.allocator = deinit_ctx.allocator;
         self.pages.changes.deinit(deinit_ctx.allocator);
         self.pages.repository.deinit(deinit_ctx.allocator);
@@ -508,14 +512,36 @@ pub const App = struct {
         };
     }
 
-    pub fn update(self: *App, msg: Msg, ctx: *chasen.Ctx(Msg)) !void {
+    pub fn update(self: *App, incoming: Msg, ctx: *chasen.Ctx(Msg)) !void {
         self.redraw_plan = .{};
+        self.clearTransitionPublications();
+        errdefer {
+            _ = self.screen_transition.cancel();
+            self.clearTransitionPublications();
+        }
+        const msg = if (incoming == .transition_input) blk: {
+            if (self.screen_transition.cancel()) self.redraw_plan.requireFrame();
+            break :blk self.shellInputView().handleEvent(incoming.transition_input) orelse .transition_cancel;
+        } else incoming;
+        const interrupts_transition = switch (msg) {
+            .terminal_resized => |size| self.terminal_size.width != 0 and !std.meta.eql(size, self.terminal_size),
+            .focus_lost => true,
+            .mouse_selection_drag, .mouse_selection_release => false,
+            else => !app_message.keepsEphemeralStatus(msg),
+        };
+        if (interrupts_transition and self.screen_transition.cancel()) self.redraw_plan.requireFrame();
         var update_succeeded = false;
         defer if (update_succeeded and self.redraw_plan.resolvesToSkip()) ctx.redraw().skip();
         defer self.reconcileDragAutoScroll(ctx);
         if (self.clearEphemeralStatusForUserAction(msg)) self.redraw_plan.requireFrame();
 
         switch (msg) {
+            .transition_input => unreachable,
+            .transition_cancel => {},
+            .transition_frame => {
+                if (self.screen_transition.step()) self.redraw_plan.requireFrame() else self.redraw_plan.requestSkip();
+                if (self.screen_transition == .running) ctx.frame().request();
+            },
             .switch_page => |target| {
                 self.drag_auto_scroll.clear();
                 self.command_session = .inactive;
@@ -680,7 +706,7 @@ pub const App = struct {
             .close_repo_picker => self.repoSession().closePicker(ctx.allocator()),
             .submit_repo_picker => {
                 if (try self.repoSession().submitPicker(ctx)) |outcome| {
-                    try self.applyRepoSessionCommit(ctx, outcome);
+                    try self.applyRepoSessionCommit(ctx, outcome, true);
                 }
             },
             .repo_picker_enter_filter_input => try self.repoSession().enterPickerFilterInput(ctx.allocator()),
@@ -807,6 +833,17 @@ pub const App = struct {
             if (try self.changesRead().maybeStartQueuedRevalidation(ctx)) self.redraw_plan.requireFrame();
         }
         self.actionLifecycle().reconcileSpinner(ctx);
+        if (self.config.transitions and self.screen_transition.publish(self.transitionIdentity(), switch (self.active_page) {
+            .changes => self.pages.changes.transition_publication,
+            .repository => self.pages.repository.transition_publication,
+            .history => self.pages.history.transition_publication,
+            .compare => self.pages.compare.transition_publication,
+        })) {
+            ctx.frame().request();
+            self.redraw_plan.requireFrame();
+        }
+        self.clearTransitionPublications();
+        if (self.screen_transition == .running) self.redraw_plan.requireFrame();
         if (!self.redraw_plan.resolvesToSkip() and self.active_page == .compare and self.pages.compare.base_picker.open) {
             self.compareCoordinator().prepareModalRedraw(ctx.io());
         }
@@ -822,6 +859,7 @@ pub const App = struct {
             self.setStatus("finish current git action before quitting", .{});
             return;
         }
+        _ = self.screen_transition.cancel();
         self.teardown_requested = true;
         ctx.quit();
     }
@@ -1153,7 +1191,7 @@ pub const App = struct {
             .shell => |shell_result| switch (shell_result) {
                 .repo_path_discovery => |result| {
                     if (try self.repoSession().finishPathDiscovery(ctx, result)) |outcome| {
-                        try self.applyRepoSessionCommit(ctx, outcome);
+                        try self.applyRepoSessionCommit(ctx, outcome, true);
                     }
                 },
                 .branch_list => |result| try self.remoteWorkflow().finishBranchListLoad(ctx.allocator(), result),
@@ -1162,7 +1200,7 @@ pub const App = struct {
                     if (self.remoteWorkflow().finishWorktreeSwitch(ctx.allocator(), result)) |validated| {
                         const caller_status = self.remoteWorkflow().branchStatus(result.owner.origin.page_id);
                         const outcome = try self.repoSession().commitWorktree(ctx, validated, caller_status);
-                        if (outcome == .changed) try self.applyRepoSessionCommit(ctx, outcome);
+                        if (outcome == .changed) try self.applyRepoSessionCommit(ctx, outcome, true);
                     }
                 },
             },
@@ -1184,7 +1222,25 @@ pub const App = struct {
             .push => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPush(ctx.allocator(), result)),
             .pull => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishPull(ctx.allocator(), result)),
             .fetch => |result| try self.applyRemoteOutcome(ctx, self.remoteWorkflow().finishFetch(ctx.allocator(), result)),
-            .switch_branch => |result| try self.applyRemoteOutcome(ctx, try self.remoteWorkflow().finishSwitchBranch(ctx.allocator(), result)),
+            .switch_branch => |result| {
+                // Capture before finishSwitchBranch releases the result text.
+                const changed = result.result == .ok and !std.mem.eql(u8, result.old_branch, result.new_branch);
+                const outcome = try self.remoteWorkflow().finishSwitchBranch(ctx.allocator(), result);
+                if (self.config.transitions and changed) {
+                    // Only an accepted, still-live caller receives branch_reload.
+                    // Failed/stale completions must never arm an animation.
+                    if (outcome.branch_reload) |reload| {
+                        const target: page.Id = switch (reload) {
+                            .changes => .changes,
+                            .repository => .repository,
+                            .history => .history,
+                            .compare => .compare,
+                        };
+                        if (target == self.active_page) self.screen_transition.arm(self.transitionIdentity().?);
+                    }
+                }
+                try self.applyRemoteOutcome(ctx, outcome);
+            },
             .create_stash => |value| {
                 var result = value;
                 defer result.deinit(ctx.allocator());
@@ -1432,7 +1488,30 @@ pub const App = struct {
     }
 
     pub fn view(self: *const App, surface: *chasen.Surface) !void {
-        return app_view.view(self.shellViewContext(), surface);
+        try app_view.view(self.shellViewContext(), surface);
+        if (self.config.transitions) {
+            self.screen_transition.render(surface);
+        }
+    }
+
+    fn transitionIdentity(self: *const App) ?page.RequestIdentity {
+        return switch (self.active_page) {
+            .changes => self.pages.changes.activation.currentIdentity(),
+            .repository => if (self.pages.repository.active) .{
+                .origin = .repository,
+                .repo_epoch = self.pages.repository.repo_epoch,
+                .activation_id = self.pages.repository.activation_id,
+            } else null,
+            .history => self.pages.history.activation.currentIdentity(),
+            .compare => self.pages.compare.activation.currentIdentity(),
+        };
+    }
+
+    fn clearTransitionPublications(self: *App) void {
+        self.pages.changes.transition_publication = .none;
+        self.pages.repository.transition_publication = .none;
+        self.pages.history.transition_publication = .none;
+        self.pages.compare.transition_publication = .none;
     }
 
     fn shellViewContext(self: *const App) app_view.Context {
@@ -1536,6 +1615,15 @@ pub const App = struct {
     }
 
     pub fn handleEvent(self: *const App, event: chasen.Event) ?Msg {
+        if (event == .frame) return if (self.config.transitions) .transition_frame else null;
+        // Before publication, let the normal router ignore unmapped input.
+        // Once visible, a new key, click, scroll or paste interrupts. Releasing
+        // the click that started a page transition must not cancel it.
+        if (self.screen_transition == .running) switch (event) {
+            .key_press, .paste => return .{ .transition_input = event },
+            .mouse => |mouse| if (mouse.type == .press) return .{ .transition_input = event },
+            else => {},
+        };
         return self.shellInputView().handleEvent(event);
     }
 
@@ -1913,22 +2001,26 @@ pub const App = struct {
         };
         if (outcome == .rejected) {
             self.changesRead().rejectAppliedRepoDiscovery(identity, generation);
-            try self.applyRepoSessionCommit(ctx, outcome);
+            try self.applyRepoSessionCommit(ctx, outcome, false);
             return;
         }
 
+        if (self.transitionIdentity()) |current| self.screen_transition.rebindStartup(current);
         try self.changesRead().acceptRepoDiscoveryCommit(ctx);
         if (outcome == .changed and self.active_page == .compare) {
-            try self.applyRepoSessionCommit(ctx, outcome);
+            try self.applyRepoSessionCommit(ctx, outcome, false);
         }
     }
 
-    fn applyRepoSessionCommit(self: *App, ctx: *chasen.Ctx(Msg), outcome: repo_session.CommitOutcome) !void {
+    fn applyRepoSessionCommit(self: *App, ctx: *chasen.Ctx(Msg), outcome: repo_session.CommitOutcome, animate: bool) !void {
         switch (outcome) {
-            .changed => try self.applyPageCoordinationIntent(
-                ctx,
-                self.pageCoordinator().acceptedRepositoryChange(self.allocator orelse ctx.allocator()),
-            ),
+            .changed => {
+                const intent = self.pageCoordinator().acceptedRepositoryChange(self.allocator orelse ctx.allocator());
+                if (animate and self.config.transitions) {
+                    if (self.transitionIdentity()) |identity| self.screen_transition.arm(identity);
+                }
+                try self.applyPageCoordinationIntent(ctx, intent);
+            },
             .unchanged => {},
             .rejected => self.setStatus("Repository root could not be opened safely", .{}),
         }

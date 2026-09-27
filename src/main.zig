@@ -185,6 +185,7 @@ fn printHelp(io: std.Io) !void {
         \\  --range <range>   Show a commit range, for example main...HEAD
         \\  --watch           Force-enable automatic reload
         \\  --no-watch        Disable automatic reload
+        \\  --no-transition   Disable all transition animations
         \\  --stats-summary   Print runtime timing summary after exit
         \\  --version         Print version and exit
         \\  -h, --help        Show this help

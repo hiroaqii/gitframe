@@ -1755,6 +1755,7 @@ test "Changes canonical publication retains the prior body for every direct acti
                 const status_revision_before = app.pages.changes.status_snapshot_revision;
                 try finishCanonicalPublicationAction(&app, &ctx, allocator, action, roots.a);
                 const reads = try takeCanonicalPublicationReads(&ctx, allocator);
+                app.screen_transition.arm(app.pages.changes.activation.currentIdentity().?);
 
                 if (status_first) {
                     try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
@@ -1778,6 +1779,7 @@ test "Changes canonical publication retains the prior body for every direct acti
                 }
 
                 try app.update(.git_action_spinner_tick, &ctx);
+                try std.testing.expect(app.screen_transition == .waiting);
                 var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
                 if (source_empty) {
                     try std.testing.expectEqual(app_changes_projection.Kind.cached_diff, request.kind);
@@ -1798,6 +1800,7 @@ test "Changes canonical publication retains the prior body for every direct acti
                         .result = .{ .ready = .{ .combined_hunks = final_bundle } },
                     } } }), &ctx);
                 }
+                try std.testing.expect(app.screen_transition == .running);
                 request = undefined;
                 try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
 

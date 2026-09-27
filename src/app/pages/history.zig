@@ -103,6 +103,7 @@ pub const AcceptedSelection = struct {
 pub const ApplyOutcome = enum { discarded, changed, failed };
 
 pub const HistoryPageState = struct {
+    transition_publication: @import("../screen_transition.zig").Publication = .none,
     activation: diff_surface.authority.Lifecycle = .init(.history),
     repo_epoch: u64 = 0,
     root_identity: ?root_capability.Identity = null,
@@ -333,6 +334,7 @@ pub const HistoryPageState = struct {
     }
 
     pub fn rejectPreparation(self: *HistoryPageState) void {
+        self.transition_publication = .failed;
         self.pending = null;
         self.needs_probe = null;
         self.needs_initial = false;
@@ -348,6 +350,7 @@ pub const HistoryPageState = struct {
             .diff => return,
         };
         if (catalog_pending.generation != generation) return;
+        self.transition_publication = .failed;
         self.pending = null;
         self.load_state = .failed;
         self.status.set("History load could not be started", .{});
@@ -401,11 +404,16 @@ pub const HistoryPageState = struct {
                     self.load_state = .failed;
                     self.status.set("History load failed: {s}", .{@tagName(failure)});
                 }
+                self.transition_publication = .failed;
                 return .failed;
             },
             .loaded => |*page| {
                 switch (pending.request) {
-                    .probe => |reason| return self.applyProbe(allocator, reason, page),
+                    .probe => |reason| {
+                        const outcome = self.applyProbe(allocator, reason, page);
+                        self.transition_publication = if (outcome == .failed) .failed else if (self.needs_initial) .none else .accepted;
+                        return outcome;
+                    },
                     .initial => |policy| try self.applyInitial(allocator, policy, page, finished.render_now_unix),
                     .continuation => {
                         try self.catalog.append(allocator, page);
@@ -416,6 +424,7 @@ pub const HistoryPageState = struct {
                     self.load_state = if (self.catalog.records.items.len == 0) .empty else .loaded;
                     self.status.clear();
                 }
+                self.transition_publication = .accepted;
                 return .changed;
             },
         }
