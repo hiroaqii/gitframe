@@ -1696,6 +1696,38 @@ test "finishPush failed preserves retry target oid for interactive push" {
     try std.testing.expectEqualStrings("abc123", target.oid);
 }
 
+test "finishPush tracking incomplete reloads without offering another push" {
+    const allocator = std.testing.allocator;
+    var app: RemoteHarness = .{ .allocator = allocator };
+    const repo_root = try installCurrentRepoForTest(&app, allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    defer app.clearRemoteError(allocator);
+    activateChanges(&app);
+    const pending = beginAcceptedTestAction(&app, .push);
+    app.remote_workflow.action_control.begin(pending.generation);
+    const outcome = try app.remoteWorkflow().finishPush(allocator, .{
+        .pending = pending,
+        .identity = .{
+            .repo_epoch = app.repoSessionView().epoch(),
+            .root_identity = app.repoSessionView().activeIdentity().?,
+            .operation_generation = pending.generation,
+        },
+        .mode = .set_upstream,
+        .repo_root = try allocator.dupe(u8, repo_root),
+        .branch = try allocator.dupe(u8, "main"),
+        .remote = try allocator.dupe(u8, "origin"),
+        .remote_branch = try allocator.dupe(u8, "main"),
+        .oid = try allocator.dupe(u8, "abc123"),
+        .result = .{ .outcome = .{ .ok = .push_tracking_incomplete } },
+    });
+    try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, outcome.reload);
+    try std.testing.expect(!app.actionLifecycleView().hasPending());
+    try std.testing.expect(!app.remote_workflow.action_control.isActive(pending.generation));
+    try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
+    try std.testing.expect(app.remote_workflow.remote_error_message == null);
+    try std.testing.expectEqualStrings("push succeeded; local upstream was not configured; repository reload required", app.pages.changes.status.text());
+}
+
 test "finishPush retires an exact action before dropping a mismatched operation generation" {
     const allocator = std.testing.allocator;
     var app: RemoteHarness = .{ .allocator = allocator };

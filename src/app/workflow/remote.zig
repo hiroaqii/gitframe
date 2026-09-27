@@ -660,7 +660,14 @@ pub const Controller = struct {
             result.identity.operation_generation != result.pending.generation)
             return .{ .quit_after_terminal = quit_after_terminal };
         switch (result.result.outcome) {
-            .ok => {
+            .ok => |success| {
+                if (success == .push_tracking_incomplete) {
+                    self.setRemoteStatus(result.result.warnings, "push succeeded; local upstream was not configured; repository reload required", .{});
+                    return .{
+                        .reload = if (active_matches) .source_and_aux else .none,
+                        .quit_after_terminal = quit_after_terminal,
+                    };
+                }
                 if (active_matches) {
                     self.setRemoteStatus(result.result.warnings, "pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
                     return .{ .reload = .source_and_aux, .quit_after_terminal = quit_after_terminal };
@@ -704,6 +711,7 @@ pub const Controller = struct {
                     self.setRemoteStatus(result.result.warnings, "pulled: {s}", .{result.repo_root});
                 },
                 .already_up_to_date => self.setRemoteStatus(result.result.warnings, "already up to date", .{}),
+                .push_tracking_incomplete => unreachable, // Only push produces this terminal.
             },
             .failed => |failure| {
                 self.setRemoteFailureStatus(result.result.warnings, .pull, failure);

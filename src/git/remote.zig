@@ -56,6 +56,7 @@ pub const RemoteFailure = enum {
 pub const RemoteSuccess = enum {
     completed,
     already_up_to_date,
+    push_tracking_incomplete,
 };
 
 pub const RemoteOperationOutcome = union(enum) {
@@ -139,8 +140,8 @@ pub const PushRequest = struct {
     branch: []const u8,
     remote: []const u8,
     remote_branch: []const u8,
-    /// Commit snapshot used by the pre-push safety check. Foreground callers
-    /// also use it as the immutable source of their native refspec.
+    /// Commit snapshot used by the pre-push safety check and as the immutable
+    /// source refspec in both background and foreground pushes.
     oid: []const u8,
 };
 
@@ -1242,23 +1243,34 @@ fn runSecureGitPush(
         .failed => |failure| return remoteFailureResult(failure, warnings),
     }
 
-    const refspec = std.fmt.allocPrint(allocator, "refs/heads/{s}:refs/heads/{s}", .{ request.branch, request.remote_branch }) catch
+    const refspec = std.fmt.allocPrint(allocator, "{s}:refs/heads/{s}", .{ request.oid, request.remote_branch }) catch
         return remoteFailureResult(.failed, warnings);
     defer allocator.free(refspec);
-    const upstream_argv = [_][]const u8{
+    const argv = [_][]const u8{
         "git",   "-c",                           "credential.interactive=false", "-c",                     "credential.trace=false", "-c", "credential.traceSecrets=false",
         "-c",    "credential.traceMsAuth=false", "-c",                           "credential.debug=false", "push",                   "--", request.remote,
         refspec,
     };
-    const set_upstream_argv = [_][]const u8{
-        "git",          "-c",                           "credential.interactive=false", "-c",                     "credential.trace=false", "-c",             "credential.traceSecrets=false",
-        "-c",           "credential.traceMsAuth=false", "-c",                           "credential.debug=false", "push",                   "--set-upstream", "--",
-        request.remote, refspec,
-    };
-    const argv: []const []const u8 = if (request.mode == .set_upstream) &set_upstream_argv else &upstream_argv;
-    var command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, argv);
+    var command = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &argv);
     defer command.deinit();
     if (commandFailure(&command, true)) |failure| return remoteFailureResult(failure, warnings);
+    if (request.mode == .set_upstream) {
+        var environment = buildRemoteEnvironment(allocator, &operation.environment.map, .local_finalizer) catch
+            return remoteSuccessResult(.push_tracking_incomplete, warnings);
+        defer environment.deinit();
+        switch (runPushUpstreamFinalizer(allocator, io, .{
+            .root = operation.root,
+            .environment = &environment,
+            .control = operation.control,
+            .branch = request.branch,
+            .remote = request.remote,
+            .remote_branch = request.remote_branch,
+            .oid = request.oid,
+        })) {
+            .configured, .already_configured => {},
+            else => return remoteSuccessResult(.push_tracking_incomplete, warnings),
+        }
+    }
     return remoteSuccessResult(.completed, warnings);
 }
 
@@ -2580,6 +2592,130 @@ test "remote foreground push inspection accepts a local bare remote" {
     try std.testing.expect(config_result.term == .exited and config_result.term.exited != 0);
 }
 
+test "remote push sends the saved oid after the current branch moves" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = enum { background_upstream, background_set_upstream, foreground_set_upstream };
+    for ([_]Case{ .background_upstream, .background_set_upstream, .foreground_set_upstream }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+        try tmp.dir.createDir(io, "work", .default_dir);
+        var work = try tmp.dir.openDir(io, "work", .{});
+        defer work.close(io);
+        var remote = try tmp.dir.openDir(io, "remote.git", .{});
+        defer remote.close(io);
+        try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+        try runTestGit(io, &.{ "git", "remote", "add", "origin", "../remote.git" }, work);
+        try work.writeFile(io, .{ .sub_path = "guard", .data = "committed\n" });
+        try runTestGit(io, &.{ "git", "add", "guard" }, work);
+        try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "A" }, work);
+        try runTestGit(io, &.{ "git", "tag", "main" }, work);
+        const oid_a = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(oid_a);
+        const oid_b = try gitOutputAlloc(io, work, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "B" });
+        defer allocator.free(oid_b);
+        try runTestGit(io, &.{ "git", "update-ref", "refs/heads/next", trimLineEnd(oid_b) }, work);
+        try work.writeFile(io, .{ .sub_path = "guard", .data = "staged\n" });
+        try runTestGit(io, &.{ "git", "add", "guard" }, work);
+        try work.writeFile(io, .{ .sub_path = "guard", .data = "worktree\n" });
+        if (case == .background_upstream) {
+            try runTestGit(io, &.{ "git", "config", "branch.main.remote", "origin" }, work);
+            try runTestGit(io, &.{ "git", "config", "branch.main.merge", "refs/heads/main" }, work);
+        }
+
+        // Advance A to B only when the actual push child starts, after inspection.
+        try tmp.dir.createDir(io, "bin", .default_dir);
+        try writeExecutableRemoteTestScript(
+            io,
+            tmp.dir,
+            "bin/git",
+            "#!/bin/sh\n" ++
+                "for arg do\n" ++
+                "  if [ \"$arg\" = push ]; then\n" ++
+                "    /usr/bin/git update-ref refs/heads/main \"$(/usr/bin/git rev-parse refs/heads/next)\" || exit 1\n" ++
+                "    break\n" ++
+                "  fi\n" ++
+                "done\n" ++
+                "exec /usr/bin/git \"$@\"\n",
+        );
+        const bin = try tmp.dir.realPathFileAlloc(io, "bin", allocator);
+        defer allocator.free(bin);
+        const path = try std.fmt.allocPrint(allocator, "{s}:/usr/bin:/bin", .{bin});
+        defer allocator.free(path);
+        const repo_root = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+        defer allocator.free(repo_root);
+        var parent = std.process.Environ.Map.init(allocator);
+        defer parent.deinit();
+        try parent.put("PATH", path);
+        try parent.put("HOME", repo_root);
+        // Executable lookup uses the Io environment, independently of child env.
+        const block = try parent.createPosixBlock(allocator, .{});
+        defer block.deinit(allocator);
+        var threaded = std.Io.Threaded.init(allocator, .{ .environ = .{ .block = block } });
+        defer threaded.deinit();
+        const push_io = threaded.io();
+        var environment = try buildRemoteEnvironment(allocator, &parent, .background);
+        defer environment.deinit();
+        var root = try root_capability.RootCapability.openCanonical(repo_root);
+        defer root.deinit();
+        const push: PushRequest = .{
+            .mode = if (case == .background_upstream) .upstream else .set_upstream,
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = trimLineEnd(oid_a),
+        };
+        if (case == .foreground_set_upstream) {
+            const inspection = inspectForegroundPush(allocator, push_io, .{ .root = &root, .environment = &environment, .control = .{}, .push = push });
+            try std.testing.expectEqual(ForegroundPushInspectionOutcome.ready, inspection.outcome);
+            var prepared = try prepareForegroundPush(allocator, &parent, push, inspection.warnings);
+            defer prepared.deinit(allocator);
+            const child = try std.process.run(allocator, push_io, .{ .argv = &prepared.argv, .cwd = .{ .dir = root.dir() }, .environ_map = &prepared.environment.map });
+            defer freeRunResult(allocator, child);
+            try std.testing.expect(termExited(child.term, 0));
+            var local = try buildRemoteEnvironment(allocator, &parent, .local_finalizer);
+            defer local.deinit();
+            try std.testing.expectEqual(PushUpstreamFinalizeOutcome.oid_changed, finalizePushUpstream(allocator, push_io, .{
+                .root = &root,
+                .environment = &local,
+                .control = .{},
+                .branch = push.branch,
+                .remote = push.remote,
+                .remote_branch = push.remote_branch,
+                .oid = push.oid,
+            }));
+        } else {
+            const result = runOperation(allocator, push_io, .{ .root = &root, .environment = &environment, .control = .{}, .kind = .{ .push = push } });
+            const expected: RemoteSuccess = if (case == .background_upstream) .completed else .push_tracking_incomplete;
+            try std.testing.expectEqual(RemoteOperationOutcome{ .ok = expected }, result.outcome);
+        }
+        const sent = try gitOutputAlloc(io, remote, &.{ "git", "rev-parse", "refs/heads/main" });
+        defer allocator.free(sent);
+        try std.testing.expectEqualStrings(oid_a, sent);
+        const head = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(head);
+        try std.testing.expectEqualStrings(oid_b, head);
+        const branch = try gitOutputAlloc(io, work, &.{ "git", "symbolic-ref", "HEAD" });
+        defer allocator.free(branch);
+        try std.testing.expectEqualStrings("refs/heads/main\n", branch);
+        const index = try gitOutputAlloc(io, work, &.{ "git", "show", ":guard" });
+        defer allocator.free(index);
+        try std.testing.expectEqualStrings("staged\n", index);
+        const file = try work.readFileAlloc(io, "guard", allocator, .limited(1024));
+        defer allocator.free(file);
+        try std.testing.expectEqualStrings("worktree\n", file);
+        if (case == .background_upstream) {
+            const config = try gitOutputAlloc(io, work, &.{ "git", "config", "--get-regexp", "^branch\\.main\\." });
+            defer allocator.free(config);
+            try std.testing.expectEqualStrings("branch.main.remote origin\nbranch.main.merge refs/heads/main\n", config);
+        } else {
+            try runTestGitFailure(io, &.{ "git", "config", "--get-regexp", "^branch\\.main\\." }, work);
+        }
+    }
+}
+
 test "remote upstream finalization configures local tracking after fixed oid push" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2608,7 +2744,6 @@ test "remote upstream finalization configures local tracking after fixed oid pus
     const oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer std.testing.allocator.free(oid);
 
-    try runTestGit(io, &.{ "git", "push", "--", "origin", "refs/heads/feature/topic:refs/heads/feature/topic" }, work);
     var parent = std.process.Environ.Map.init(std.testing.allocator);
     defer parent.deinit();
     try parent.put("PATH", "/usr/bin:/bin");
@@ -2626,14 +2761,21 @@ test "remote upstream finalization configures local tracking after fixed oid pus
         .remote_branch = "feature/topic",
         .oid = trimLineEnd(oid),
     };
-    const result = finalizePushUpstream(std.testing.allocator, io, request);
-    try std.testing.expectEqual(PushUpstreamFinalizeOutcome.configured, result);
+    var background = try buildRemoteEnvironment(std.testing.allocator, &parent, .background);
+    defer background.deinit();
+    const pushed = runOperation(std.testing.allocator, io, .{
+        .root = &root,
+        .environment = &background,
+        .control = .{},
+        .kind = .{ .push = .{ .mode = .set_upstream, .branch = request.branch, .remote = request.remote, .remote_branch = request.remote_branch, .oid = request.oid } },
+    });
+    try std.testing.expectEqual(RemoteOperationOutcome{ .ok = .completed }, pushed.outcome);
     try std.testing.expectEqual(
         PushUpstreamFinalizeOutcome.already_configured,
         finalizePushUpstream(std.testing.allocator, io, request),
     );
 
-    const remote_oid = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "--verify", "refs/remotes/origin/feature/topic" });
+    const remote_oid = try gitOutputAlloc(io, work, &.{ "git", "--git-dir", remote_root, "rev-parse", "--verify", "refs/heads/feature/topic" });
     defer std.testing.allocator.free(remote_oid);
     try std.testing.expectEqualStrings(trimLineEnd(oid), trimLineEnd(remote_oid));
 
