@@ -275,15 +275,16 @@ pub fn buildWithOptions(
     }
 
     for (document.files, 0..) |file, file_index| {
-        const path = displayPath(file);
+        const key = diff_file.canonicalPathKey(file);
+        const path = key orelse "Unknown path";
         try path_budget.consume(path);
-        const path_key = diff_file.canonicalPathKey(file) orelse path;
-        const status_entry = if (status_document) |doc|
-            if (status_index.get(path_key)) |index| doc.entries[index] else null
+        const path_key = key orelse "";
+        const status_entry = if (key != null and status_document != null)
+            if (status_index.get(path_key)) |index| status_document.?.entries[index] else null
         else
             null;
 
-        if (diff_file.canonicalPathKey(file)) |key| try diff_keys.put(allocator, key, {});
+        if (key) |raw_path| try diff_keys.put(allocator, raw_path, {});
 
         try rows.append(allocator, .{
             .name = baseName(path),

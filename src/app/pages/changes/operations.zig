@@ -234,10 +234,10 @@ pub const View = struct {
         return switch (node.target) {
             .repo_root => .{ .path = "", .kind = .repository },
             .directory => |path| .{ .path = if (path.len > 0) path else node.path, .kind = .directory },
-            .diff_file, .status_entry => .{
-                .path = if (node.path_key.len > 0) node.path_key else node.path,
+            .diff_file, .status_entry => if (node.path_key.len > 0) .{
+                .path = node.path_key,
                 .kind = .file,
-            },
+            } else null,
         };
     }
 
@@ -880,6 +880,158 @@ fn clonePullProposal(allocator: std.mem.Allocator, target: git_ops.PullTarget) !
         .ahead = target.ahead,
         .behind = target.behind,
     };
+}
+
+test "Changes raw diff paths reach the Git index without touching namesakes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const git_command = @import("../../../git/command.zig");
+    const git_read = @import("../../../git/read.zig");
+    const backend = @import("../../../git/operations.zig");
+    const parser = @import("../../../diff/parser.zig");
+    const file_tree = @import("../../../file_tree.zig");
+    const git_status = @import("../../../git/status.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const names = [_][]const u8{ "trailing.txt ", "日本\t.txt", "choice*.txt", "mode.txt", "binary.dat", "a/victim", "b/victim" };
+    const init = try pathTestCommand(tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+    allocator.free(init);
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    for (names ++ .{ "choice-other.txt", "rename-old.txt" }) |name|
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "base\n" });
+    for ([_][]const []const u8{
+        &.{ "git", "config", "core.fileMode", "true" },
+        &.{ "git", "config", "core.quotePath", "true" },
+        &.{ "git", "add", "--all" },
+        &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" },
+    }) |argv| allocator.free(try pathTestCommand(tmp.dir, argv));
+    try tmp.dir.writeFile(io, .{ .sub_path = "trailing.txt", .data = "UNTRACKED namesake\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "choice-other.txt", .data = "CANARY staged\n" });
+    allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "add", "--", "choice-other.txt" }));
+    try tmp.dir.writeFile(io, .{ .sub_path = "choice-other.txt", .data = "CANARY worktree\n" });
+    var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+    defer environment.deinit();
+    const git_context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+
+    for (names) |name| {
+        const mode_only = std.mem.eql(u8, name, "mode.txt");
+        const expected = if (mode_only) "base\n" else if (std.mem.eql(u8, name, "binary.dat")) "changed\x00binary\n" else "selected\n";
+        if (mode_only) {
+            allocator.free(try pathTestCommand(tmp.dir, &.{ "chmod", "+x", name }));
+        } else {
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = expected });
+        }
+        const raw_diff = try git_read.loadDiff(allocator, io, .{ .context = git_context, .kind = .unstaged });
+        defer raw_diff.deinit(allocator);
+        try std.testing.expect(raw_diff == .ok);
+        const raw_status = try git_read.loadStatus(allocator, io, .{ .context = git_context });
+        defer raw_status.deinit(allocator);
+        try std.testing.expect(raw_status == .ok);
+        var status = try git_status.StatusBundle.parseOwned(allocator, raw_status.ok);
+        defer status.deinit();
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const document = try parser.parse(arena.allocator(), raw_diff.ok);
+        const tree = try file_tree.buildWithStatus(arena.allocator(), document, status.document);
+        var selected_node: ?usize = null;
+        for (tree.nodes, 0..) |node, index| {
+            if (node.kind != .file or !std.mem.eql(u8, node.path_key, name)) continue;
+            try std.testing.expect(selected_node == null); // diff/status merge yields one row
+            selected_node = index;
+        }
+        const node = tree.nodes[selected_node.?];
+        try std.testing.expect(node.target == .diff_file);
+        const file = document.files[node.target.diff_file];
+        try std.testing.expectEqualStrings(name, file.old_path.?);
+        try std.testing.expectEqualStrings(name, file.new_path.?);
+        if (mode_only or std.mem.eql(u8, name, "binary.dat"))
+            try std.testing.expectEqual(@as(usize, 0), file.hunks.len);
+        var loaded = test_support.loadedDiffOne();
+        loaded.document = document;
+        loaded.tree = tree;
+        var page: changes_page.ChangesPageState = .{
+            .load = test_support.loadState(loaded),
+            .viewer = .{ .selected_node = selected_node.?, .selected_target = .{ .diff_file = node.target.diff_file } },
+        };
+        defer page.git_status.deinit();
+        try page.git_status.replace("/repo", &status);
+        acceptTestSource(&page);
+        const target = testView(&page, .unstaged).stageTarget();
+        try std.testing.expect(target == .ready);
+        try std.testing.expectEqual(git_ops.TargetKind.file, target.ready.kind);
+        try std.testing.expectEqualStrings(name, target.ready.path);
+        const result = try backend.runOperation(allocator, io, .{ .context = git_context, .kind = .{ .stage_file = target.ready.path } });
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .ok);
+        const index_spec = try std.fmt.allocPrint(allocator, ":{s}", .{name});
+        defer allocator.free(index_spec);
+        const index_bytes = try pathTestCommand(tmp.dir, &.{ "git", "show", index_spec });
+        defer allocator.free(index_bytes);
+        try std.testing.expectEqualStrings(expected, index_bytes);
+        if (mode_only) {
+            const index_mode = try pathTestCommand(tmp.dir, &.{ "git", "ls-files", "--stage", "--", name });
+            defer allocator.free(index_mode);
+            try std.testing.expect(std.mem.startsWith(u8, index_mode, "100755 "));
+        }
+        const canary_index = try pathTestCommand(tmp.dir, &.{ "git", "show", ":choice-other.txt" });
+        defer allocator.free(canary_index);
+        try std.testing.expectEqualStrings("CANARY staged\n", canary_index);
+        const canary_worktree = try tmp.dir.readFileAlloc(io, "choice-other.txt", allocator, .limited(1024));
+        defer allocator.free(canary_worktree);
+        try std.testing.expectEqualStrings("CANARY worktree\n", canary_worktree);
+        const namesake_index = try pathTestCommand(tmp.dir, &.{ "git", "ls-files", "--stage", "--", "trailing.txt" });
+        defer allocator.free(namesake_index);
+        try std.testing.expectEqualStrings("", namesake_index);
+        const namesake_worktree = try tmp.dir.readFileAlloc(io, "trailing.txt", allocator, .limited(1024));
+        defer allocator.free(namesake_worktree);
+        try std.testing.expectEqualStrings("UNTRACKED namesake\n", namesake_worktree);
+        allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree", "--", name }));
+    }
+
+    allocator.free(try pathTestCommand(tmp.dir, &.{ "git", "mv", "rename-old.txt", "a/renamed.txt" }));
+    const rename_patch = try pathTestCommand(tmp.dir, &.{ "git", "diff", "--cached", "--find-renames", "--", "rename-old.txt", "a/renamed.txt" });
+    defer allocator.free(rename_patch);
+    var renamed = try parser.parse(allocator, rename_patch);
+    defer renamed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), renamed.files.len);
+    try std.testing.expectEqual(@as(usize, 0), renamed.files[0].hunks.len);
+    try std.testing.expectEqualStrings("rename-old.txt", renamed.files[0].old_path.?);
+    try std.testing.expectEqualStrings("a/renamed.txt", renamed.files[0].new_path.?);
+    const rename_status = try git_read.loadStatus(allocator, io, .{ .context = git_context });
+    defer rename_status.deinit(allocator);
+    try std.testing.expect(rename_status == .ok);
+    var rename_bundle = try git_status.StatusBundle.parseOwned(allocator, rename_status.ok);
+    defer rename_bundle.deinit();
+    var rename_arena = std.heap.ArenaAllocator.init(allocator);
+    defer rename_arena.deinit();
+    const rename_tree = try file_tree.buildWithStatus(rename_arena.allocator(), renamed, rename_bundle.document);
+    const renamed_node = rename_tree.nodes[rename_tree.selectedNodeIndex(0).?];
+    try std.testing.expectEqualStrings("a/renamed.txt", renamed_node.path_key);
+    try std.testing.expectEqual(file_tree.StagePresence.staged_only, renamed_node.stage_presence);
+    var rename_rows: usize = 0;
+    for (rename_tree.nodes) |node| {
+        if (node.kind == .file and std.mem.eql(u8, node.path_key, "a/renamed.txt")) rename_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rename_rows);
+}
+
+fn pathTestCommand(cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
+    const allocator = std.testing.allocator;
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return result.stdout,
+        else => {},
+    }
+    return error.GitCommandFailed;
 }
 
 test "owned operation proposal frees every cloned field" {

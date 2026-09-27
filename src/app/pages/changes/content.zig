@@ -310,7 +310,7 @@ fn selectedSidebarTarget(view: navigation.View) ?SidebarTarget {
     return switch (node.target) {
         .repo_root => .{ .kind = .repository, .path = "" },
         .directory => |path| .{ .kind = .directory, .path = if (path.len > 0) path else node.path },
-        .diff_file, .status_entry => .{ .kind = .file, .path = if (node.path_key.len > 0) node.path_key else node.path },
+        .diff_file, .status_entry => if (node.path_key.len > 0) .{ .kind = .file, .path = node.path_key } else null,
     };
 }
 

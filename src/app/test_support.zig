@@ -168,43 +168,43 @@ pub fn loadedDiffBinaryOnly() LoadedDiff {
 }
 
 pub const tree_one_nodes = [_]file_tree.Node{
-    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 } },
 };
 
 pub const tree_two_nodes = [_]file_tree.Node{
-    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
-    .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .diff_file = 1 } },
+    .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "b", .path_key = "b", .depth = 0, .target = .{ .diff_file = 1 } },
 };
 
 pub const tree_file_one_first_nodes = [_]file_tree.Node{
-    .{ .kind = .file, .name = "b", .path = "b", .depth = 0, .target = .{ .diff_file = 1 } },
-    .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "b", .path_key = "b", .depth = 0, .target = .{ .diff_file = 1 } },
+    .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 } },
 };
 
 pub const tree_nested_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
-    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
-    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
+    .{ .kind = .file, .name = "a", .path = "src/a", .path_key = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .path_key = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
 };
 
 pub const tree_rooted_nested_nodes = [_]file_tree.Node{
     .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 1 },
-    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 2, .target = .{ .diff_file = 0 } },
-    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 2, .target = .{ .diff_file = 1 } },
+    .{ .kind = .file, .name = "a", .path = "src/a", .path_key = "src/a", .depth = 2, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .path_key = "src/b", .depth = 2, .target = .{ .diff_file = 1 } },
 };
 
 pub const tree_non_contiguous_nodes = [_]file_tree.Node{
     .{ .kind = .directory, .name = "src", .path = "src", .depth = 0 },
-    .{ .kind = .file, .name = "a", .path = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "a", .path = "src/a", .path_key = "src/a", .depth = 1, .target = .{ .diff_file = 0 } },
     .{ .kind = .directory, .name = "lib", .path = "lib", .depth = 0 },
-    .{ .kind = .file, .name = "c", .path = "lib/c", .depth = 1, .target = .{ .diff_file = 0 } },
-    .{ .kind = .file, .name = "b", .path = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
+    .{ .kind = .file, .name = "c", .path = "lib/c", .path_key = "lib/c", .depth = 1, .target = .{ .diff_file = 0 } },
+    .{ .kind = .file, .name = "b", .path = "src/b", .path_key = "src/b", .depth = 1, .target = .{ .diff_file = 1 } },
 };
 
 pub const tree_two_status_nodes = [_]file_tree.Node{
-    .{ .kind = .file, .name = "added.zig", .path = "src/added.zig", .depth = 1, .target = .{ .diff_file = 0 }, .status = .added },
-    .{ .kind = .file, .name = "deleted.zig", .path = "src/deleted.zig", .depth = 1, .target = .{ .diff_file = 1 }, .status = .deleted },
+    .{ .kind = .file, .name = "added.zig", .path = "src/added.zig", .path_key = "src/added.zig", .depth = 1, .target = .{ .diff_file = 0 }, .status = .added },
+    .{ .kind = .file, .name = "deleted.zig", .path = "src/deleted.zig", .path_key = "src/deleted.zig", .depth = 1, .target = .{ .diff_file = 1 }, .status = .deleted },
 };
 
 pub const files_one = [_]diff_parser.FileDiff{

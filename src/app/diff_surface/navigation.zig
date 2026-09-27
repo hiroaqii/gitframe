@@ -212,7 +212,7 @@ pub const View = struct {
         return switch (node.kind) {
             .repo_root => .repo_root,
             .directory => .{ .directory = node.path },
-            .file => .{ .file = if (node.path_key.len > 0) node.path_key else node.path },
+            .file => if (node.path_key.len > 0) .{ .file = node.path_key } else null,
         };
     }
 
@@ -2666,9 +2666,8 @@ pub fn findNodeBySidebarIdentity(
                 if (node.kind == .directory and std.mem.eql(u8, node.path, path)) return index;
             },
             .file => |path_key| {
-                if (node.kind != .file) continue;
-                const node_key = if (node.path_key.len > 0) node.path_key else node.path;
-                if (std.mem.eql(u8, node_key, path_key)) return index;
+                if (node.kind != .file or node.path_key.len == 0) continue;
+                if (std.mem.eql(u8, node.path_key, path_key)) return index;
             },
         }
     }
@@ -2677,9 +2676,8 @@ pub fn findNodeBySidebarIdentity(
 
 pub fn findFileNodeByPathKey(loaded: *const LoadedDiff, path_key: []const u8) ?usize {
     for (loaded.tree.nodes, 0..) |node, index| {
-        if (node.kind != .file) continue;
-        const node_key = if (node.path_key.len > 0) node.path_key else node.path;
-        if (std.mem.eql(u8, node_key, path_key)) return index;
+        if (node.kind != .file or node.path_key.len == 0) continue;
+        if (std.mem.eql(u8, node.path_key, path_key)) return index;
     }
     return null;
 }

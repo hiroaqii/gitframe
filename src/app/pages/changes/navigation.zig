@@ -1945,6 +1945,7 @@ fn typedActionNode(
         };
         if (!kind_matches) continue;
         if (target.kind == .repository_root) return index;
+        if (target.kind == .file and node.path_key.len == 0) continue;
         const node_key = if (node.path_key.len > 0) node.path_key else node.path;
         if (std.mem.eql(u8, node_key, target.path_key)) return index;
     }
@@ -2905,7 +2906,7 @@ test "unified body always selects complete marker-prefixed diff rows" {
         }},
     }};
     const eligibility = [_]loaded_diff.FileTextEligibility{.selectable_utf8};
-    const tree = [_]file_tree.Node{.{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } }};
+    const tree = [_]file_tree.Node{.{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 } }};
     const loaded: loaded_diff.LoadedDiff = .{
         .text = "",
         .document = .{ .files = &files },
@@ -4470,13 +4471,13 @@ test "body file navigation follows filtered tree order through folds binary and 
     const allocator = std.testing.allocator;
     const files = app_test_support.files_two ++ app_test_support.files_binary_only;
     const nodes = [_]file_tree.Node{
-        .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 }, .status = .modified },
+        .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 }, .status = .modified },
         .{ .kind = .directory, .name = "nested", .path = "nested", .depth = 0 },
-        .{ .kind = .file, .name = "added", .path = "nested/added", .depth = 1, .target = .{ .status_entry = 0 }, .status = .added },
-        .{ .kind = .file, .name = "b", .path = "nested/b", .depth = 1, .target = .{ .diff_file = 1 }, .status = .modified },
-        .{ .kind = .file, .name = "bin", .path = "nested/bin", .depth = 1, .target = .{ .diff_file = 2 }, .status = .binary },
+        .{ .kind = .file, .name = "added", .path = "nested/added", .path_key = "nested/added", .depth = 1, .target = .{ .status_entry = 0 }, .status = .added },
+        .{ .kind = .file, .name = "b", .path = "nested/b", .path_key = "nested/b", .depth = 1, .target = .{ .diff_file = 1 }, .status = .modified },
+        .{ .kind = .file, .name = "bin", .path = "nested/bin", .path_key = "nested/bin", .depth = 1, .target = .{ .diff_file = 2 }, .status = .binary },
         .{ .kind = .directory, .name = "other", .path = "other", .depth = 0 },
-        .{ .kind = .file, .name = "last", .path = "last", .depth = 0, .target = .{ .status_entry = 1 }, .status = .modified },
+        .{ .kind = .file, .name = "last", .path = "last", .path_key = "last", .depth = 0, .target = .{ .status_entry = 1 }, .status = .modified },
     };
     var reviewed = [_]bool{ false, true, false };
     var loaded = app_test_support.loadedDiffTwo();
@@ -4948,9 +4949,9 @@ test "changes transition exact lookup skips colliding directories before files" 
         .root_identity = identity,
     };
     defer legacy_app.clearLoadedDiff();
-    try expectExactPathReady(
+    try expectExactPathUnavailable(
         legacy_app.changesNavigation().exactPathTarget(exactChangesIntent(&legacy_app, "legacy")),
-        1,
+        .path_not_found,
     );
 }
 
@@ -5115,8 +5116,8 @@ test "changes transition exact reveal expands only target ancestors and selects 
 test "changes transition exact reveal selects status-only and reports unchanged" {
     const identity: root_capability.Identity = .{ .device = 3, .inode = 5 };
     const nodes = [_]file_tree.Node{
-        .{ .kind = .file, .name = "a", .path = "a", .depth = 0, .target = .{ .diff_file = 0 } },
-        .{ .kind = .file, .name = "new.zig", .path = "new.zig", .depth = 0, .target = .{ .status_entry = 0 }, .status = .added },
+        .{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 } },
+        .{ .kind = .file, .name = "new.zig", .path = "new.zig", .path_key = "new.zig", .depth = 0, .target = .{ .status_entry = 0 }, .status = .added },
     };
     var app: TestHarness = .{
         .pages = .{ .changes = .{
@@ -5976,6 +5977,74 @@ test "hunk stage presentation uses all-staged only for fresh staged-only status"
     try std.testing.expectEqual(diff_render.HunkStageState.staged, other_repo.stateForHunk(1));
 }
 
+test "Changes unknown path stays viewable without file action or restoration identity" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const patch = "diff --git a/unresolved/old b/unresolved/new\n@@ -1 +1 @@\n-old\n+new\n";
+    const document = try diff_parser.parse(arena.allocator(), patch);
+    var status = try git_status.StatusBundle.parseOwned(allocator, " M Unknown path\x00");
+    defer status.deinit();
+    const tree = try file_tree.buildWithStatus(arena.allocator(), document, status.document);
+    try std.testing.expectEqual(@as(usize, 2), tree.nodes.len);
+    const unknown = tree.selectedNodeIndex(0).?;
+    try std.testing.expectEqualStrings("Unknown path", tree.nodes[unknown].path);
+    try std.testing.expectEqualStrings("", tree.nodes[unknown].path_key);
+    try std.testing.expectEqual(@as(u16, 0), tree.nodes[unknown].depth);
+    try std.testing.expectEqual(file_tree.StagePresence.clean_or_unknown, tree.nodes[unknown].stage_presence);
+    try std.testing.expectEqualStrings("diff --git a/unresolved/old b/unresolved/new", document.files[0].header);
+
+    var loaded = test_support.loadedDiffOne();
+    loaded.document = document;
+    loaded.tree = tree;
+    var page: changes_page.ChangesPageState = .{
+        .load = test_support.loadState(loaded),
+        .viewer = .{ .selected_node = unknown, .selected_target = .{ .diff_file = 0 } },
+    };
+    defer page.git_status.deinit();
+    try page.git_status.replace("/repo", &status);
+    page.activation.state = .{ .active = .{
+        .activation_id = 1,
+        .repo_epoch = 0,
+        .members = .{ .source = .fresh, .status = .fresh, .branch = .fresh },
+    } };
+    const view: View = .{ .page = &page, .repo_root = "/repo", .source = .unstaged, .layout = .{ .width = 100, .height = 40 } };
+    const operations: @import("operations.zig").View = .{
+        .page = &page,
+        .navigation = view,
+        .repo_root = "/repo",
+        .source = .unstaged,
+        .activation_state = page.activation.state,
+    };
+    const content: @import("content.zig").View = .{ .page = &page, .navigation = view, .repo_root = "/repo", .source = .unstaged };
+    const selection = view.diffFileSelection(&loaded, 0).?.diff_file;
+    try std.testing.expectEqual(@as(usize, 0), selection.file_index);
+    try std.testing.expect(selection.path_key == null);
+    try std.testing.expectEqual(@as(usize, 1), view.selectedFile().?.hunks.len);
+    try std.testing.expect(operations.selectedSidebarActionTarget() == null);
+    try std.testing.expect(operations.stageTarget() == .no_path);
+    try std.testing.expect(operations.unstageTarget() == .no_path);
+    try std.testing.expect(operations.discardTarget() == .no_path);
+    try std.testing.expect(content.editorTarget() == .no_path);
+    try std.testing.expect(view.selectedSidebarIdentity() == null);
+    try std.testing.expect(findNodeBySidebarIdentity(&loaded, .{ .file = "" }) == null);
+    try std.testing.expect(findFileNodeByPathKey(&loaded, "") == null);
+    const empty_target: changes_page.action_cursor.Target = .{ .kind = .file, .path_key = &.{}, .visible_row = 0 };
+    try std.testing.expect(typedActionNode(&loaded, &empty_target) == null);
+
+    const real = findFileNodeByPathKey(&loaded, "Unknown path").?;
+    try std.testing.expect(real != unknown);
+    try std.testing.expectEqual(real, findNodeBySidebarIdentity(&loaded, .{ .file = "Unknown path" }).?);
+    var raw_name = "Unknown path".*;
+    const real_target: changes_page.action_cursor.Target = .{ .kind = .file, .path_key = &raw_name, .visible_row = 0 };
+    try std.testing.expectEqual(real, typedActionNode(&loaded, &real_target).?);
+    page.viewer.selected_node = real;
+    page.viewer.selected_target = .{ .status_only = tree.nodes[real].target.status_entry };
+    try std.testing.expectEqualStrings("Unknown path", view.selectedSidebarIdentity().?.file);
+    try std.testing.expectEqualStrings("Unknown path", operations.stageTarget().ready.path);
+    try std.testing.expectEqualStrings("Unknown path", content.editorTarget().ready.path);
+}
+
 test "typed action cursor remaps a directory without changing the sticky diff target" {
     var app: TestHarness = .{
         .pages = .{ .changes = .{
@@ -6094,9 +6163,9 @@ test "filtered directory action cursor falls back to repository root instead of 
     const nodes = [_]file_tree.Node{
         .{ .kind = .repo_root, .name = "repo", .path = "", .depth = 0, .target = .repo_root },
         .{ .kind = .directory, .name = "src", .path = "src", .depth = 1 },
-        .{ .kind = .file, .name = "a", .path = "src/a", .depth = 2, .target = .{ .diff_file = 0 }, .status = .modified },
+        .{ .kind = .file, .name = "a", .path = "src/a", .path_key = "src/a", .depth = 2, .target = .{ .diff_file = 0 }, .status = .modified },
         .{ .kind = .directory, .name = "lib", .path = "lib", .depth = 1 },
-        .{ .kind = .file, .name = "b", .path = "lib/b", .depth = 2, .target = .{ .diff_file = 1 }, .status = .added },
+        .{ .kind = .file, .name = "b", .path = "lib/b", .path_key = "lib/b", .depth = 2, .target = .{ .diff_file = 1 }, .status = .added },
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var loaded = app_test_support.loadedDiffTwo();
