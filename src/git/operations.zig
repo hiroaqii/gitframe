@@ -7,6 +7,7 @@
 const std = @import("std");
 const git_command = @import("command.zig");
 const git_ref = @import("ref.zig");
+const git_read = @import("read.zig");
 const process_runner = @import("../process/runner.zig");
 
 pub const OperationResult = union(enum) {
@@ -68,7 +69,7 @@ pub fn runOperation(
         .stage_file => |path| runGitAdd(allocator, io, request.context, path),
         .unstage_file => |path| runGitUnstage(allocator, io, request.context, path),
         .stage_all => runGitAddAll(allocator, io, request.context),
-        .unstage_all => runGitUnstageAll(allocator, io, request.context),
+        .unstage_all => runGitUnstage(allocator, io, request.context, "."),
         .discard_file => |path| runGitDiscard(allocator, io, request.context, path),
         .stage_patch => |patch| runGitApplyCached(allocator, io, request.context, patch.patch),
         .unstage_patch => |patch| runGitApplyCachedReverse(allocator, io, request.context, patch.patch),
@@ -182,21 +183,32 @@ fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, context: git_command.Dire
 }
 
 fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, path: []const u8) git_command.Error!OperationResult {
-    const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "restore", "--staged", "--", path };
-    const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
-    return operationResultFromGitCommand(allocator, result, "git restore --staged");
+    var head = (try git_read.readHeadBasis(allocator, io, context)) orelse
+        return .{ .failed = allocator.dupe(u8, "Cannot determine a valid HEAD; unstage was not started") catch return error.OutOfMemory };
+    defer head.deinit(allocator);
+    const pathspec = std.fmt.allocPrint(allocator, "{s}\x00", .{path}) catch return error.OutOfMemory;
+    defer allocator.free(pathspec);
+    const detailed = switch (head) {
+        .oid => |oid| blk: {
+            const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{
+                "restore", "--staged", "--source", oid, "--pathspec-from-file=-", "--pathspec-file-nul", "--",
+            };
+            break :blk try runWithStdinDetailed(allocator, io, context, &argv, pathspec);
+        },
+        .unborn => blk: {
+            const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{
+                "rm", "--cached", "-f", "-r", "--quiet", "--pathspec-from-file=-", "--pathspec-file-nul", "--",
+            };
+            break :blk try runWithStdinDetailed(allocator, io, context, &argv, pathspec);
+        },
+    };
+    return operationResultFromGitStdinCommand(allocator, detailed, if (head == .unborn) "git rm --cached" else "git restore --staged");
 }
 
 fn runGitAddAll(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext) git_command.Error!OperationResult {
     const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "add", "--all", "--", "." };
     const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
     return operationResultFromGitCommand(allocator, result, "git add --all");
-}
-
-fn runGitUnstageAll(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext) git_command.Error!OperationResult {
-    const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{ "restore", "--staged", "--", "." };
-    const result = try runCaptured(allocator, io, context, &argv, .limited(64 * 1024), .limited(256 * 1024));
-    return operationResultFromGitCommand(allocator, result, "git restore --staged");
 }
 
 fn runGitDiscard(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, path: []const u8) git_command.Error!OperationResult {
@@ -450,6 +462,156 @@ test "stdin admission Git mapping keeps writer error with zero-exit warning" {
     }
 }
 
+test "unstage preserves index units and worktree bytes with unborn or normal HEAD" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = enum { unborn_file, unborn_directory, unborn_all, normal_add, normal_delete };
+    for (std.enums.values(Case)) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+        try tmp.dir.createDirPath(io, "picked");
+        const selected = "picked/choice*.txt ";
+        const names = [_][]const u8{ selected, "picked/other.txt", "guard.txt" };
+        for (names) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "base\n", .flags = .{ .permissions = .executable_file } });
+        try runTestGit(io, &.{ "git", "add", "--all" }, tmp.dir);
+        const unborn = switch (case) {
+            .unborn_file, .unborn_directory, .unborn_all => true,
+            .normal_add, .normal_delete => false,
+        };
+        if (!unborn) try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, tmp.dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = "guard.txt", .data = "guard staged\x00bytes\n" });
+        try runTestGit(io, &.{ "git", "add", "--", "guard.txt" }, tmp.dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = "guard.txt", .data = "guard worktree\r\n" });
+        const expected_index = switch (case) {
+            .unborn_file => try gitOutputAlloc(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z", "--", "picked/other.txt", "guard.txt" }),
+            .unborn_directory => try gitOutputAlloc(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z", "--", "guard.txt" }),
+            .unborn_all => try allocator.dupe(u8, ""),
+            .normal_add, .normal_delete => try gitOutputAlloc(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z" }),
+        };
+        defer allocator.free(expected_index);
+        const target = if (case == .normal_add) "picked/added.txt" else selected;
+        if (case == .normal_delete) {
+            try tmp.dir.deleteFile(io, target);
+        } else {
+            try tmp.dir.writeFile(io, .{ .sub_path = target, .data = "selected staged\x00bytes\n" });
+        }
+        try runTestGit(io, &.{ "git", "--literal-pathspecs", "add", "--", target }, tmp.dir);
+        if (case != .normal_delete) try tmp.dir.writeFile(io, .{ .sub_path = target, .data = "selected worktree\r\n" });
+        const guard_mode = (try tmp.dir.statFile(io, "guard.txt", .{})).permissions;
+        const other_mode = (try tmp.dir.statFile(io, "picked/other.txt", .{})).permissions;
+        const target_mode = if (case != .normal_delete) (try tmp.dir.statFile(io, target, .{})).permissions else null;
+        var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+        defer environment.deinit();
+        const kind: OperationKind = switch (case) {
+            .unborn_all => .unstage_all,
+            .unborn_directory => .{ .unstage_file = "picked" },
+            else => .{ .unstage_file = target },
+        };
+        const result = try runOperation(allocator, io, .{ .context = .{ .cwd = tmp.dir, .environment = &environment }, .kind = kind });
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .ok);
+        const index_after = try gitOutputAlloc(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z" });
+        defer allocator.free(index_after);
+        try std.testing.expectEqualStrings(expected_index, index_after);
+        if (case != .unborn_all) try expectIndexBlobForTest(tmp.dir, "guard.txt", "guard staged\x00bytes\n");
+        if (case == .unborn_file) try expectIndexBlobForTest(tmp.dir, "picked/other.txt", "base\n");
+        if (case == .normal_delete) try expectIndexBlobForTest(tmp.dir, target, "base\n");
+        const guard = try tmp.dir.readFileAlloc(io, "guard.txt", allocator, .limited(1024));
+        defer allocator.free(guard);
+        try std.testing.expectEqualStrings("guard worktree\r\n", guard);
+        try std.testing.expectEqual(guard_mode, (try tmp.dir.statFile(io, "guard.txt", .{})).permissions);
+        if (target_mode) |mode| {
+            const worktree = try tmp.dir.readFileAlloc(io, target, allocator, .limited(1024));
+            defer allocator.free(worktree);
+            try std.testing.expectEqualStrings("selected worktree\r\n", worktree);
+            try std.testing.expectEqual(mode, (try tmp.dir.statFile(io, target, .{})).permissions);
+        } else {
+            try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, target, .{}));
+        }
+        const other = try tmp.dir.readFileAlloc(io, "picked/other.txt", allocator, .limited(1024));
+        defer allocator.free(other);
+        try std.testing.expectEqualStrings("base\n", other);
+        try std.testing.expectEqual(other_mode, (try tmp.dir.statFile(io, "picked/other.txt", .{})).permissions);
+        if (case == .normal_add) {
+            const original = try tmp.dir.readFileAlloc(io, selected, allocator, .limited(1024));
+            defer allocator.free(original);
+            try std.testing.expectEqualStrings("base\n", original);
+            try std.testing.expectEqual(other_mode, (try tmp.dir.statFile(io, selected, .{})).permissions);
+        }
+    }
+}
+
+test "unstage refuses abnormal HEAD and preserves bytes on index lock failures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = enum { broken_ref, missing_nonbranch, direct_tree, normal_lock, unborn_lock };
+    for (std.enums.values(Case)) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+        for ([_][]const u8{ "selected.txt", "guard.txt" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "base\n" });
+        try runTestGit(io, &.{ "git", "add", "--all" }, tmp.dir);
+        if (case != .unborn_lock) try runTestGit(io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" }, tmp.dir);
+        for ([_][]const u8{ "selected.txt", "guard.txt" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "staged\x00bytes\n" });
+        try runTestGit(io, &.{ "git", "add", "--all" }, tmp.dir);
+        for ([_][]const u8{ "selected.txt", "guard.txt" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "worktree\r\n" });
+        switch (case) {
+            .broken_ref => try tmp.dir.writeFile(io, .{ .sub_path = ".git/refs/heads/main", .data = "not-an-object-id\n" }),
+            .missing_nonbranch => try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/tags/missing\n" }),
+            .direct_tree => {
+                const tree = try gitOutputAlloc(io, tmp.dir, &.{ "git", "rev-parse", "HEAD^{tree}" });
+                defer allocator.free(tree);
+                try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = tree });
+            },
+            .normal_lock, .unborn_lock => try tmp.dir.writeFile(io, .{ .sub_path = ".git/index.lock", .data = "held\n" }),
+        }
+        const index_before = try tmp.dir.readFileAlloc(io, ".git/index", allocator, .limited(64 * 1024));
+        defer allocator.free(index_before);
+        const mode_before = (try tmp.dir.statFile(io, "selected.txt", .{})).permissions;
+        var environment = try git_command.LocalGitEnvironment.initFromParent(allocator, null);
+        defer environment.deinit();
+        const result = try runOperation(allocator, io, .{
+            .context = .{ .cwd = tmp.dir, .environment = &environment },
+            .kind = .{ .unstage_file = "selected.txt" },
+        });
+        defer result.deinit(allocator);
+        switch (case) {
+            .broken_ref, .missing_nonbranch, .direct_tree => {
+                try std.testing.expect(result == .failed);
+                try std.testing.expectEqualStrings("Cannot determine a valid HEAD; unstage was not started", result.failed);
+            },
+            .normal_lock, .unborn_lock => try std.testing.expect(result == .failed),
+        }
+        const index_after = try tmp.dir.readFileAlloc(io, ".git/index", allocator, .limited(64 * 1024));
+        defer allocator.free(index_after);
+        try std.testing.expectEqualSlices(u8, index_before, index_after);
+        try std.testing.expectEqual(mode_before, (try tmp.dir.statFile(io, "selected.txt", .{})).permissions);
+        for ([_][]const u8{ "selected.txt", "guard.txt" }) |name| {
+            try expectIndexBlobForTest(tmp.dir, name, "staged\x00bytes\n");
+            try std.testing.expectEqual(mode_before, (try tmp.dir.statFile(io, name, .{})).permissions);
+            const bytes = try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024));
+            defer allocator.free(bytes);
+            try std.testing.expectEqualStrings("worktree\r\n", bytes);
+        }
+    }
+}
+
+fn expectIndexBlobForTest(dir: std.Io.Dir, path: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const record = try gitOutputAlloc(std.testing.io, dir, &.{ "git", "--literal-pathspecs", "ls-files", "--stage", "-z", "--", path });
+    defer allocator.free(record);
+    const tab = std.mem.indexOfScalar(u8, record, '\t') orelse return error.MissingIndexEntry;
+    try std.testing.expectEqualStrings(path, record[tab + 1 .. record.len - 1]);
+    var fields = std.mem.tokenizeScalar(u8, record[0..tab], ' ');
+    _ = fields.next() orelse return error.MissingIndexMode;
+    const oid = fields.next() orelse return error.MissingIndexOid;
+    try std.testing.expectEqualStrings("0", fields.next().?);
+    const blob = try gitOutputAlloc(std.testing.io, dir, &.{ "git", "cat-file", "blob", oid });
+    defer allocator.free(blob);
+    try std.testing.expectEqualSlices(u8, expected, blob);
+}
+
 test "literal path operations and reads preserve unselected index and worktree bytes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -465,7 +627,8 @@ test "literal path operations and reads preserve unselected index and worktree b
     defer environment.deinit();
     const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
 
-    for (names) |name| {
+    for (names, 0..) |name, name_index| {
+        if (name_index == 3) try runTestGit(io, &.{ "git", "switch", "--detach" }, tmp.dir);
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "selected\n" });
         try tmp.dir.writeFile(io, .{ .sub_path = "choice-other.txt", .data = "CANARY staged\n" });
         for ([_]read.FileDiffBase{ .unstaged, .cached }) |base| {

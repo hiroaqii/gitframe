@@ -253,11 +253,49 @@ fn loadRepositoryPathHistoryWithHook(
     return .{ .known = .{ .head = before, .fact = fact } };
 }
 
-fn readHeadBasis(
+/// Resolve a commit-backed HEAD or an unborn branch; reject unknown HEAD state.
+pub fn readHeadBasis(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: git_command.DirectoryContext,
 ) git_command.Error!?HeadBasis {
+    const symbolic_result = try runPathHistoryCommand(
+        allocator,
+        io,
+        context,
+        &.{ "git", "--no-optional-locks", "symbolic-ref", "--quiet", "--no-recurse", "HEAD" },
+    );
+    defer symbolic_result.deinit(allocator);
+    var terminal_result: ?process_runner.Result = null;
+    defer if (terminal_result) |result| result.deinit(allocator);
+    var branch: ?[]const u8 = null;
+    if (exitedWith(symbolic_result.term, 0)) {
+        const direct = exactLine(symbolic_result.stdout) orelse return null;
+        if (symbolic_result.stderr.len != 0 or !std.mem.startsWith(u8, direct, "refs/heads/")) return null;
+        const format = try runPathHistoryCommand(allocator, io, context, &.{ "git", "check-ref-format", direct });
+        defer format.deinit(allocator);
+        if (!exitedWith(format.term, 0) or format.stdout.len != 0 or format.stderr.len != 0) return null;
+
+        terminal_result = try runPathHistoryCommand(
+            allocator,
+            io,
+            context,
+            &.{ "git", "--no-optional-locks", "symbolic-ref", "--quiet", "HEAD" },
+        );
+        const terminal = terminal_result.?;
+        if (!exitedWith(terminal.term, 0) or terminal.stderr.len != 0) return null;
+        const reference = exactLine(terminal.stdout) orelse return null;
+        if (!std.mem.startsWith(u8, reference, "refs/heads/")) return null;
+        if (!std.mem.eql(u8, direct, reference)) {
+            const terminal_format = try runPathHistoryCommand(allocator, io, context, &.{ "git", "check-ref-format", reference });
+            defer terminal_format.deinit(allocator);
+            if (!exitedWith(terminal_format.term, 0) or terminal_format.stdout.len != 0 or terminal_format.stderr.len != 0) return null;
+        }
+        branch = reference;
+    } else if (!exitedWith(symbolic_result.term, 1) or symbolic_result.stdout.len != 0 or symbolic_result.stderr.len != 0) {
+        return null;
+    }
+
     const oid_result = try runPathHistoryCommand(
         allocator,
         io,
@@ -267,21 +305,14 @@ fn readHeadBasis(
     defer oid_result.deinit(allocator);
     if (exitedWith(oid_result.term, 0)) {
         const oid = exactLine(oid_result.stdout) orelse return null;
-        if (!validObjectId(oid)) return null;
+        if (oid_result.stderr.len != 0 or !validObjectId(oid)) return null;
+        const object_type = try runPathHistoryCommand(allocator, io, context, &.{ "git", "--no-optional-locks", "cat-file", "-t", oid });
+        defer object_type.deinit(allocator);
+        if (!exitedWith(object_type.term, 0) or object_type.stderr.len != 0 or !std.mem.eql(u8, object_type.stdout, "commit\n")) return null;
         return .{ .oid = allocator.dupe(u8, oid) catch return error.OutOfMemory };
     }
-
-    const symbolic_result = try runPathHistoryCommand(
-        allocator,
-        io,
-        context,
-        &.{ "git", "--no-optional-locks", "symbolic-ref", "-q", "HEAD" },
-    );
-    defer symbolic_result.deinit(allocator);
-    if (!exitedWith(symbolic_result.term, 0)) return null;
-    const reference = exactLine(symbolic_result.stdout) orelse return null;
-    if (!std.mem.startsWith(u8, reference, "refs/") or reference.len <= "refs/".len) return null;
-
+    if (!exitedWith(oid_result.term, 128)) return null;
+    const reference = branch orelse return null;
     const ref_result = try runPathHistoryCommand(
         allocator,
         io,
@@ -289,7 +320,7 @@ fn readHeadBasis(
         &.{ "git", "--no-optional-locks", "show-ref", "--verify", "--quiet", reference },
     );
     defer ref_result.deinit(allocator);
-    if (!exitedWith(ref_result.term, 1) or ref_result.stdout.len != 0) return null;
+    if (!exitedWith(ref_result.term, 1) or ref_result.stdout.len != 0 or ref_result.stderr.len != 0) return null;
     return .unborn;
 }
 
