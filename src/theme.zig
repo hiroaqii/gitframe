@@ -116,9 +116,9 @@ pub const Palette = struct {
         palette.set(.foreground, .default);
         palette.set(.accent, .{ .index = 14 });
         palette.set(.muted, .{ .rgb = .{ 92, 102, 122 } });
-        palette.set(.prompt, .{ .index = 11 });
+        palette.set(.prompt, .{ .rgb = .{ 241, 219, 174 } });
         palette.set(.success, .{ .index = 2 });
-        palette.set(.warning, .{ .index = 11 });
+        palette.set(.warning, .{ .rgb = .{ 241, 219, 174 } });
         palette.set(.danger, .{ .index = 9 });
         palette.set(.info, .{ .index = 12 });
         palette.set(.binary, .{ .index = 13 });
