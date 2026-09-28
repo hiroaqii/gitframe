@@ -1306,7 +1306,7 @@ test "stage unstage and discard launch typed action cursor owners with task gene
     try abandonSingleQueuedAction(&app, &ctx);
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 
-    var staged = try git_status.StatusBundle.parseOwned(allocator, "M  src/a\x00M  src/b\x00");
+    var staged = try git_status.StatusBundle.parseOwned(allocator, "R  src/a\x00outside/old\x00M  src/b\x00");
     try app.pages.changes.git_status.replace(roots.a, &staged);
     try app.localWorkflow().unstageSelectedFile(&ctx);
     const unstage_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedUnstageAction;
@@ -1358,6 +1358,162 @@ test "fresh status-only targets fail closed without accepted source" {
     try std.testing.expectEqual(git_ops.StageTargetResult.stale_source, app.changesOperations().stageTarget());
     try std.testing.expectEqual(git_ops.UnstageTargetResult.stale_source, app.changesOperations().unstageTarget());
     try std.testing.expectEqual(git_ops.DiscardTargetResult.stale_source, app.changesOperations().discardTarget());
+}
+
+test "Changes unstage keeps rename units and unrelated index worktree bytes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const file_tree = @import("../../file_tree.zig");
+    const Case = enum { file, edited, incoming, same_directory, outgoing, repository, special, locked };
+    for (std.enums.values(Case)) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try runLocalTestGit(io, tmp.dir, &.{ "git", "init", "--initial-branch=main" });
+        try runLocalTestGit(io, tmp.dir, &.{ "git", "config", "core.fileMode", "true" });
+        try runLocalTestGit(io, tmp.dir, &.{ "git", "config", "status.renames", "true" });
+        try tmp.dir.createDirPath(io, "picked");
+        try tmp.dir.createDirPath(io, "outside");
+        const old = switch (case) {
+            .same_directory, .outgoing => "picked/old",
+            .special => ":(literal)old\t\n ",
+            else => "outside/old",
+        };
+        const new = switch (case) {
+            .outgoing => "outside/new",
+            .special => "picked/new*\t\n ",
+            else => "picked/new",
+        };
+        const base = "rename line one\nrename line two\nrename line three\nrename line four\n";
+        for ([_][]const u8{ old, "picked/keep", "guard", "picked/new-other" }) |path|
+            try tmp.dir.writeFile(io, .{ .sub_path = path, .data = base });
+        try runLocalTestGit(io, tmp.dir, &.{ "git", "add", "--all" });
+        try runLocalTestGit(io, tmp.dir, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base" });
+        const head_index = try localTestGitOutput(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z" });
+        defer allocator.free(head_index);
+        try tmp.dir.writeFile(io, .{ .sub_path = "guard", .data = "guard index\n" });
+        try runLocalTestGit(io, tmp.dir, &.{ "chmod", "+x", "guard" });
+        try runLocalTestGit(io, tmp.dir, &.{ "git", "add", "--", "guard" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "guard", .data = "guard worktree\n" });
+        const guarded_index = try localTestGitOutput(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z" });
+        defer allocator.free(guarded_index);
+        try runLocalTestGit(io, tmp.dir, &.{ "git", "--literal-pathspecs", "mv", "--", old, new });
+        if (case == .edited) {
+            try tmp.dir.writeFile(io, .{ .sub_path = new, .data = base ++ "staged edit\n" });
+            try runLocalTestGit(io, tmp.dir, &.{ "git", "--literal-pathspecs", "add", "--", new });
+            try tmp.dir.writeFile(io, .{ .sub_path = new, .data = "different worktree bytes\n" });
+        }
+        const renamed_index = try localTestGitOutput(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z" });
+        defer allocator.free(renamed_index);
+        const directory = case == .incoming or case == .same_directory or case == .outgoing;
+        if (directory) {
+            try tmp.dir.writeFile(io, .{ .sub_path = "picked/keep", .data = "selected index\n" });
+            try runLocalTestGit(io, tmp.dir, &.{ "git", "add", "--", "picked/keep" });
+            try tmp.dir.writeFile(io, .{ .sub_path = "picked/keep", .data = "selected worktree\n" });
+        }
+        // Repository-wide unstage must also remove intent-to-add entries.
+        try tmp.dir.writeFile(io, .{ .sub_path = "intent", .data = "untracked bytes\n" });
+        if (case == .repository) try runLocalTestGit(io, tmp.dir, &.{ "git", "add", "-N", "--", "intent" });
+        const expected_index = if (case == .repository) head_index else if (case == .outgoing or case == .locked) renamed_index else guarded_index;
+        const raw_index_before = try tmp.dir.readFileAlloc(io, ".git/index", allocator, .limited(64 * 1024));
+        defer allocator.free(raw_index_before);
+        const worktree_paths = [_][]const u8{ new, "picked/keep", "guard", "picked/new-other", "intent" };
+        var worktree: [worktree_paths.len][]u8 = undefined;
+        var modes: [worktree_paths.len]std.Io.File.Permissions = undefined;
+        for (worktree_paths, 0..) |path, i| {
+            worktree[i] = try tmp.dir.readFileAlloc(io, path, allocator, .limited(4096));
+            modes[i] = (try tmp.dir.statFile(io, path, .{})).permissions;
+        }
+        defer for (worktree) |bytes| allocator.free(bytes);
+
+        const repo_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(repo_path);
+        const raw_status = try localTestGitOutput(io, tmp.dir, &.{ "git", "status", "--porcelain=v1", "-z" });
+        defer allocator.free(raw_status);
+        var status = try git_status.StatusBundle.parseOwned(allocator, raw_status);
+        defer status.deinit();
+        const rename = for (status.document.entries) |entry| {
+            if (std.mem.eql(u8, entry.path, new)) break entry;
+        } else return error.ExpectedRenameEntry;
+        try std.testing.expectEqual(git_status.StatusCode.renamed, rename.index);
+        try std.testing.expectEqualStrings(old, rename.old_path.?);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        var loaded = app_test_support.loadedDiffOne();
+        loaded.document = .{ .files = &.{} };
+        loaded.file_text_eligibility = &.{};
+        loaded.tree = try file_tree.buildWithOptions(arena.allocator(), loaded.document, status.document, .{ .root = .{ .name = "repo" } });
+        var selected: ?usize = null;
+        for (loaded.tree.nodes, 0..) |node, i| {
+            const matches = if (case == .repository) node.kind == .repo_root else if (directory)
+                node.kind == .directory and std.mem.eql(u8, node.path, "picked")
+            else
+                node.kind == .file and std.mem.eql(u8, node.path_key, new);
+            if (matches) selected = i;
+        }
+        var app: LocalHarness = .{
+            .allocator = allocator,
+            .config = .{ .source = .unstaged },
+            .pages = .{ .changes = .{
+                .load = app_test_support.loadStateWithArena(arena, loaded),
+                .viewer = .{ .selected_node = selected.? },
+            } },
+            .repo_session = .{ .repo_state = .{
+                .discovery = try testSingleRepoDiscovery(allocator, repo_path),
+                .root = try repo_root_capability.RootCapability.openCanonical(repo_path),
+            } },
+        };
+        defer app.repo_session.repo_state.deinit(allocator);
+        defer app.pages.changes.deinit(allocator);
+        try app.pages.changes.git_status.replace(repo_path, &status);
+        app.pages.changes.status_load.markSuccess();
+        app.pages.changes.branch_status_load.markSuccess();
+        acceptTestSource(&app);
+        var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._io = io };
+        defer chasen.testing.discardPendingTasks(LocalHarness.Msg, &ctx);
+        try app.localWorkflow().unstageSelectedFile(&ctx);
+        const queued = ctx.takePendingTasks();
+        try std.testing.expectEqual(@as(usize, 1), queued.len);
+        // Both the owned proposal and borrowed status may disappear before execution.
+        app.changesReload().clearLoadedDiff(allocator);
+        app.pages.changes.git_status.deinit();
+        if (case == .locked) try tmp.dir.writeFile(io, .{ .sub_path = ".git/index.lock", .data = "locked\n" });
+        const message = try queued[0].run(allocator, io);
+        const finished = message.action_finished.unstage_file;
+        try std.testing.expect(if (case == .locked) finished.result == .failed else finished.result == .ok);
+        const intent = app.localWorkflow().finishUnstageFile(allocator, finished);
+        if (case == .locked) {
+            try std.testing.expect(intent == null);
+            try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
+        } else {
+            try std.testing.expect(intent.?.active_matches);
+            try std.testing.expectEqual(changes_action_fence.ReloadIntent.source_and_aux, intent.?.reload);
+        }
+        const actual_index = try localTestGitOutput(io, tmp.dir, &.{ "git", "ls-files", "--stage", "-z" });
+        defer allocator.free(actual_index);
+        try std.testing.expectEqualStrings(expected_index, actual_index);
+        if (case == .locked) {
+            const raw_index_after = try tmp.dir.readFileAlloc(io, ".git/index", allocator, .limited(64 * 1024));
+            defer allocator.free(raw_index_after);
+            try std.testing.expectEqualStrings(raw_index_before, raw_index_after);
+        }
+        // Resolve actual index OIDs to bytes, without interpreting raw names as rev syntax.
+        for ([_][]const u8{ if (case == .outgoing or case == .locked) new else old, "guard" }) |path| {
+            const record = try localTestGitOutput(io, tmp.dir, &.{ "git", "--literal-pathspecs", "ls-files", "--stage", "-z", "--", path });
+            defer allocator.free(record);
+            var fields = std.mem.tokenizeAny(u8, record, " \t");
+            _ = fields.next().?;
+            const blob = try localTestGitOutput(io, tmp.dir, &.{ "git", "cat-file", "blob", fields.next().? });
+            defer allocator.free(blob);
+            try std.testing.expectEqualStrings(if (std.mem.eql(u8, path, "guard") and case != .repository) "guard index\n" else base, blob);
+        }
+        for (worktree_paths, 0..) |path, i| {
+            const bytes = try tmp.dir.readFileAlloc(io, path, allocator, .limited(4096));
+            defer allocator.free(bytes);
+            try std.testing.expectEqualStrings(worktree[i], bytes);
+            try std.testing.expectEqual(modes[i], (try tmp.dir.statFile(io, path, .{})).permissions);
+        }
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, old, .{}));
+    }
 }
 
 test "queued local Git mutation retains the accepted root across path replacement" {

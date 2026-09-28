@@ -27,7 +27,7 @@ pub const OperationResult = union(enum) {
 
 pub const OperationKind = union(enum) {
     stage_file: []const u8,
-    unstage_file: []const u8,
+    unstage_paths: []const []const u8,
     stage_all,
     unstage_all,
     discard_file: []const u8,
@@ -67,9 +67,9 @@ pub fn runOperation(
 ) git_command.Error!OperationResult {
     return switch (request.kind) {
         .stage_file => |path| runGitAdd(allocator, io, request.context, path),
-        .unstage_file => |path| runGitUnstage(allocator, io, request.context, path),
+        .unstage_paths => |paths| runGitUnstage(allocator, io, request.context, paths),
         .stage_all => runGitAddAll(allocator, io, request.context),
-        .unstage_all => runGitUnstage(allocator, io, request.context, "."),
+        .unstage_all => runGitUnstage(allocator, io, request.context, &.{"."}),
         .discard_file => |path| runGitDiscard(allocator, io, request.context, path),
         .stage_patch => |patch| runGitApplyCached(allocator, io, request.context, patch.patch),
         .unstage_patch => |patch| runGitApplyCachedReverse(allocator, io, request.context, patch.patch),
@@ -182,24 +182,29 @@ fn runGitAdd(allocator: std.mem.Allocator, io: std.Io, context: git_command.Dire
     return operationResultFromGitCommand(allocator, result, "git add");
 }
 
-fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, path: []const u8) git_command.Error!OperationResult {
+fn runGitUnstage(allocator: std.mem.Allocator, io: std.Io, context: git_command.DirectoryContext, paths: []const []const u8) git_command.Error!OperationResult {
+    if (paths.len == 0) return .{ .failed_static = "No staged paths selected" };
     var head = (try git_read.readHeadBasis(allocator, io, context)) orelse
         return .{ .failed = allocator.dupe(u8, "Cannot determine a valid HEAD; unstage was not started") catch return error.OutOfMemory };
     defer head.deinit(allocator);
-    const pathspec = std.fmt.allocPrint(allocator, "{s}\x00", .{path}) catch return error.OutOfMemory;
-    defer allocator.free(pathspec);
+    var pathspec: std.ArrayList(u8) = .empty;
+    defer pathspec.deinit(allocator);
+    for (paths) |path| {
+        try pathspec.appendSlice(allocator, path);
+        try pathspec.append(allocator, 0);
+    }
     const detailed = switch (head) {
         .oid => |oid| blk: {
             const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{
                 "restore", "--staged", "--source", oid, "--pathspec-from-file=-", "--pathspec-file-nul", "--",
             };
-            break :blk try runWithStdinDetailed(allocator, io, context, &argv, pathspec);
+            break :blk try runWithStdinDetailed(allocator, io, context, &argv, pathspec.items);
         },
         .unborn => blk: {
             const argv = git_command.literal_pathspec_prefix ++ [_][]const u8{
                 "rm", "--cached", "-f", "-r", "--quiet", "--pathspec-from-file=-", "--pathspec-file-nul", "--",
             };
-            break :blk try runWithStdinDetailed(allocator, io, context, &argv, pathspec);
+            break :blk try runWithStdinDetailed(allocator, io, context, &argv, pathspec.items);
         },
     };
     return operationResultFromGitStdinCommand(allocator, detailed, if (head == .unborn) "git rm --cached" else "git restore --staged");
@@ -317,9 +322,9 @@ test "OperationRequest represents supported operation inputs" {
     defer environment.deinit();
     const context: git_command.DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
 
-    const request: OperationRequest = .{ .context = context, .kind = .{ .unstage_file = "src/app.zig" } };
+    const request: OperationRequest = .{ .context = context, .kind = .{ .unstage_paths = &.{"src/app.zig"} } };
     try std.testing.expectEqual(tmp.dir.handle, request.context.cwd.handle);
-    try std.testing.expectEqualStrings("src/app.zig", request.kind.unstage_file);
+    try std.testing.expectEqualStrings("src/app.zig", request.kind.unstage_paths[0]);
     const commit_request: OperationRequest = .{ .context = context, .kind = .{ .commit = .{ .subject = "subject", .body = "body" } } };
     try std.testing.expectEqualStrings("subject", commit_request.kind.commit.subject);
     try std.testing.expectEqualStrings("body", commit_request.kind.commit.body.?);
@@ -505,8 +510,8 @@ test "unstage preserves index units and worktree bytes with unborn or normal HEA
         defer environment.deinit();
         const kind: OperationKind = switch (case) {
             .unborn_all => .unstage_all,
-            .unborn_directory => .{ .unstage_file = "picked" },
-            else => .{ .unstage_file = target },
+            .unborn_directory => .{ .unstage_paths = &.{"picked"} },
+            else => .{ .unstage_paths = &.{target} },
         };
         const result = try runOperation(allocator, io, .{ .context = .{ .cwd = tmp.dir, .environment = &environment }, .kind = kind });
         defer result.deinit(allocator);
@@ -573,7 +578,7 @@ test "unstage refuses abnormal HEAD and preserves bytes on index lock failures" 
         defer environment.deinit();
         const result = try runOperation(allocator, io, .{
             .context = .{ .cwd = tmp.dir, .environment = &environment },
-            .kind = .{ .unstage_file = "selected.txt" },
+            .kind = .{ .unstage_paths = &.{"selected.txt"} },
         });
         defer result.deinit(allocator);
         switch (case) {
@@ -656,7 +661,7 @@ test "literal path operations and reads preserve unselected index and worktree b
             try std.testing.expectEqualStrings(expected_stats, stats.ok);
         }
 
-        const unstage = try runOperation(allocator, io, .{ .context = context, .kind = .{ .unstage_file = name } });
+        const unstage = try runOperation(allocator, io, .{ .context = context, .kind = .{ .unstage_paths = &.{name} } });
         defer unstage.deinit(allocator);
         try std.testing.expect(unstage == .ok);
         const staged_names = try gitOutputAlloc(io, tmp.dir, &.{ "git", "diff", "--cached", "--name-only", "-z" });

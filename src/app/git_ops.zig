@@ -147,6 +147,8 @@ pub const UnstageTarget = struct {
     path: []const u8,
     kind: TargetKind,
     label: []const u8 = "",
+    /// Fresh status borrowed only until Changes owns the selected index units.
+    entries: []const git_status.StatusEntry,
 };
 
 pub const UnstageTargetResult = union(enum) {
@@ -592,7 +594,7 @@ fn fileUnstageTarget(repo_root: []const u8, action_target: PathTarget, status: S
     const entry = status.entryForPathKey(action_target.path) orelse return .{ .no_staged_content = action_target };
     if (entry.isConflict()) return .{ .conflict_unsupported = action_target };
     if (!entry.isStaged()) return .{ .no_staged_content = action_target };
-    return .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file, .label = action_target.path } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = action_target.path, .kind = .file, .label = action_target.path, .entries = status.entries } };
 }
 
 fn directoryUnstageTarget(repo_root: []const u8, directory: []const u8, status: StatusSnapshot) UnstageTargetResult {
@@ -612,7 +614,7 @@ fn directoryUnstageTarget(repo_root: []const u8, directory: []const u8, status: 
     }
 
     if (!has_staged) return .{ .no_staged_content = .{ .path = directory, .kind = .directory } };
-    return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory, .label = directory } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = directory, .kind = .directory, .label = directory, .entries = status.entries } };
 }
 
 fn repositoryUnstageTarget(repo_root: []const u8, status: StatusSnapshot) UnstageTargetResult {
@@ -630,7 +632,7 @@ fn repositoryUnstageTarget(repo_root: []const u8, status: StatusSnapshot) Unstag
     }
 
     if (!has_staged) return .{ .no_staged_content = .{ .path = repoRootLabel(repo_root), .kind = .repository } };
-    return .{ .ready = .{ .repo_root = repo_root, .path = "", .kind = .repository, .label = repoRootLabel(repo_root) } };
+    return .{ .ready = .{ .repo_root = repo_root, .path = "", .kind = .repository, .label = repoRootLabel(repo_root), .entries = status.entries } };
 }
 
 pub fn discardTarget(ctx: TargetContext) DiscardTargetResult {

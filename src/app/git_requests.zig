@@ -76,7 +76,7 @@ pub fn startStageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: action
     _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }
 
-pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: git_ops.UnstageTarget, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
+pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: actions.PendingAction, target: struct { repo_root: []const u8, paths: []const []const u8, kind: git_ops.TargetKind, label: []const u8 }, root: *const root_capability.RootCapability, parent_environment: ?*const std.process.Environ.Map) !void {
     requireKind(pending, .unstage_file);
 
     var authority = try LocalTaskAuthority.init(ctx.allocator(), root, parent_environment);
@@ -90,7 +90,7 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
         .repo_root = &.{},
         .root = authority.root,
         .environment = authority.environment,
-        .path = &.{},
+        .paths = &.{},
         .label = &.{},
         .target_kind = target.kind,
     };
@@ -98,8 +98,10 @@ pub fn startUnstageFile(comptime Msg: type, ctx: *chasen.Ctx(Msg), pending: acti
     errdefer Task.destroy(task, ctx.allocator());
 
     task.repo_root = try ctx.allocator().dupe(u8, target.repo_root);
-    task.path = try ctx.allocator().dupe(u8, target.path);
-    task.label = try ctx.allocator().dupe(u8, if (target.label.len > 0) target.label else target.path);
+    task.paths = try ctx.allocator().alloc([]const u8, target.paths.len);
+    @memset(task.paths, &.{});
+    for (target.paths, task.paths) |path, *owned| owned.* = try ctx.allocator().dupe(u8, path);
+    task.label = try ctx.allocator().dupe(u8, target.label);
 
     _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
 }

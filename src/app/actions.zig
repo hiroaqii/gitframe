@@ -492,7 +492,7 @@ pub fn StageFileTask(comptime Msg: type) type {
     };
 }
 
-/// Async task for `git restore --staged -- <path>`.
+/// Async task for unstaging complete index units in one Git mutation.
 ///
 /// Kept separate from StageFileTask for now so operation-specific status text
 /// stays obvious; a shared helper can be introduced once a third file action
@@ -503,12 +503,12 @@ pub fn UnstageFileTask(comptime Msg: type) type {
         repo_root: []u8,
         root: root_capability.RootCapability,
         environment: git_command.LocalGitEnvironment,
-        path: []u8,
+        paths: [][]const u8,
         label: []u8,
         target_kind: git_ops.TargetKind,
 
         pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
-            return task.finish(runUnstageTarget(task.directoryContext(), task.path, task.target_kind, allocator, io));
+            return task.finish(runUnstageTarget(task.directoryContext(), task.paths, task.target_kind, allocator, io));
         }
 
         pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
@@ -518,7 +518,8 @@ pub fn UnstageFileTask(comptime Msg: type) type {
         /// Release all fields not moved into the result.
         pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
             if (task.repo_root.len > 0) allocator.free(task.repo_root);
-            if (task.path.len > 0) allocator.free(task.path);
+            for (task.paths) |path| allocator.free(path);
+            allocator.free(task.paths);
             if (task.label.len > 0) allocator.free(task.label);
             task.environment.deinit();
             task.root.deinit();
@@ -1079,21 +1080,14 @@ pub fn runStageTarget(context: git_command.DirectoryContext, path: []const u8, t
     };
 }
 
-pub fn runUnstageFile(context: git_command.DirectoryContext, path: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
+pub fn runUnstageTarget(context: git_command.DirectoryContext, paths: []const []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
     return runOperationMapped("Unstage", .{
         .context = context,
-        .kind = .{ .unstage_file = path },
+        .kind = switch (target_kind) {
+            .repository => .unstage_all,
+            .file, .directory => .{ .unstage_paths = paths },
+        },
     }, allocator, io);
-}
-
-pub fn runUnstageTarget(context: git_command.DirectoryContext, path: []const u8, target_kind: git_ops.TargetKind, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
-    return switch (target_kind) {
-        .repository => runOperationMapped("Unstage", .{
-            .context = context,
-            .kind = .unstage_all,
-        }, allocator, io),
-        .file, .directory => runUnstageFile(context, path, allocator, io),
-    };
 }
 
 pub fn runStageHunk(context: git_command.DirectoryContext, patch: []const u8, allocator: std.mem.Allocator, io: std.Io) FileActionTaskResult {
@@ -1290,8 +1284,14 @@ fn makeUnstageFileTaskForTest(allocator: std.mem.Allocator, pending: PendingActi
     errdefer environment.deinit();
     const repo_root = try allocator.dupe(u8, "/__gitframe_missing_repo__");
     errdefer allocator.free(repo_root);
-    const path = try allocator.dupe(u8, "src/main.zig");
-    errdefer allocator.free(path);
+    const paths = try allocator.alloc([]const u8, 2);
+    @memset(paths, &.{});
+    errdefer {
+        for (paths) |path| allocator.free(path);
+        allocator.free(paths);
+    }
+    paths[0] = try allocator.dupe(u8, "src/main.zig");
+    paths[1] = try allocator.dupe(u8, "old/main.zig");
     const label = try allocator.dupe(u8, "src/main.zig");
     errdefer allocator.free(label);
     const task = try allocator.create(Task);
@@ -1300,7 +1300,7 @@ fn makeUnstageFileTaskForTest(allocator: std.mem.Allocator, pending: PendingActi
         .repo_root = repo_root,
         .root = root,
         .environment = environment,
-        .path = path,
+        .paths = paths,
         .label = label,
         .target_kind = .file,
     };

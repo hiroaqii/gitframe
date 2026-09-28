@@ -488,7 +488,7 @@ pub const Controller = struct {
         };
         app_git_requests.startUnstageFile(app_message.Msg, ctx, prepared.pending, .{
             .repo_root = owned.repo_root,
-            .path = owned.path,
+            .paths = owned.paths,
             .kind = owned.kind,
             .label = owned.label,
         }, capability, self.env_map) catch |err| {

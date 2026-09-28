@@ -72,6 +72,24 @@ pub const OwnedHunkProposal = struct {
     }
 };
 
+pub const OwnedUnstageProposal = struct {
+    repo_root: []u8,
+    /// Navigation selection, separate from the raw command paths.
+    path: []u8,
+    label: []u8,
+    kind: git_ops.TargetKind,
+    paths: []const []const u8,
+
+    fn deinit(self: *OwnedUnstageProposal, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo_root);
+        allocator.free(self.path);
+        allocator.free(self.label);
+        for (self.paths) |path| allocator.free(path);
+        allocator.free(self.paths);
+        self.* = undefined;
+    }
+};
+
 pub const OwnedPushProposal = struct {
     repository_identity: remote_request.RepositoryIdentity,
     mode: git_ops.PushMode,
@@ -129,7 +147,7 @@ pub const OwnedFetchProposal = struct {
 /// never borrows Changes state while a confirmation or async operation is live.
 pub const OwnedOperationProposal = union(enum) {
     stage_file: OwnedPathProposal,
-    unstage_file: OwnedPathProposal,
+    unstage_file: OwnedUnstageProposal,
     stage_hunk: OwnedHunkProposal,
     unstage_hunk: OwnedHunkProposal,
     discard: OwnedDiscardProposal,
@@ -384,7 +402,39 @@ pub const View = struct {
     }
 
     pub fn ownUnstageFileProposal(_: View, allocator: std.mem.Allocator, target: git_ops.UnstageTarget) !OwnedOperationProposal {
-        return .{ .unstage_file = try clonePathProposal(allocator, target.repo_root, target.path, target.label, target.kind) };
+        var selection = try clonePathProposal(allocator, target.repo_root, target.path, target.label, target.kind);
+        errdefer selection.deinit(allocator);
+        var paths: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (paths.items) |path| allocator.free(path);
+            paths.deinit(allocator);
+        }
+        if (target.kind != .repository) {
+            for (target.entries) |entry| {
+                if (!entry.isStaged()) continue;
+                const key = entry.canonicalPathKey() orelse continue;
+                const selected = switch (target.kind) {
+                    .file => std.mem.eql(u8, key, target.path),
+                    .directory => @import("../../../file_tree.zig").isPathDescendantOfDirectory(key, target.path),
+                    .repository => unreachable,
+                };
+                if (!selected) continue;
+                try paths.ensureUnusedCapacity(allocator, 2);
+                paths.appendAssumeCapacity(try allocator.dupe(u8, entry.path));
+                if (entry.index == .renamed) {
+                    const old_path = entry.old_path orelse return error.MissingRenamePath;
+                    paths.appendAssumeCapacity(try allocator.dupe(u8, old_path));
+                }
+            }
+            if (paths.items.len == 0) return error.NoStagedPaths;
+        }
+        return .{ .unstage_file = .{
+            .repo_root = selection.repo_root,
+            .path = selection.path,
+            .label = selection.label,
+            .kind = selection.kind,
+            .paths = try paths.toOwnedSlice(allocator),
+        } };
     }
 
     pub fn ownStageHunkProposal(_: View, allocator: std.mem.Allocator, target: *git_ops.HunkStageTarget) !OwnedOperationProposal {
@@ -1760,6 +1810,39 @@ test "unstage target requires fresh staged status" {
     try page.git_status.replace("/repo", &conflict);
     try std.testing.expect(testView(&page, .unstaged).unstageTarget() == .conflict_unsupported);
     try std.testing.expect(testView(&page, .{ .range = "main...HEAD" }).unstageTarget() == .unavailable_source);
+}
+
+test "unstage proposal includes old paths only for staged renames" {
+    const allocator = std.testing.allocator;
+    const git_status = @import("../../../git/status.zig");
+    var page: changes_page.ChangesPageState = .{};
+    const view = testView(&page, .unstaged);
+    for ([_]git_status.StatusEntry{
+        .{ .path = "picked/new", .old_path = "outside/old", .raw = .{ 'C', ' ' }, .index = .copied, .worktree = .unmodified },
+        .{ .path = "picked/new", .old_path = "outside/old", .raw = .{ 'M', 'R' }, .index = .modified, .worktree = .renamed },
+        .{ .path = "picked/new", .old_path = "outside/old", .raw = .{ 'R', ' ' }, .index = .renamed, .worktree = .unmodified },
+    }) |entry| {
+        const target = git_ops.unstageTarget(.{
+            .source = .unstaged,
+            .source_fresh = true,
+            .repo_root = "/repo",
+            .action_target = .{ .path = "picked/new", .kind = .file },
+            .status = .{ .repo_root = "/repo", .loading = false, .fresh = true, .entries = &.{entry} },
+        });
+        try std.testing.expect(target == .ready);
+        var proposal = try view.ownUnstageFileProposal(allocator, target.ready);
+        defer proposal.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, if (entry.index == .renamed) 2 else 1), proposal.unstage_file.paths.len);
+        try std.testing.expectEqualStrings(entry.path, proposal.unstage_file.paths[0]);
+        if (entry.index == .renamed) {
+            try std.testing.expectEqualStrings(entry.old_path.?, proposal.unstage_file.paths[1]);
+            var missing = entry;
+            missing.old_path = null;
+            var incomplete = target.ready;
+            incomplete.entries = &.{missing};
+            try std.testing.expectError(error.MissingRenamePath, view.ownUnstageFileProposal(allocator, incomplete));
+        }
+    }
 }
 
 test "hunk toggle resolves source and session staged state" {
