@@ -89,6 +89,8 @@ pub fn centerCursor(bounds: Bounds, scroll: usize, cursor: usize) usize {
 
 /// Viewport-primary wheel synchronization. The caller owns the scroll move and
 /// must preserve its domain cursor identity when this returns the old ordinal.
+/// Visible cursors retain their screen row, including the viewport edges;
+/// offscreen cursors move only as far as the nearest newly visible row.
 pub fn retargetCursorAfterViewportScroll(
     bounds: Bounds,
     old_scroll: usize,
@@ -100,21 +102,15 @@ pub fn retargetCursorAfterViewportScroll(
     if (old == new or bounds.visible_rows == 0) return old_cursor;
     if (bounds.content_rows == 0) return null;
 
+    const last = @min(new +| (bounds.visible_rows - 1), bounds.content_rows - 1);
     if (old_cursor) |cursor| {
-        if (cursor >= old) {
-            const screen_row = cursor - old;
-            if (screen_row < bounds.visible_rows) {
-                if (bounds.comfortBand()) |band| {
-                    const candidate = new +| screen_row;
-                    if (band.contains(screen_row) and candidate < bounds.content_rows) {
-                        return candidate;
-                    }
-                }
-            }
+        if (cursor >= old and cursor - old < bounds.visible_rows) {
+            return @min(new +| (cursor - old), last);
         }
+        return std.math.clamp(cursor, new, last);
     }
 
-    return @min(new +| (bounds.visible_rows / 2), bounds.content_rows - 1);
+    return @min(new +| (bounds.visible_rows / 2), last);
 }
 
 test "cursor viewport comfort band saturates for small heights and caps its margin" {
@@ -134,7 +130,7 @@ test "cursor viewport bounds handle empty short zero-height and maximal values" 
     const bounds = Bounds{ .content_rows = maximum, .visible_rows = maximum };
     try std.testing.expectEqual(@as(usize, 0), bounds.maxScroll());
     try std.testing.expectEqual(@as(usize, 0), bounds.clampScroll(maximum));
-    try std.testing.expectEqual(@as(?usize, maximum - 2), retargetCursorAfterViewportScroll(
+    try std.testing.expectEqual(@as(?usize, maximum - 1), retargetCursorAfterViewportScroll(
         .{ .content_rows = maximum, .visible_rows = 3 },
         maximum - 4,
         maximum - 3,
@@ -169,14 +165,26 @@ test "cursor viewport coarse placement centers when bounds permit" {
     try std.testing.expectEqual(@as(usize, 12), centerCursor(.{ .content_rows = 100, .visible_rows = 0 }, 12, 99));
 }
 
-test "cursor viewport wheel preserves band rows and recenters edge rows" {
+test "cursor viewport wheel preserves every visible row and clamps offscreen cursors to the nearest edge" {
+    for ([_]usize{ 1, 2, 3, 9, 40 }) |height| {
+        const bounds = Bounds{ .content_rows = 100, .visible_rows = height };
+        for (0..height) |screen_row| {
+            try std.testing.expectEqual(@as(?usize, 21 + screen_row), retargetCursorAfterViewportScroll(bounds, 20, 21, 20 + screen_row));
+            try std.testing.expectEqual(@as(?usize, 20 + screen_row), retargetCursorAfterViewportScroll(bounds, 21, 20, 21 + screen_row));
+        }
+    }
+
     const bounds = Bounds{ .content_rows = 100, .visible_rows = 9 };
-    try std.testing.expectEqual(@as(?usize, 25), retargetCursorAfterViewportScroll(bounds, 20, 21, 24));
-    try std.testing.expectEqual(@as(?usize, 25), retargetCursorAfterViewportScroll(bounds, 20, 21, 20));
-    try std.testing.expectEqual(@as(?usize, 24), retargetCursorAfterViewportScroll(bounds, 21, 20, 29));
+    try std.testing.expectEqual(@as(?usize, 21), retargetCursorAfterViewportScroll(bounds, 20, 21, 0));
+    try std.testing.expectEqual(@as(?usize, 29), retargetCursorAfterViewportScroll(bounds, 20, 21, 99));
+    try std.testing.expectEqual(@as(?usize, 20), retargetCursorAfterViewportScroll(bounds, 21, 20, 0));
+    try std.testing.expectEqual(@as(?usize, 28), retargetCursorAfterViewportScroll(bounds, 21, 20, 99));
     try std.testing.expectEqual(@as(?usize, 24), retargetCursorAfterViewportScroll(bounds, 20, 20, 24));
     try std.testing.expectEqual(@as(?usize, 25), retargetCursorAfterViewportScroll(bounds, 20, 21, null));
-    try std.testing.expectEqual(@as(?usize, 95), retargetCursorAfterViewportScroll(bounds, 90, 91, 98));
+    try std.testing.expectEqual(@as(?usize, 99), retargetCursorAfterViewportScroll(bounds, 90, 91, 98));
+    try std.testing.expectEqual(@as(?usize, 99), retargetCursorAfterViewportScroll(bounds, 91, 92, 99));
+    try std.testing.expectEqual(@as(?usize, 0), retargetCursorAfterViewportScroll(bounds, 1, 0, 1));
+    try std.testing.expectEqual(@as(?usize, 0), retargetCursorAfterViewportScroll(bounds, 0, 0, 0));
     try std.testing.expectEqual(@as(?usize, 7), retargetCursorAfterViewportScroll(
         .{ .content_rows = 100, .visible_rows = 0 },
         5,

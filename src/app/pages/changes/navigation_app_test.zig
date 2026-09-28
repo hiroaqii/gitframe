@@ -193,7 +193,7 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
     try std.testing.expect(changesNavigationView(&app).visibleDiffCursorOffset() != null);
 }
 
-test "diff wheel comfort routes through Changes and recenters an edge cursor" {
+test "diff wheel routes through Changes and preserves an edge cursor screen row" {
     var app: App = .{
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -207,7 +207,6 @@ test "diff wheel comfort routes through Changes and recenters an edge cursor" {
         .terminal_size = .{ .width = 140, .height = 15 },
     };
     const old_scroll = app.pages.changes.viewer.diff_scroll;
-    const visible_rows = changesNavigationView(&app).diffVisibleRows();
     app.pages.changes.viewer.diff_cursor = changesNavigationView(&app).selectedCoordinateAtOffset(old_scroll) orelse
         return error.ExpectedCoordinate;
 
@@ -216,9 +215,13 @@ test "diff wheel comfort routes through Changes and recenters an edge cursor" {
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
     try std.testing.expectEqual(old_scroll + 1, app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(
-        app.pages.changes.viewer.diff_scroll + visible_rows / 2,
+        app.pages.changes.viewer.diff_scroll,
         changesNavigationView(&app).selectedDiffCursorOffset().?,
     );
+
+    try app.update(.{ .changes = .mouse_diff_wheel_up }, undefined);
+    try std.testing.expectEqual(old_scroll, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(old_scroll, changesNavigationView(&app).selectedDiffCursorOffset().?);
 }
 
 test "diff mouse drag supports unified fallback and clears on invalidation" {

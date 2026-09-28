@@ -3910,32 +3910,29 @@ test "diff wheel scroll brings an invisible cursor into the moved viewport" {
     try std.testing.expect(app.visibleDiffCursorOffset() != null);
 }
 
-test "diff wheel comfort keeps band cursor screen position stable" {
-    var app: TestHarness = .{
-        .pages = .{ .changes = .{
-            .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .viewer = .{
-                .display_mode = .unified,
-                .sidebar_hidden = true,
-                .diff_scroll = 1,
-            },
-        } },
-        .terminal_size = .{ .width = 140, .height = 15 },
-    };
-    const old_scroll = app.pages.changes.viewer.diff_scroll;
-    const visible_rows = app.changesNavigationView().diffVisibleRows();
-    const margin = @min(@as(usize, 8), visible_rows / 3);
-    const old_offset = old_scroll + margin;
-    app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(old_offset) orelse return error.ExpectedCoordinate;
+test "diff wheel keeps every visible cursor screen position stable in both display modes" {
+    for ([_]diff_render.DisplayMode{ .unified, .side_by_side }) |mode| {
+        var app = TestHarness.init(.{
+            .load = test_support.loadState(test_support.loadedDiffOne()),
+            .viewer = .{ .display_mode = mode, .sidebar_hidden = true },
+        }, .{ .width = 140, .height = 10 });
+        const view = app.changesNavigationView();
+        for (0..view.diffVisibleRows()) |screen_row| {
+            app.pages.changes.viewer.diff_scroll = 1;
+            app.pages.changes.viewer.diff_cursor = view.selectedCoordinateAtOffset(1 + screen_row) orelse return error.ExpectedCoordinate;
 
-    app.changesNavigation().scrollDiff(.down);
+            app.changesNavigation().scrollDiff(.down);
+            try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.diff_scroll);
+            try std.testing.expectEqual(2 + screen_row, view.selectedDiffCursorOffset().?);
 
-    const new_offset = app.changesNavigationView().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    try std.testing.expectEqual(old_scroll + 1, app.pages.changes.viewer.diff_scroll);
-    try std.testing.expectEqual(old_offset - old_scroll, new_offset - app.pages.changes.viewer.diff_scroll);
+            app.changesNavigation().scrollDiff(.up);
+            try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+            try std.testing.expectEqual(1 + screen_row, view.selectedDiffCursorOffset().?);
+        }
+    }
 }
 
-test "diff wheel comfort recenters edge cursor only after viewport movement" {
+test "diff wheel clamps offscreen cursors to the nearest edge only after viewport movement" {
     var app: TestHarness = .{
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
@@ -3958,7 +3955,7 @@ test "diff wheel comfort recenters edge cursor only after viewport movement" {
     app.changesNavigation().scrollDiff(.down);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(
-        @min(app.pages.changes.viewer.diff_scroll + visible_rows / 2, line_count - 1),
+        @min(line_count - 2, app.pages.changes.viewer.diff_scroll + visible_rows - 1),
         app.changesNavigationView().selectedDiffCursorOffset().?,
     );
 
@@ -3967,7 +3964,7 @@ test "diff wheel comfort recenters edge cursor only after viewport movement" {
     app.changesNavigation().scrollDiff(.up);
     try std.testing.expectEqual(line_count - visible_rows - 1, app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(
-        app.pages.changes.viewer.diff_scroll + visible_rows / 2,
+        app.pages.changes.viewer.diff_scroll,
         app.changesNavigationView().selectedDiffCursorOffset().?,
     );
 }

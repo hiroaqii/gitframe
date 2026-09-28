@@ -6494,12 +6494,12 @@ test "repository source comfort page routes wheel page search boundaries and mou
     _ = state.applyNavigation(allocator, .mouse_source_wheel_down, size);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
 
     _ = state.applyNavigation(allocator, .wheel_down, size);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
 
     state.viewer.focus = .source;
     state.viewer.source_cursor = 5;

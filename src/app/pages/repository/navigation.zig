@@ -243,7 +243,7 @@ test "repository source comfort keeps single row navigation in band and permits 
     try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll);
 }
 
-test "repository source comfort keeps wheel viewport primary at edges and inside band" {
+test "repository source wheel preserves visible screen rows and clamps offscreen cursors" {
     const allocator = std.testing.allocator;
     var document = try sourceDocumentWithRowsForTest(allocator, 100);
     defer document.deinit(allocator);
@@ -255,22 +255,28 @@ test "repository source comfort keeps wheel viewport primary at edges and inside
         .source_horizontal_scroll = 7,
     };
 
-    wheelSource(&viewer, &document, 1, geometry);
-    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 25), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 7), viewer.source_horizontal_scroll);
+    for (0..geometry.visible_source_rows) |screen_row| {
+        viewer.source_cursor = 20 + screen_row;
+        viewer.source_vertical_scroll = 20;
+        wheelSource(&viewer, &document, 1, geometry);
+        try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+        try std.testing.expectEqual(21 + screen_row, viewer.source_cursor);
 
-    viewer.source_cursor = 24;
-    viewer.source_vertical_scroll = 20;
+        wheelSource(&viewer, &document, -1, geometry);
+        try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+        try std.testing.expectEqual(20 + screen_row, viewer.source_cursor);
+        try std.testing.expectEqual(@as(usize, 7), viewer.source_horizontal_scroll);
+    }
+
+    viewer.source_cursor = 0;
     wheelSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 25), viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 21), viewer.source_cursor);
 
     viewer.source_cursor = 29;
-    viewer.source_vertical_scroll = 21;
     wheelSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
-    try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 27), viewer.source_cursor);
 
     viewer.source_cursor = 4;
     viewer.source_vertical_scroll = 0;
