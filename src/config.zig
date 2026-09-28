@@ -1018,6 +1018,7 @@ test "loaded theme config feeds palette derivation" {
         \\accent = "#0a0b0c"
         \\success = "#010203"
         \\info = "#070809"
+        \\history_date = "#141516"
         \\syntax_string = "index:13"
         \\
     });
@@ -1038,6 +1039,7 @@ test "loaded theme config feeds palette derivation" {
     try std.testing.expect(palette.color(.syntax_operator).eql(.{ .rgb = .{ 10, 11, 12 } }));
     try std.testing.expect(palette.color(.syntax_function).eql(.{ .rgb = .{ 7, 8, 9 } }));
     try std.testing.expect(palette.color(.syntax_property).eql(.{ .rgb = .{ 7, 8, 9 } }));
+    try std.testing.expect(palette.color(.history_date).eql(.{ .rgb = .{ 20, 21, 22 } }));
     try std.testing.expect(palette.color(.syntax_string).eql(.{ .index = 13 }));
 }
 

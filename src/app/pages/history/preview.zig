@@ -502,13 +502,13 @@ pub fn canonicalDetailAlloc(allocator: std.mem.Allocator, detail: git_preview.De
     errdefer out.deinit();
     switch (detail) {
         .single => |single| {
-            try out.writer.print("Commit: {s}\nAuthor: {s} <{s}>\nAuthored: ", .{
+            try out.writer.print("Commit: {s}\nAuthor: {s} <{s}>\nAuthorDate: ", .{
                 single.summary.selected_oid.slice(),
                 single.author.name,
                 single.author.email,
             });
             try writeTimestamp(&out.writer, single.authored);
-            try out.writer.print("\nCommitter: {s} <{s}>\nCommitted: ", .{
+            try out.writer.print("\nCommitter: {s} <{s}>\nCommitDate: ", .{
                 single.committer.name,
                 single.committer.email,
             });
@@ -957,9 +957,9 @@ test "History preview canonical detail is exact for single and range" {
     try std.testing.expectEqualStrings(
         "Commit: 2222222222222222222222222222222222222222\n" ++
             "Author: A U Thor <author@example.com>\n" ++
-            "Authored: 1970-01-01 09:00:00 +0900\n" ++
+            "AuthorDate: 1970-01-01 09:00:00 +0900\n" ++
             "Committer: C O M <commit@example.com>\n" ++
-            "Committed: 1969-12-31 21:30:00 -0230\n" ++
+            "CommitDate: 1969-12-31 21:30:00 -0230\n" ++
             "Branch tips: main, release\nTags: v1\nRemote tips: —\n" ++
             "Diff base: parent 1/2 1111111111111111111111111111111111111111\n" ++
             "Message:\nsubject\n\nbody",

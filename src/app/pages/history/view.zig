@@ -858,12 +858,18 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
     }
 
     if (pane_active and page.load_state != .loading and !page.catalog.moreRowSelected()) {
+        const space_key = " Space ";
+        const space_style = chasen.TextStyle{
+            .fg = context.palette.color(.selection_action_fg),
+            .bg = context.palette.color(.selection_action_bg),
+        };
+        try drawClipped(surface, row_prefix_width, 1, space_key, space_style);
         try drawClipped(
             surface,
-            row_prefix_width,
+            row_prefix_width + space_key.len,
             1,
-            if (page.draft.isRange()) "Space: clear range" else "Space: start range",
-            context.palette.style(.muted),
+            if (page.draft.isRange()) " clear range" else " start range",
+            context.palette.style(.foreground),
         );
     }
 
@@ -1196,7 +1202,7 @@ fn drawCommitRow(
         row,
         layout.date.width,
         if (formatted_date) |*value| value[0..] else "—",
-        catalogStyle(palette, .muted, focused),
+        catalogStyle(palette, .history_date, focused),
     );
     try drawClippedField(
         surface,
@@ -1540,8 +1546,8 @@ test "History range hint stays readable and fixed above commits only while usabl
         more: bool = false,
         hint: ?[]const u8 = null,
     }{
-        .{ .hint = "Space: start range" },
-        .{ .range = true, .scroll = 2, .hint = "Space: clear range" },
+        .{ .hint = " Space  start range" },
+        .{ .range = true, .scroll = 2, .hint = " Space  clear range" },
         .{ .range = true, .scroll = 2, .focus = .commit_detail },
         .{ .range = true, .scroll = 2, .focus = .changed_files },
         .{ .loading = true },
@@ -1560,12 +1566,18 @@ test "History range hint stays readable and fixed above commits only while usabl
         defer std.testing.allocator.free(snapshot);
         if (case.hint) |hint| {
             try std.testing.expect(std.mem.indexOf(u8, snapshot, hint) != null);
-            try rendered.expectCellText(row_prefix_width, 1, "S");
-            const cell = rendered.surface.readCell(row_prefix_width, 1).?;
-            try std.testing.expect(!cell.style.dim);
-            try std.testing.expect(cell.style.fg.eql(palette.color(.muted)));
+            try rendered.expectCellText(row_prefix_width + 1, 1, "S");
+            for (0..7) |offset| {
+                const cell = rendered.surface.readCell(row_prefix_width + @as(u16, @intCast(offset)), 1).?;
+                try std.testing.expect(!cell.style.dim);
+                try std.testing.expect(cell.style.fg.eql(palette.color(.selection_action_fg)));
+                try std.testing.expect(cell.style.bg.eql(palette.color(.selection_action_bg)));
+            }
+            const action = rendered.surface.readCell(row_prefix_width + 8, 1).?;
+            try std.testing.expect(action.style.fg.eql(palette.color(.foreground)));
+            try std.testing.expect(action.style.bg.eql(.default));
         } else {
-            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space:") == null);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "Space") == null);
             try rendered.expectCellText(row_prefix_width, 1, " ");
         }
         try rendered.expectCellText(row_prefix_width, 2, "1");
@@ -1628,6 +1640,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 10, 11, 12 } };
     palette.colors[@intFromEnum(theme.Role.foreground)] = .{ .rgb = .{ 13, 14, 15 } };
     palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 16, 17, 18 } };
+    palette.colors[@intFromEnum(theme.Role.history_date)] = .{ .rgb = .{ 19, 20, 21 } };
 
     for ([_]chasen.Size{
         .{ .width = 80, .height = 24 },
@@ -1657,7 +1670,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         const refs_width = chasen.text.displayWidth("[HEAD -> main]");
         for ([_]struct { col: u16, role: theme.Role }{
             .{ .col = layout.commit.col, .role = .accent },
-            .{ .col = layout.date.col, .role = .muted },
+            .{ .col = layout.date.col, .role = .history_date },
             .{ .col = layout.author.col, .role = .info },
             .{ .col = layout.topology.col, .role = .info },
             .{ .col = layout.summary.col, .role = .prompt },
@@ -1671,7 +1684,7 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         const selected_refs_width = chasen.text.displayWidth("[root-tag]");
         for ([_]struct { col: u16, role: theme.Role }{
             .{ .col = layout.commit.col, .role = .accent },
-            .{ .col = layout.date.col, .role = .muted },
+            .{ .col = layout.date.col, .role = .history_date },
             .{ .col = layout.author.col, .role = .info },
             .{ .col = layout.topology.col, .role = .accent },
             .{ .col = layout.summary.col, .role = .prompt },

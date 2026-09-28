@@ -18,6 +18,7 @@ pub const Role = enum {
     selection_action_fg,
     selection_action_bg,
     pane_active_line_number,
+    history_date,
 
     syntax_keyword,
     syntax_operator,
@@ -137,6 +138,7 @@ pub const Palette = struct {
         // colors so it stays distinct from adjacent source tokens. Repository
         // uses it directly; Changes and Review use it through shared diff rendering.
         palette.set(.pane_active_line_number, .{ .rgb = .{ 255, 218, 170 } });
+        palette.set(.history_date, .{ .rgb = .{ 184, 178, 200 } });
 
         palette.deriveSyntaxRoles();
         palette.set(.diff_added, palette.color(.success));
@@ -321,6 +323,7 @@ test "roleFromKey maps known theme keys" {
     try std.testing.expectEqual(Role.selection_action_fg, roleFromKey("selection_action_fg").?);
     try std.testing.expectEqual(Role.selection_action_bg, roleFromKey("selection_action_bg").?);
     try std.testing.expectEqual(Role.pane_active_line_number, roleFromKey("pane_active_line_number").?);
+    try std.testing.expectEqual(Role.history_date, roleFromKey("history_date").?);
     try std.testing.expectEqual(Role.syntax_keyword, roleFromKey("syntax_keyword").?);
     try std.testing.expectEqual(Role.syntax_comment, roleFromKey("syntax_comment").?);
     try std.testing.expect(roleFromKey("repository_active_line_number") == null);
