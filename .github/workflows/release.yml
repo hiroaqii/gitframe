@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/release-notes/**
+      - scripts/release*
+      - scripts/publish-release.sh
+      - build.zig
+      - build.zig.zon
+  # Build downloadable artifacts without creating or publishing a release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check release scripts
+        run: python3 -m unittest discover -s scripts -p 'release_test.py' -v
+      - name: Validate version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          args=()
+          if [[ "$REF_TYPE" == tag ]]; then
+            args+=(--tag "$REF_NAME")
+          fi
+          python3 scripts/release.py version "${args[@]}" >> "$GITHUB_OUTPUT"
+      - name: Validate release notes
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: python3 scripts/release.py notes --tag "$RELEASE_TAG"
+
+  build:
+    needs: prepare
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-linux.5.15-gnu.2.35
+          - platform: macos-arm64
+            os: macos-15
+            target: aarch64-macos.15.0
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      ZIG_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build release binary
+        run: >-
+          zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
+          -Dcpu=baseline -j2 --summary new
+      - name: Test release configuration
+        env:
+          TMPDIR: ${{ runner.temp }}
+        # Keep peak compiler memory within the standard macOS runner's RAM.
+        run: >-
+          zig build test -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
+          -Dcpu=baseline -j1 --summary new
+      - name: Package and smoke-test archive
+        run: >-
+          python3 scripts/release.py package --tag "$RELEASE_TAG"
+          --platform "$RELEASE_PLATFORM" --binary zig-out/bin/gitframe
+          --output release
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: release/gitframe-*.tar.gz*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble:
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Verify both archives and generate checksums
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 scripts/release.py checksums --tag "$RELEASE_TAG" --output release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: |
+            release/*.tar.gz
+            release/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [prepare, assemble]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: bash scripts/publish-release.sh "$RELEASE_TAG" release

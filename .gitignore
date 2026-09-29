@@ -1,10 +1,10 @@
 .zig-cache/
 zig-out/
 zig-pkg/
+__pycache__/
 /release/
 /debug/
 /build/
 /build-*/
 /docgen_tmp/
 /tmp
-
