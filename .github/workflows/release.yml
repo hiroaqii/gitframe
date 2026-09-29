@@ -96,14 +96,13 @@ jobs:
       - name: Build release binary
         run: >-
           zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
-          -Dcpu=baseline -j2 --summary new
+          -Dcpu=baseline --summary new
       - name: Test release configuration
         env:
           TMPDIR: ${{ runner.temp }}
-        # Keep peak compiler memory within the standard macOS runner's RAM.
         run: >-
           zig build test -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
-          -Dcpu=baseline -j1 --summary new
+          -Dcpu=baseline --summary new
       - name: Package and smoke-test archive
         run: >-
           python3 scripts/release.py package --tag "$RELEASE_TAG"
