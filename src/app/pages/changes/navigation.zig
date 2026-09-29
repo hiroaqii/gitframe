@@ -5741,7 +5741,8 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
     app.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
     app.changesNavigation().scrollDiff(.down);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
-    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 2 }, app.pages.changes.viewer.diff_cursor);
+    // The cursor stays on the first visible row after scrolling.
+    try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.changes.viewer.diff_cursor);
 }
 
 test "generated preview blocks diff search" {
