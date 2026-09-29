@@ -1,14 +1,16 @@
 .{
     .name = .gitframe,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x424bfbfaa0066315, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .chasen = .{
-            .path = "../chasen",
+            .url = "git+https://github.com/hiroaqii/chasen.git#86ef5de75b1c48bdf46c1862542fdc4039cf74ae",
+            .hash = "chasen-0.1.0-lvlHSU9HBwBed2osSsNICrnIOGkmtCh_-9Ulym5m51ur",
         },
         .chasen_ui = .{
-            .path = "../chasen-ui",
+            .url = "git+https://github.com/hiroaqii/chasen-ui.git#68f9ed68723141719b0f4d41810b76db75f08185",
+            .hash = "chasen_ui-0.1.0-ATsSa_1OCgBI689wPX1lrBZQuvWu54-A7_kemVkDE5OM",
         },
         .flow_syntax = .{
             .url = "git+https://github.com/neurocyte/flow-syntax?ref=zig-0.16#4a44180376ec28e7bb4ed56c5b6fe24292c74930",
@@ -19,6 +21,9 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "LICENSE",
+        "README.md",
         "src",
+        "testdata",
     },
 }
