@@ -441,6 +441,7 @@ const ControlTerminal = enum {
 const ControlledTestHooks = struct {
     terminate_grace: std.Io.Duration = .fromSeconds(1),
     wait_failure_after_reap: ?anyerror = null,
+    group_signal_failure: ?anyerror = null,
     lifecycle_audit: ?*ControlledLifecycleAudit = null,
     ready_race: ?*ControlledReadyRace = null,
     synchronize_final_signal_after_child_exit: bool = false,
@@ -478,6 +479,10 @@ const WaitEvent = union(enum) {
 const DarwinWaitId = struct {
     extern "c" fn waitid(id_type: c_uint, id: u32, info: *std.c.siginfo_t, options: c_int) c_int;
 };
+
+const DarwinProcessInfo = if (builtin.os.tag == .macos) @cImport({
+    @cInclude("sys/sysctl.h");
+}) else struct {};
 
 const ZeroizingAllocator = struct {
     child: std.mem.Allocator,
@@ -666,12 +671,56 @@ fn signalProcessGroup(
     signal: std.posix.SIG,
     hooks: ControlledTestHooks,
 ) ?anyerror {
+    std.debug.assert(child.id != null and child.id.? == pid);
     recordSignalAttempt(child, hooks);
-    std.posix.kill(-pid, signal) catch |err| switch (err) {
-        error.ProcessNotFound => return null,
-        else => |signal_error| return signal_error,
+    const signal_error = hooks.group_signal_failure orelse failed: {
+        std.posix.kill(-pid, signal) catch |err| break :failed err;
+        return null;
     };
-    return null;
+    if (signal_error == error.ProcessNotFound) return null;
+    if (builtin.os.tag == .macos and signal_error == error.PermissionDenied and
+        darwinProcessGroupExiting(pid, std.heap.page_allocator, &std.c.sysctl)) return null;
+    return signal_error;
+}
+
+/// Darwin's group kill can return EPERM when every member is already exiting
+/// or a zombie. A leader's waitid result alone cannot establish this: a live
+/// descendant may remain, and P_WEXIT precedes waitid's completion observation.
+/// Never use partial or failed queries to suppress a real permission failure.
+fn darwinProcessGroupExiting(
+    pid: std.posix.pid_t,
+    allocator: std.mem.Allocator,
+    query: *const @TypeOf(std.c.sysctl),
+) bool {
+    const c = DarwinProcessInfo;
+    const mib = [_]c_int{ c.CTL_KERN, c.KERN_PROC, c.KERN_PROC_PGRP, pid };
+    const max_bytes = 4 * 1024 * 1024;
+    for (0..3) |_| {
+        var size: usize = 0;
+        switch (std.c.errno(query(&mib, mib.len, null, &size, null, 0))) {
+            .SUCCESS => {},
+            .INTR, .NOMEM => continue,
+            else => return false,
+        }
+        if (size > max_bytes or size % @sizeOf(c.struct_kinfo_proc) != 0) return false;
+        // Even a zero size query needs a non-null data buffer for a fresh,
+        // complete snapshot rather than another size-only observation.
+        const members = allocator.alloc(c.struct_kinfo_proc, @max(1, size / @sizeOf(c.struct_kinfo_proc))) catch return false;
+        defer allocator.free(members);
+        size = std.mem.sliceAsBytes(members).len;
+        switch (std.c.errno(query(&mib, mib.len, members.ptr, &size, null, 0))) {
+            .SUCCESS => {},
+            .INTR, .NOMEM => continue,
+            else => return false,
+        }
+        if (size > std.mem.sliceAsBytes(members).len or size % @sizeOf(c.struct_kinfo_proc) != 0) return false;
+        for (members[0 .. size / @sizeOf(c.struct_kinfo_proc)]) |member| {
+            if (member.kp_proc.p_pid <= 0 or member.kp_eproc.e_pgid != pid) return false;
+            if (member.kp_proc.p_stat != c.SZOMB and member.kp_proc.p_flag & c.P_WEXIT == 0) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 fn signalDirectChild(
@@ -1794,6 +1843,147 @@ test "process cancel completion race prefers a ready child result" {
     try std.testing.expectEqual(@as(usize, 0), audit.signal_attempts_after_reap);
     try std.testing.expectEqual(@as(usize, 1), audit.wait_calls);
     try std.testing.expectEqual(@as(usize, 1), audit.reaps);
+}
+
+test "process group macOS snapshots require complete terminal membership" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const c = DarwinProcessInfo;
+    const Fake = struct {
+        const Mode = enum { normal, size_failure, data_failure, short_size, short_data, oversized_size, oversized_data, interrupted, growing, grow_once };
+        var mode: Mode = .normal;
+        var members: [2]c.struct_kinfo_proc = undefined;
+        var count: usize = 2;
+        var calls: usize = 0;
+
+        fn query(mib: [*]const c_int, len: c_uint, buffer: ?*anyopaque, size: ?*usize, new: ?*anyopaque, new_len: usize) callconv(.c) c_int {
+            std.debug.assert(len == 4 and mib[2] == c.KERN_PROC_PGRP and mib[3] == 541);
+            std.debug.assert(new == null and new_len == 0);
+            calls += 1;
+            const failure: std.posix.E = switch (mode) {
+                .size_failure => if (buffer == null) .PERM else .SUCCESS,
+                .data_failure => if (buffer != null) .PERM else .SUCCESS,
+                .interrupted => .INTR,
+                .growing => if (buffer != null) .NOMEM else .SUCCESS,
+                .grow_once => if (calls == 2) .NOMEM else .SUCCESS,
+                else => .SUCCESS,
+            };
+            if (failure != .SUCCESS) {
+                std.c._errno().* = @intFromEnum(failure);
+                return -1;
+            }
+            if (buffer == null) {
+                size.?.* = switch (mode) {
+                    .short_size => 1,
+                    .oversized_size => 4 * 1024 * 1024 + @sizeOf(c.struct_kinfo_proc),
+                    else => count * @sizeOf(c.struct_kinfo_proc),
+                };
+                return 0;
+            }
+            if (mode == .short_data or mode == .oversized_data) {
+                size.?.* = if (mode == .short_data) 1 else size.?.* + @sizeOf(c.struct_kinfo_proc);
+                return 0;
+            }
+            const destination: [*]c.struct_kinfo_proc = @ptrCast(@alignCast(buffer.?));
+            std.debug.assert(size.?.* >= count * @sizeOf(c.struct_kinfo_proc));
+            @memcpy(destination[0..count], members[0..count]);
+            size.?.* = count * @sizeOf(c.struct_kinfo_proc);
+            return 0;
+        }
+    };
+    Fake.members = @splat(std.mem.zeroes(c.struct_kinfo_proc));
+    for (&Fake.members, 0..) |*member, i| {
+        member.kp_proc.p_pid = @intCast(541 + i);
+        member.kp_eproc.e_pgid = 541;
+        member.kp_proc.p_stat = c.SZOMB;
+    }
+    // P_WEXIT is already terminal even before waitid can observe completion.
+    Fake.members[1].kp_proc.p_stat = c.SRUN;
+    Fake.members[1].kp_proc.p_flag = c.P_WEXIT;
+    try std.testing.expect(darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+    Fake.members[1].kp_proc.p_flag = 0;
+    try std.testing.expect(!darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+    Fake.members[1].kp_proc.p_flag = c.P_SYSTEM;
+    try std.testing.expect(!darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+    Fake.members[1].kp_proc.p_stat = c.SZOMB;
+    Fake.members[1].kp_proc.p_pid = 0;
+    try std.testing.expect(!darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+    Fake.members[1].kp_proc.p_pid = 542;
+    Fake.members[1].kp_eproc.e_pgid = 999;
+    try std.testing.expect(!darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+    Fake.members[1].kp_eproc.e_pgid = 541;
+    for ([_]Fake.Mode{ .size_failure, .data_failure, .short_size, .short_data, .oversized_size, .oversized_data, .interrupted, .growing }) |mode| {
+        Fake.mode = mode;
+        Fake.calls = 0;
+        try std.testing.expect(!darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+        try std.testing.expect(Fake.calls <= 6);
+        if (mode == .interrupted) try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+        if (mode == .growing) try std.testing.expectEqual(@as(usize, 6), Fake.calls);
+    }
+    Fake.mode = .grow_once;
+    Fake.calls = 0;
+    try std.testing.expect(darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+    try std.testing.expectEqual(@as(usize, 4), Fake.calls);
+    Fake.mode = .normal;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expect(!darwinProcessGroupExiting(541, failing.allocator(), &Fake.query));
+    Fake.count = 0;
+    Fake.calls = 0;
+    try std.testing.expect(darwinProcessGroupExiting(541, std.testing.allocator, &Fake.query));
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+}
+
+test "process group signaling preserves failures for live members and accepts a zombie" {
+    try requireControlledProcessTest();
+    const io = std.testing.io;
+    var audit: ControlledLifecycleAudit = .{};
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "while :; do sleep 1; done" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const pid = child.id.?;
+    defer if (child.id != null) {
+        _ = finishGroupTermination(&child, pid, .{});
+        _ = reapChild(&child, io, .{}) catch {};
+    };
+    // Inject only the group syscall result; membership is read from the real OS.
+    try std.testing.expectEqual(error.PermissionDenied, signalProcessGroup(&child, pid, .TERM, .{ .group_signal_failure = error.PermissionDenied }).?);
+    try std.testing.expectEqual(error.InjectedSignalFailure, signalProcessGroup(&child, pid, .TERM, .{ .group_signal_failure = error.InjectedSignalFailure }).?);
+    try std.testing.expect(signalProcessGroup(&child, pid, .TERM, .{ .group_signal_failure = error.ProcessNotFound }) == null);
+    // Actual signals, never the injected failure, own fixture cleanup.
+    try std.testing.expect(finishGroupTermination(&child, pid, .{ .lifecycle_audit = &audit }) == null);
+    for (0..1000) |_| {
+        if (try childExitedWithoutReaping(pid)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(try childExitedWithoutReaping(pid));
+    try std.testing.expect(signalProcessGroup(&child, pid, .TERM, .{ .lifecycle_audit = &audit }) == null);
+    try std.testing.expect(finishGroupTermination(&child, pid, .{ .lifecycle_audit = &audit }) == null);
+    _ = try reapChild(&child, io, .{ .lifecycle_audit = &audit });
+    try std.testing.expectEqual(@as(usize, 1), audit.wait_calls);
+    try std.testing.expectEqual(@as(usize, 1), audit.reaps);
+    try std.testing.expectEqual(@as(usize, 0), audit.signal_attempts_after_reap);
+}
+
+test "controlled stdin preserves fast completion across group exit observation races" {
+    try requireControlledProcessTest();
+    for (0..16) |_| {
+        var result = runWithStdinControlledInternal(std.testing.allocator, std.testing.io, .{
+            .argv = &.{ "/bin/sh", "-c", "printf done" },
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(64),
+        }, .ordinary, .{}, .{ .terminate_grace = .fromMilliseconds(0) });
+        defer result.deinit(std.testing.allocator);
+        switch (result) {
+            .completed => |captured| {
+                try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, captured.ordinary.term);
+                try std.testing.expectEqualStrings("done", captured.ordinary.stdout);
+            },
+            else => return error.ExpectedControlledCompletion,
+        }
+    }
 }
 
 test "process group timeout kills TERM ignoring leader and descendant and reaps direct child" {
