@@ -18,6 +18,7 @@ const git_preview = @import("../../../git/history_preview.zig");
 const history_page = @import("../history.zig");
 const catalog = @import("catalog.zig");
 const loaded_diff = @import("../../../loaded_diff.zig");
+const path_key = @import("../../../path_key.zig");
 const root_capability = @import("../../../repo/root_capability.zig");
 const theme = @import("theme");
 
@@ -789,7 +790,12 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
     const page = context.page_state;
-    try drawPaneTitle(surface, row_prefix_width, "History", pane_active, context.palette);
+    const repository_name = if (context.repo_root) |root| name: {
+        const basename = std.fs.path.basename(root);
+        const raw = if (basename.len == 0) root else basename;
+        break :name if (path_key.isPlainDisplaySafe(raw)) raw else try path_key.quotedDisplayAlloc(surface.frameAllocator(), raw);
+    } else "History";
+    try drawPaneTitle(surface, row_prefix_width, repository_name, pane_active, context.palette);
 
     if (page.load_state == .no_repository) {
         drawState(surface, context.palette, "History", "History requires a repository", "R: switch repository");
@@ -844,7 +850,7 @@ fn viewPicker(context: ViewContext, surface: *chasen.Surface, pane_active: bool)
         try previousDiffLabel(surface.frameAllocator(), page.accepted.?)
     else
         null;
-    try drawCatalogContext(surface, context.palette, page, snapshot, previous, pane_active);
+    try drawCatalogContext(surface, context.palette, page, snapshot, previous, pane_active, repository_name);
 
     if (page.catalog.records.items.len == 0) {
         if (size.height > catalog.header_rows) try drawClipped(
@@ -1044,14 +1050,15 @@ fn drawCatalogContext(
     snapshot: *const git_history.Snapshot,
     previous: ?[]const u8,
     pane_active: bool,
+    repository_name: []const u8,
 ) !void {
     const size = surface.size();
     if (size.width <= row_prefix_width or size.height == 0) return;
     const allocator = surface.frameAllocator();
     const base = try std.fmt.allocPrint(
         allocator,
-        "History · {s}",
-        .{try catalogHeadContextLabel(allocator, snapshot)},
+        "{s} · {s}",
+        .{ repository_name, try catalogHeadContextLabel(allocator, snapshot) },
     );
     var left = base;
     if (page.catalog.capped) {
@@ -1103,12 +1110,12 @@ fn drawCatalogContext(
 
 fn catalogHeadContextLabel(allocator: std.mem.Allocator, snapshot: *const git_history.Snapshot) ![]const u8 {
     return switch (snapshot.display) {
-        .branch => |branch| if (snapshot.head) |head|
-            try std.fmt.allocPrint(allocator, "Branch {s} · HEAD {s}", .{ branch, head.short() })
+        .branch => |branch| if (snapshot.head != null)
+            try std.fmt.allocPrint(allocator, "Branch {s}", .{branch})
         else
             try std.fmt.allocPrint(allocator, "Branch {s} · HEAD unavailable", .{branch}),
-        .detached => if (snapshot.head) |head|
-            try std.fmt.allocPrint(allocator, "Detached HEAD {s}", .{head.short()})
+        .detached => if (snapshot.head != null)
+            "Detached HEAD"
         else
             "Detached HEAD unavailable",
         .unborn => |branch| try std.fmt.allocPrint(allocator, "Branch {s} · Unborn", .{branch}),
@@ -1397,11 +1404,11 @@ test "History preview three pane renders focus structured detail and flat files"
     var rendered: chasen.testing.TestSurface = undefined;
     try rendered.init(120, 27);
     defer rendered.deinit();
-    try view(.{ .page_state = &page_state, .palette = palette }, &rendered.surface);
+    try view(.{ .page_state = &page_state, .palette = palette, .repo_root = "/work/gitframe" }, &rendered.surface);
 
     const snapshot = try rendered.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "History") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "gitframe") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Range summary") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Changed files (2) +24 -31") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "Count: 3") != null);
@@ -1649,16 +1656,17 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
         var rendered: chasen.testing.TestSurface = undefined;
         try rendered.init(size.width, size.height);
         defer rendered.deinit();
-        try viewPicker(.{ .page_state = &page_state, .palette = palette }, &rendered.surface, true);
+        try viewPicker(.{ .page_state = &page_state, .palette = palette, .repo_root = "/work/gitframe" }, &rendered.surface, true);
         const snapshot = try rendered.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Branch main · HEAD 1111111") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "gitframe · Branch main") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, " · HEAD ") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Commit 3 of 1024") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "catalog head") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit   subject") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "HiHistory") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "root subject") != null);
-        try rendered.expectCellText(row_prefix_width, 0, "H");
+        try rendered.expectCellText(row_prefix_width, 0, "g");
         const layout = CommitRowLayout.init(size.width);
         try rendered.expectCellText(layout.commit.col, 2, "1");
         try rendered.expectCellText(layout.date.col, 2, "2");
@@ -1732,7 +1740,8 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try viewPicker(.{ .page_state = &page_state, .palette = detached_palette }, &detached_more.surface, true);
     const detached_more_snapshot = try detached_more.snapshot(allocator);
     defer allocator.free(detached_more_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Detached HEAD 1111111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Detached HEAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Detached HEAD 1111111") == null);
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "3 commits loaded · more available") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached_more_snapshot, "Enter  Load 200 older commits…") != null);
     const load_more_row: u16 = @intCast(catalog.header_rows + page_state.catalog.records.items.len);
@@ -1788,7 +1797,8 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     try viewPicker(.{ .page_state = &page_state, .palette = .default() }, &changed.surface, true);
     const changed_snapshot = try changed.snapshot(allocator);
     defer allocator.free(changed_snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "Branch feature · HEAD 2222222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "Branch feature") != null);
+    try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, " · HEAD ") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed_snapshot, "Previous diff: main @ 1111111") != null);
 
     page_state.catalog.capped = true;
