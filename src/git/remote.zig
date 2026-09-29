@@ -1785,7 +1785,9 @@ test "remote authentication blocks GUI interaction and bounds a noncooperating c
 
     var denied = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
     defer denied.deinit();
-    try std.testing.expectEqual(RemoteFailure.failed, commandFailure(&denied, true, .read_only).?);
+    // Git versions differ in the diagnostic emitted when prompting is disabled.
+    const failure = commandFailure(&denied, true, .read_only) orelse return error.ExpectedCredentialFailure;
+    try std.testing.expect(failure == .failed or failure == .authentication_required);
     try tmp.dir.access(io, "home/helper-invoked", .{});
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/gui-attempted", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "home/interaction-enabled", .{}));
@@ -1895,7 +1897,8 @@ test "credential helper requiring an omitted key returns only a fixed sensitive 
     var command = runBackgroundCredentialFill(allocator, io, work, &environment.map, .{});
     defer command.deinit();
     const failure = commandFailure(&command, true, .read_only) orelse return error.ExpectedCredentialFailure;
-    try std.testing.expectEqual(RemoteFailure.failed, failure);
+    // Both diagnostics must remain safe to present without the helper's stderr.
+    try std.testing.expect(failure == .failed or failure == .authentication_required);
     const raw = switch (command) {
         .completed => |*result| result.stderr.bytes(),
         else => return error.ExpectedSensitiveDiagnostic,

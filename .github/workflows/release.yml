@@ -78,6 +78,21 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Resolve release dependencies
+        run: |
+          # Configure the build to fetch required lazy dependencies without compiling.
+          for attempt in 1 2 3; do
+            if zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET" \
+              -Dcpu=baseline --help > /dev/null; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::Could not resolve release dependencies after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::Dependency resolution failed (attempt $attempt/3); retrying"
+            sleep "$((attempt * 5))"
+          done
       - name: Build release binary
         run: >-
           zig build -Doptimize=ReleaseSafe -Dtarget="$ZIG_TARGET"
