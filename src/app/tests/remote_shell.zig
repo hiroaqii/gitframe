@@ -72,7 +72,11 @@ const TestRepoPair = struct {
     b: [:0]u8,
 
     fn init() !TestRepoPair {
-        var tmp = std.testing.tmpDir(.{});
+        return initWithTmpDir(std.testing.tmpDir(.{}));
+    }
+
+    fn initWithTmpDir(directory: std.testing.TmpDir) !TestRepoPair {
+        var tmp = directory;
         errdefer tmp.cleanup();
         try tmp.dir.createDir(std.testing.io, "a", .default_dir);
         try tmp.dir.createDir(std.testing.io, "b", .default_dir);
@@ -1713,7 +1717,7 @@ test "finishPushForeground reloads matching active repo after failure" {
 
 test "inactive Changes foreground completions retain diagnostics without effects" {
     const allocator = std.testing.allocator;
-    var roots = try TestRepoPair.init();
+    var roots = try TestRepoPair.initWithTmpDir(try @import("../../test_tmp.zig").shortDir());
     defer roots.deinit();
     var app = try mutationFenceRepoTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);

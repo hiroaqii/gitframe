@@ -508,7 +508,7 @@ test "repository document classifies a unix domain socket" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try @import("../test_tmp.zig").shortDir();
     defer tmp.cleanup();
     const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root_path);

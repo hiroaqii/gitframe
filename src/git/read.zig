@@ -1205,7 +1205,6 @@ test "repository path history classification prioritizes current exact path stat
     try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
 
     const magic_path = ":(glob)literal[1].txt";
-    const invalid_path = "invalid-\xff.txt";
     try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "tracked base\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "history.txt", .data = "old history\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "cached.txt", .data = "cached base\n" });
@@ -1213,8 +1212,7 @@ test "repository path history classification prioritizes current exact path stat
     try tmp.dir.writeFile(io, .{ .sub_path = "pending-old.txt", .data = "pending rename\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "-leading.txt", .data = "leading\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = magic_path, .data = "magic\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = invalid_path, .data = "invalid\n" });
-    try runTestGit(io, &.{ "git", "--literal-pathspecs", "add", "--", "tracked.txt", "history.txt", "cached.txt", "rename-old.txt", "pending-old.txt", "-leading.txt", magic_path, invalid_path }, tmp.dir);
+    try runTestGit(io, &.{ "git", "--literal-pathspecs", "add", "--", "tracked.txt", "history.txt", "cached.txt", "rename-old.txt", "pending-old.txt", "-leading.txt", magic_path }, tmp.dir);
     try runTestGitWithDates(io, tmp.dir, "base", "@946684800 +0000", "@951827640 +0000");
 
     try runTestGit(io, &.{ "git", "rm", "--", "history.txt" }, tmp.dir);
@@ -1228,7 +1226,6 @@ test "repository path history classification prioritizes current exact path stat
     try expectCommittedPath(tmp.dir, "rename-new.txt", 951_827_700);
     try expectCommittedPath(tmp.dir, "-leading.txt", 951_827_640);
     try expectCommittedPath(tmp.dir, magic_path, 951_827_640);
-    try expectCommittedPath(tmp.dir, invalid_path, 951_827_640);
 
     // Every case below has old or potential history, but current state wins.
     try tmp.dir.writeFile(io, .{ .sub_path = "history.txt", .data = "recreated\n" });
@@ -1246,6 +1243,23 @@ test "repository path history classification prioritizes current exact path stat
     try expectUncommittedPath(tmp.dir, "intent.txt", .oid);
     try expectUncommittedPath(tmp.dir, "index-only.txt", .oid);
     try expectUncommittedPath(tmp.dir, "pending-new.txt", .oid);
+}
+
+test "repository path history accepts non-UTF-8 filenames when the filesystem supports them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const invalid_path = "invalid-\xff.txt";
+    // Some filesystems reject this fixture before Git or the history loader
+    // can use it. Only that capability failure skips this isolated case.
+    tmp.dir.writeFile(io, .{ .sub_path = invalid_path, .data = "invalid\n" }) catch |err| switch (err) {
+        error.BadPathName => return error.SkipZigTest,
+        else => return err,
+    };
+    try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, tmp.dir);
+    try runTestGit(io, &.{ "git", "--literal-pathspecs", "add", "--", invalid_path }, tmp.dir);
+    try runTestGitWithDates(io, tmp.dir, "base", "@946684800 +0000", "@951827640 +0000");
+    try expectCommittedPath(tmp.dir, invalid_path, 951_827_640);
 }
 
 test "repository path history handles unborn ignored and corrupt HEAD without fabricated facts" {
