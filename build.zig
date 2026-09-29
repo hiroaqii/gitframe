@@ -25,12 +25,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const chasen_mod = chasen_dep.module("chasen");
+    const chasen_ui_mod = chasen_ui_dep.module("chasen_ui");
+    // Shared public types require Chasen UI and GitFrame to import one module instance.
+    chasen_ui_mod.addImport("chasen", chasen_mod);
     const draw_mod = b.createModule(.{
         .root_source_file = b.path("src/draw.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+            .{ .name = "chasen", .module = chasen_mod },
         },
     });
     const theme_mod = b.createModule(.{
@@ -38,7 +42,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+            .{ .name = "chasen", .module = chasen_mod },
         },
     });
     const keymap_mod = b.createModule(.{
@@ -46,7 +50,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+            .{ .name = "chasen", .module = chasen_mod },
         },
     });
     const build_options = b.addOptions();
@@ -61,8 +65,8 @@ pub fn build(b: *std.Build) void {
 
     const mod = mod: {
         const base_imports: [6]std.Build.Module.Import = .{
-            .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-            .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+            .{ .name = "chasen", .module = chasen_mod },
+            .{ .name = "chasen_ui", .module = chasen_ui_mod },
             .{ .name = "draw", .module = draw_mod },
             .{ .name = "theme", .module = theme_mod },
             .{ .name = "keymap", .module = keymap_mod },
@@ -108,8 +112,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "gitframe", .module = mod },
-                .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-                .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                .{ .name = "chasen", .module = chasen_mod },
+                .{ .name = "chasen_ui", .module = chasen_ui_mod },
                 .{ .name = "build_options", .module = build_options_mod },
             },
         }),
@@ -179,7 +183,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                .{ .name = "chasen_ui", .module = chasen_ui_mod },
             },
         }),
         .filters = test_filters,
@@ -192,7 +196,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                .{ .name = "chasen_ui", .module = chasen_ui_mod },
             },
         }),
         .filters = test_filters,
@@ -215,7 +219,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "chasen", .module = chasen_dep.module("chasen") },
+                .{ .name = "chasen", .module = chasen_mod },
             },
         }),
         .filters = test_filters,
@@ -277,8 +281,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-                .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                .{ .name = "chasen", .module = chasen_mod },
+                .{ .name = "chasen_ui", .module = chasen_ui_mod },
                 .{ .name = "draw", .module = draw_mod },
                 .{ .name = "theme", .module = theme_mod },
                 .{ .name = "keymap", .module = keymap_mod },
@@ -316,8 +320,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
-                    .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-                    .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                    .{ .name = "chasen", .module = chasen_mod },
+                    .{ .name = "chasen_ui", .module = chasen_ui_mod },
                     .{ .name = "draw", .module = draw_mod },
                     .{ .name = "theme", .module = theme_mod },
                     .{ .name = "keymap", .module = keymap_mod },
@@ -337,8 +341,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
-                    .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-                    .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                    .{ .name = "chasen", .module = chasen_mod },
+                    .{ .name = "chasen_ui", .module = chasen_ui_mod },
                 },
             }),
         });
@@ -355,8 +359,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "flow_syntax", .module = flow_syntax_dep.module("syntax") },
-                    .{ .name = "chasen", .module = chasen_dep.module("chasen") },
-                    .{ .name = "chasen_ui", .module = chasen_ui_dep.module("chasen_ui") },
+                    .{ .name = "chasen", .module = chasen_mod },
+                    .{ .name = "chasen_ui", .module = chasen_ui_mod },
                 },
             }),
         });
