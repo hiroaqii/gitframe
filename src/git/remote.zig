@@ -3179,7 +3179,7 @@ test "remote push failure phase preserves actual effects" {
         }
         try tmp.dir.createDir(io, "bin", .default_dir);
         const fault = switch (case) {
-            .spawn_failure, .after_fetch_spawn => "/usr/bin/rm -- \"$0\"\n",
+            .spawn_failure, .after_fetch_spawn => "/bin/rm -- \"$0\" || exit 97\n",
             .cancel, .timeout => "printf pushed > pushed.marker\n/bin/sleep 10\n",
             .overflow, .preflight_overflow => "/usr/bin/head -c 300000 /dev/zero\n",
             .signal => "kill -TERM $$\n",
@@ -3227,6 +3227,9 @@ test "remote push failure phase preserves actual effects" {
             .kind = if (case == .after_fetch_spawn) .{ .pull_refresh_ff_only = .{ .branch = "main", .remote = "origin", .remote_branch = "main", .upstream_ref = "refs/remotes/origin/main", .oid = trimLineEnd(oid_o) } } else .{ .push = .{ .branch = "main", .remote = "origin", .remote_branch = "main", .oid = trimLineEnd(oid_a) } },
         });
         if (cancel_future) |*future| try future.await(io);
+        if (case == .spawn_failure or case == .after_fetch_spawn) {
+            try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "bin/git", .{}));
+        }
         const expected: RemoteOperationOutcome = switch (case) {
             .normal => .{ .ok = .completed },
             .overflow, .signal, .after_fetch_spawn => .{ .failed = .outcome_unknown },
