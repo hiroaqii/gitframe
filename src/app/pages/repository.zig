@@ -784,7 +784,7 @@ pub const RepositoryPageState = struct {
         self.needs_change_map_request = false;
         self.needs_revalidation = false;
         self.freshness = .validating;
-        if (self.bundle != null or self.status.provenance == .repository_read) self.setReadStatus(.manifest, "Validating repository...", .{});
+        if (self.status.provenance == .repository_read) self.status.clear();
         if (self.bundle == null) self.load_state = .loading;
         return .{
             .identity = .{ .origin = .repository, .repo_epoch = self.repo_epoch, .activation_id = self.activation_id },
@@ -964,7 +964,7 @@ pub const RepositoryPageState = struct {
             );
             std.debug.assert(bound);
         }
-        if (self.displayed_document != null or self.status.provenance == .repository_read) self.setReadStatus(.document, "Validating selected file...", .{});
+        if (self.status.provenance == .repository_read) self.status.clear();
         return .{
             .identity = .{ .origin = .repository, .repo_epoch = self.repo_epoch, .activation_id = self.activation_id },
             .generation = self.document_generation,
@@ -1690,7 +1690,7 @@ pub const RepositoryPageState = struct {
         };
     }
 
-    /// Background reads may replace their loading/error message, but a newer
+    /// Background reads may replace their error message, but a newer
     /// clipboard/search/action notification keeps the shared status slot.
     fn setReadStatus(self: *RepositoryPageState, owner: app_state.RepositoryReadStatus.Owner, comptime fmt: []const u8, args: anytype) void {
         if (self.status.text().len > 0 and self.status.provenance != .repository_read) return;
@@ -3722,7 +3722,9 @@ test "repository explicit reload restores typed root and directory across outcom
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer unchanged.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &unchanged, test_body_size));
+    _ = state.applyFinished(allocator, &unchanged, test_body_size);
+    try std.testing.expect(state.pending_generation == null);
+    try std.testing.expect(state.freshness == .fresh);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
@@ -3752,7 +3754,9 @@ test "repository explicit reload restores typed root and directory across outcom
     };
     defer changed.deinit(allocator);
 
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &changed, test_body_size));
+    _ = state.applyFinished(allocator, &changed, test_body_size);
+    try std.testing.expect(state.pending_generation == null);
+    try std.testing.expect(state.bundle.?.tree.filePath("new.zig", .all) != null);
     try std.testing.expectEqual(@as(?u16, 42), state.viewer.tree_width);
     try std.testing.expect(state.viewer.tree_hidden);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
@@ -6242,7 +6246,8 @@ test "repository page accepts active and inactive matching manifest completions"
         .result = .{ .loaded = try bundleForTest("src/main.zig\x00") },
     };
     defer finished.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &finished, test_body_size));
+    _ = state.applyFinished(std.testing.allocator, &finished, test_body_size);
+    try std.testing.expect(state.pending_generation == null);
     try std.testing.expectEqualStrings("src/main.zig", state.selected_path.?);
     try std.testing.expect(state.freshness == .fresh);
 
@@ -6257,7 +6262,10 @@ test "repository page accepts active and inactive matching manifest completions"
         .result = .{ .unchanged = retained_bundle.document.fingerprint },
     };
     defer unchanged.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &unchanged, test_body_size));
+    _ = state.applyFinished(std.testing.allocator, &unchanged, test_body_size);
+    try std.testing.expect(state.pending_generation == null);
+    try std.testing.expect(state.freshness == .fresh);
+    try std.testing.expectEqualStrings("src/main.zig", state.selected_path.?);
     try std.testing.expectEqual(retained_bundle, &state.bundle.?);
 
     state.needs_revalidation = true;
@@ -6271,8 +6279,11 @@ test "repository page accepts active and inactive matching manifest completions"
         .result = .{ .loaded = try bundleForTest("README.md\x00src/main.zig\x00") },
     };
     defer inactive.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(std.testing.allocator, &inactive, test_body_size));
+    _ = state.applyFinished(std.testing.allocator, &inactive, test_body_size);
+    try std.testing.expect(state.pending_generation == null);
+    try std.testing.expect(!state.active);
     try std.testing.expect(state.bundle != null);
+    try std.testing.expect(state.bundle.?.tree.filePath("README.md", .all) != null);
     try std.testing.expect(state.freshness == .validating);
     state.activate(7, root.capability.identity);
     try std.testing.expect(state.needs_revalidation);
@@ -8635,9 +8646,11 @@ fn expectReactivatedIncomingDocumentForTest(
         .result = .{ .unchanged = state.bundle.?.document.fingerprint },
     };
     defer manifest_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyFinished(allocator, &manifest_finished, test_body_size));
+    _ = state.applyFinished(allocator, &manifest_finished, test_body_size);
+    try std.testing.expect(state.pending_generation == null);
     try std.testing.expect(state.incoming == .awaiting_document);
     try std.testing.expect(state.needs_document_revalidation);
+    try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
 
     var document_request = try state.prepareDocumentRequest(allocator, &root.capability);
     defer document_request.deinit(allocator);
@@ -8654,7 +8667,8 @@ fn expectReactivatedIncomingDocumentForTest(
         .value = value,
     };
     defer document_finished.deinit(allocator);
-    try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &document_finished));
+    _ = state.applyDocumentFinished(allocator, &document_finished);
+    try std.testing.expect(state.pending_document_generation == null);
 
     if (expected_cursor) |cursor| {
         try std.testing.expect(state.incoming == .none);
@@ -9636,7 +9650,7 @@ test "repository read completions clear only owned status and preserve newer ope
             state.root_identity = root.capability.identity;
             var request = try state.prepareRequest(allocator, root.path, &root.capability);
             defer request.deinit(allocator);
-            try std.testing.expect(state.status.provenance == .repository_read);
+            try std.testing.expectEqualStrings("", state.status.text());
             if (newer_message) state.status.set("Clipboard failed", .{});
             var finished = repository_tasks.ManifestFinished{
                 .identity = request.identity,
@@ -9655,6 +9669,7 @@ test "repository read completions clear only owned status and preserve newer ope
             if (completion == .failed) {
                 var retry = try state.prepareRequest(allocator, root.path, &root.capability);
                 defer retry.deinit(allocator);
+                try std.testing.expectEqualStrings(if (newer_message) "Clipboard failed" else "", state.status.text());
                 finished.generation = retry.generation;
                 finished.result = .{ .unchanged = state.bundle.?.document.fingerprint };
                 _ = state.applyFinished(allocator, &finished, test_body_size);
@@ -9667,6 +9682,7 @@ test "repository read completions clear only owned status and preserve newer ope
             if (!newer_message) try std.testing.expect(std.mem.indexOf(u8, state.status.text(), "Could not start") != null);
             var retry = try state.prepareDocumentRequest(allocator, &root.capability);
             defer retry.deinit(allocator);
+            try std.testing.expectEqualStrings(if (newer_message) "Clipboard failed" else "", state.status.text());
             var document = repository_tasks.DocumentFinished{
                 .identity = retry.identity,
                 .root_identity = retry.root.identity,

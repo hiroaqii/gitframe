@@ -464,11 +464,12 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         app.user_config.editor.argv[1] = "+{line}";
         app.user_config.editor.argv[2] = "{path}";
         app.user_config.editor.argv_len = 3;
+        app.pages.repository.status.clear();
         try app.shellEffects().requestEditor(&ctx, ready, false, origin);
         const entry = ctx._pending_foreground_commands[0];
         try std.testing.expectEqualStrings("+42", entry.argv[1]);
         try std.testing.expectEqualStrings("src/main.zig", entry.argv[2]);
-        try std.testing.expectEqualStrings("opening editor: src/main.zig", app.pages.repository.status.text());
+        try std.testing.expectEqualStrings("", app.pages.repository.status.text());
         try std.testing.expectEqual(shell_effects.EditorFinishOutcome.reload_repository, app.shellEffects().finishEditor(.{
             .request_id = entry.request_id,
             .outcome = .{ .failed = .{ .stage = .spawn, .error_name = "FileNotFound" } },
@@ -541,7 +542,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
         }
         try std.testing.expect(entry.runtimeChildEnvironment() == null);
 
-        try std.testing.expectEqualStrings("opening editor: src/main.zig", app.pages.changes.status.text());
+        try std.testing.expectEqualStrings("", app.pages.changes.status.text());
         try std.testing.expectEqual(request_id.id, app.shell_state.editor_foreground.?.request_id.id);
         try std.testing.expectEqual(
             shell_effects.EditorFinishOutcome.none,
@@ -560,7 +561,7 @@ test "openSelectedFileInEditor blocks while git action is pending" {
             }),
         );
         try std.testing.expect(app.shell_state.editor_foreground == null);
-        try std.testing.expectEqualStrings("editor closed", app.pages.changes.status.text());
+        try std.testing.expectEqualStrings("", app.pages.changes.status.text());
         try std.testing.expectEqual(
             shell_effects.EditorFinishOutcome.none,
             app.shellEffects().finishEditor(.{

@@ -641,7 +641,6 @@ pub const Controller = struct {
         try self.installPreparedRecent(ctx, &next);
         repo_picker.focusVisibleIndex(&self.state.repo_picker, focused);
         self.state.repo_picker.clearPathStatus();
-        self.setStatus("removed recent repository", .{});
     }
 
     pub fn finishPathDiscovery(

@@ -82,7 +82,6 @@ pub const ViewContext = struct {
         var resolver = navigation.resolver();
         var result = diff_surface.view.footer(.{
             .surface = navigation.view().surface,
-            .auto_reload_enabled = false,
             .selection_action_visible = navigation.bodyView(&resolver).retainedSelectionActionAvailable(),
         });
         result.source_label = null;

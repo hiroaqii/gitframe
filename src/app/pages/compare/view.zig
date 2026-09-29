@@ -32,7 +32,6 @@ pub const Context = struct {
         var resolver = navigation.resolver();
         var result = diff_surface.view.footer(.{
             .surface = self.page.readSurface(self.layout),
-            .auto_reload_enabled = false,
             .selection_action_visible = navigation.bodyView(&resolver).retainedSelectionActionAvailable(),
         });
         result.source_label = null;

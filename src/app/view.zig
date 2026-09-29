@@ -92,7 +92,6 @@ pub const Context = struct {
     page_bar_visible: bool,
     theme: theme.Palette,
     keymap: keymap.Effective,
-    terminal_size: chasen.Size,
     action: action_lifecycle.View,
     remote_cancelable: bool = false,
     remote_canceling: bool = false,
@@ -536,14 +535,9 @@ pub fn footerStatusTarget(app: Context, width: u16) ?FooterStatusTarget {
     if (app.action.spinnerPresentation() != null) return null;
     const visible = app_state.resolveVisibleStatus(app.status, app.page_status) orelse return null;
 
-    var terminal_buffer: [32]u8 = undefined;
-    const terminal_text = std.fmt.bufPrint(terminal_buffer[0..], "{d}x{d}", .{
-        app.terminal_size.width,
-        app.terminal_size.height,
-    }) catch return null;
     var key_buffers: [footer_hint_capacity][16]u8 = undefined;
     const hints = footerHints(app, &key_buffers);
-    const projection = projectFooter(app, width, &hints, terminal_text, null);
+    const projection = projectFooter(app, width, &hints, null);
     const status_segment = projection.status_segment orelse return null;
     const range = projection.segments.renderedRange(status_segment, projection.left_limit) orelse return null;
     return .{
@@ -563,12 +557,8 @@ fn viewFooter(app: Context, surface: *chasen.Surface) void {
 
     var footer_key_buffers: [footer_hint_capacity][16]u8 = undefined;
     const hints = footerHints(app, &footer_key_buffers);
-    const terminal_text = std.fmt.allocPrint(surface.frameAllocator(), "{d}x{d}", .{
-        app.terminal_size.width,
-        app.terminal_size.height,
-    }) catch return;
     const spinner_text = gitActionSpinnerText(app, surface.frameAllocator());
-    const projection = projectFooter(app, width, &hints, terminal_text, spinner_text);
+    const projection = projectFooter(app, width, &hints, spinner_text);
 
     var left_area = surface.child(.{
         .col = 0,
@@ -612,7 +602,6 @@ fn projectFooter(
     app: Context,
     width: u16,
     hints: *const FooterHints,
-    terminal_text: []const u8,
     spinner_text: ?[]const u8,
 ) FooterProjection {
     const hint_options = footerKeyHintOptions(app.theme);
@@ -622,11 +611,6 @@ fn projectFooter(
     else
         essential_hint_width +| 1;
     var footer_segments = FooterSegments{};
-    footer_segments.append(.{
-        .text = terminal_text,
-        .style = app.theme.style(.muted),
-        .drop_priority = .terminal,
-    });
     if (app.active_page == .changes) {
         const changes_footer = app.changes.footer();
         if (changes_footer.source_label) |label| footer_segments.append(.{
@@ -634,18 +618,11 @@ fn projectFooter(
             .style = app.theme.style(.prompt),
             .drop_priority = .source,
         });
-        if (changes_footer.auto_reload_enabled) footer_segments.append(.{
-            .text = "auto-refresh",
-            .style = app.theme.style(.staged),
-            .drop_priority = .auto,
-        });
         if (changes_footer.activation) |activation| footer_segments.append(.{
             .text = switch (activation) {
-                .validating => "validating",
                 .stale => "stale",
             },
             .style = switch (activation) {
-                .validating => app.theme.style(.prompt),
                 .stale => app.theme.style(.danger),
             },
             .drop_priority = .source,
@@ -678,11 +655,9 @@ fn projectFooter(
         });
         if (footer.activation) |activation| footer_segments.append(.{
             .text = switch (activation) {
-                .validating => "validating",
                 .stale => "stale",
             },
             .style = switch (activation) {
-                .validating => app.theme.style(.prompt),
                 .stale => app.theme.style(.danger),
             },
             .drop_priority = .source,
@@ -778,8 +753,6 @@ fn projectFooterHints(
 
 const FooterDropPriority = enum {
     source,
-    auto,
-    terminal,
 };
 
 const FooterSegment = struct {
@@ -805,7 +778,7 @@ const FooterSegments = struct {
     }
 
     fn fit(self: *FooterSegments, width: u16) void {
-        const order = [_]FooterDropPriority{ .source, .auto, .terminal };
+        const order = [_]FooterDropPriority{.source};
         for (order) |priority| {
             if (self.requiredWidth() <= width) return;
             self.drop(priority);
@@ -2534,7 +2507,7 @@ test "footer falls back to pending kind when status is empty" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "| push") != null);
 }
 
-test "footer labels enabled automatic reload as auto-refresh" {
+test "footer keeps action hints without terminal size or automatic reload labels" {
     var app: ShellViewTestHarness = .{ .terminal_size = .{ .width = 120, .height = 32 } };
     app.changes.auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s };
 
@@ -2546,7 +2519,8 @@ test "footer labels enabled automatic reload as auto-refresh" {
     const snapshot = try ts.snapshot(std.testing.allocator);
     defer std.testing.allocator.free(snapshot);
 
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto-refresh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "auto-refresh") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "120x32") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "b: switch branch") != null);
 }
 
@@ -2625,7 +2599,6 @@ const ShellViewTestHarness = struct {
             .page_bar_visible = false,
             .theme = self.theme,
             .keymap = self.keymap,
-            .terminal_size = self.terminal_size,
             .action = self.action_runtime.view(),
             .remote_cancelable = self.remote_cancelable,
             .status = &self.status,
@@ -2781,7 +2754,6 @@ test "footer normal-mode hints match the decided page lists" {
         ui.key_hint.item("R", "switch repo"),
         ui.key_hint.item("?", "help"),
     });
-    context.terminal_size = .{ .width = 120, .height = 32 };
     var footer: chasen.testing.TestSurface = undefined;
     try footer.init(120, 1);
     defer footer.deinit();
@@ -2790,7 +2762,7 @@ test "footer normal-mode hints match the decided page lists" {
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "m: select commits") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "commit history") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "120x32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "120x32") == null);
 }
 
 test "History picker footer keeps diff actions and range state without the local Space hint" {

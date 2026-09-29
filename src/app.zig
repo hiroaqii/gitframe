@@ -1550,7 +1550,6 @@ pub const App = struct {
             .page_bar_visible = true,
             .theme = self.theme,
             .keymap = self.keymap,
-            .terminal_size = self.terminal_size,
             .action = self.actionLifecycleView(),
             .remote_cancelable = remote.canCancel(self.actionLifecycleView().acceptedPending()),
             .remote_canceling = remote.canceling(),

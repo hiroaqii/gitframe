@@ -1,8 +1,7 @@
 //! Page-independent footer and state rendering for a diff surface.
 //!
 //! Pages inject only presentation values which are outside the shared surface
-//! contract (currently the auto-reload capability). This module must not
-//! import a page namespace.
+//! contract. This module must not import a page namespace.
 
 const std = @import("std");
 const chasen = @import("chasen");
@@ -39,20 +38,16 @@ pub const FooterView = struct {
     /// Suppress ordinary shell hints while those actions are unreachable.
     normal_action_hints_enabled: bool,
     sidebar_hidden: bool,
-    auto_reload_enabled: bool,
     source_label: ?[]const u8,
     activation: ?ActivationPresentation,
 };
 
 pub const ActivationPresentation = enum {
-    validating,
     stale,
 };
 
 pub const FooterArgs = struct {
     surface: diff_surface.ReadSurface,
-    /// Page-owned policy narrowed to a presentation-only value.
-    auto_reload_enabled: bool,
     /// True only when the retained selection status is admitted for the
     /// exact body currently on screen. A stale retained candidate must not
     /// suppress otherwise reachable normal-mode hints.
@@ -65,7 +60,6 @@ pub fn footer(args: FooterArgs) FooterView {
             !args.surface.file_search.mode and
             !args.selection_action_visible,
         .sidebar_hidden = args.surface.viewer.sidebar_hidden,
-        .auto_reload_enabled = args.auto_reload_enabled,
         .source_label = sourceFooterLabel(args.surface.source),
         .activation = activationPresentation(args.surface.activation),
     };
@@ -77,7 +71,7 @@ pub fn activationPresentation(activation: *const diff_surface.authority.Lifecycl
         .active => |active| blk: {
             const members = active.members;
             if (members.source == .pending or members.status == .pending or members.branch == .pending) {
-                break :blk .validating;
+                break :blk null;
             }
             if (members.source == .failed or members.status == .failed or members.branch == .failed) {
                 break :blk .stale;

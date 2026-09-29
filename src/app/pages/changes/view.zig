@@ -65,7 +65,6 @@ pub const Context = struct {
     pub fn footer(self: Context) FooterView {
         return diff_surface_view.footer(.{
             .surface = self.page.readSurface(self.source, self.navigation.layout),
-            .auto_reload_enabled = self.page.auto_reload.enabled(),
             .selection_action_visible = self.navigation.retainedSelectionActionAvailable(),
         });
     }
@@ -155,10 +154,10 @@ fn activationPresentation(changes: *const changes_page.ChangesPageState) ?Activa
     return diff_surface_view.activationPresentation(&changes.activation);
 }
 
-test "activation reports validating and stale" {
+test "activation stays silent while validating and reports stale failures" {
     var changes: changes_page.ChangesPageState = .{};
     _ = changes.activation.activate(1, .pending, .pending, .pending);
-    try std.testing.expectEqual(ActivationPresentation.validating, activationPresentation(&changes).?);
+    try std.testing.expect(activationPresentation(&changes) == null);
 
     changes.activation.state.active.members = .{ .source = .fresh, .status = .failed, .branch = .fresh };
     try std.testing.expectEqual(ActivationPresentation.stale, activationPresentation(&changes).?);

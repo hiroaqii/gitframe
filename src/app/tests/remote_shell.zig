@@ -1773,7 +1773,7 @@ test "inactive Changes foreground completions retain diagnostics without effects
         .outcome = .{ .exited = 0 },
     } } }, &ctx);
 
-    try std.testing.expectEqualStrings("editor closed", app.pages.changes.status.text());
+    try std.testing.expectEqualStrings(expected_status, app.pages.changes.status.text());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
@@ -1801,7 +1801,7 @@ test "inactive Changes foreground completions retain diagnostics without effects
     } } }, &active_ctx);
 
     try std.testing.expect(active_app.shell_effects_state.editor_foreground == null);
-    try std.testing.expectEqualStrings("editor closed", active_app.pages.changes.status.text());
+    try std.testing.expectEqualStrings("", active_app.pages.changes.status.text());
     try std.testing.expectEqual(@as(u8, 3), active_ctx._pending_tasks_len);
 }
 

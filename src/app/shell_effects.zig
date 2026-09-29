@@ -257,7 +257,6 @@ pub const Controller = struct {
             .request_id = request_id,
             .origin = origin,
         };
-        self.setEffectStatus(.{ .page = origin }, "opening editor: {s}", .{target.path});
     }
 
     pub fn finishEditor(
@@ -276,9 +275,7 @@ pub const Controller = struct {
 
         switch (result.outcome) {
             .exited => |code| {
-                if (code == 0) {
-                    self.setEffectStatus(origin, "editor closed", .{});
-                } else {
+                if (code != 0) {
                     self.setEffectStatus(origin, "editor exited: {d}", .{code});
                 }
             },
