@@ -154,6 +154,8 @@ pub fn build(b: *std.Build) void {
     const draw_tests = b.addTest(.{
         .root_module = draw_mod,
         .filters = test_filters,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     const run_draw_tests = b.addRunArtifact(draw_tests);
 
@@ -187,6 +189,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     const run_diff_view_model_tests = b.addRunArtifact(diff_view_model_tests);
 
@@ -200,6 +204,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     const run_diff_search_tests = b.addRunArtifact(diff_search_tests);
 
@@ -223,6 +229,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     const run_sidebar_view_model_tests = b.addRunArtifact(sidebar_view_model_tests);
 
@@ -276,6 +284,8 @@ pub fn build(b: *std.Build) void {
 
     const perf_baseline_exe = b.addExecutable(.{
         .name = "gitframe-perf-baseline",
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/perf_baseline.zig"),
             .target = target,
@@ -411,6 +421,8 @@ pub fn build(b: *std.Build) void {
     const keymap_tests = b.addTest(.{
         .root_module = keymap_mod,
         .filters = test_filters,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
     const check_tests_step = b.step("check-tests", "Compile all test artifacts without executing them");
