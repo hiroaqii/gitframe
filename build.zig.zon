@@ -23,6 +23,7 @@
         "build.zig.zon",
         "LICENSE",
         "README.md",
+        "docs",
         "scripts",
         "src",
         "testdata",

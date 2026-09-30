@@ -115,6 +115,7 @@ def package(args):
         shutil.copyfile(binary, stage / "gitframe")
         for document in ("README.md", "LICENSE"):
             shutil.copyfile(ROOT / document, stage / document)
+        shutil.copytree(ROOT / "docs", stage / "docs")
         (stage / "BUILD-INFO.json").write_text(json.dumps({
             "version": version,
             "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),

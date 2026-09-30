@@ -39,9 +39,9 @@ gitframe-v0.1.0-macos-arm64.tar.gz
 SHA256SUMS
 ```
 
-Each archive contains `gitframe`, `README.md`, GitFrame's own `LICENSE`, and
-`BUILD-INFO.json`. The archive has a single enclosing directory matching its
-filename without `.tar.gz`.
+Each archive contains `gitframe`, `README.md`, `docs/guide.md`, GitFrame's own
+`LICENSE`, and `BUILD-INFO.json`. The archive has a single enclosing directory
+matching its filename without `.tar.gz`.
 
 ## Publish
 
@@ -62,6 +62,22 @@ No paid service or additional secret is required for this public repository.
 An interrupted upload can be rerun while the release remains a draft. Before
 publishing, the draft body is refreshed from the tagged notes file. A published
 release is never overwritten by the workflow. Prerelease tags are not supported yet.
+
+## Update installation instructions and Homebrew
+
+After the GitHub Release is published, update `Formula/gitframe.rb` in
+[hiroaqii/homebrew-tap](https://github.com/hiroaqii/homebrew-tap) with the new
+version and both SHA-256 hashes from the release's `SHA256SUMS`. Check its
+**Install** workflow before merging the update. This tests Homebrew and mise
+installation on Linux and macOS, including execution without removing
+quarantine attributes on macOS. The Formula update is currently manual.
+
+The [guide's mise command](../docs/guide.md#mise) uses `@latest`, so it needs no
+version edit for each release. mise uses the existing GitHub Release directly
+and needs no separate registry update. Its default minimum release age can
+exclude a newly published version from `@latest` for 24 hours. Keep the
+[source instructions' Zig version](../docs/guide.md#from-source) aligned with
+the workflow.
 
 ## Local validation
 
