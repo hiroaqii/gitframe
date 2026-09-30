@@ -1384,10 +1384,8 @@ pub fn runStatusLoadWithOrigin(
     switch (raw_result) {
         .ok => |bytes| {
             defer allocator.free(bytes);
-            // Empty porcelain output is a valid clean-worktree snapshot. Keep it
-            // as a loaded document so App can remember which repo was proven
-            // clean; otherwise pull's clean-worktree gate sees the status as
-            // stale forever on clean repositories.
+            // Empty porcelain output is a valid status snapshot. Keep it as a
+            // loaded document associated with the repository that was read.
             var bundle = git_status.StatusBundle.parseOwned(allocator, bytes) catch |err| {
                 return .{ .failed = std.fmt.allocPrint(allocator, "Status parse failed: {s}", .{@errorName(err)}) catch
                     return .{ .failed_static = "Status parse failed: OutOfMemory" } };

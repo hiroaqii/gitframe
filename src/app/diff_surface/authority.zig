@@ -57,8 +57,8 @@ pub const Action = enum {
             .read_diff => .{ .source = .readable },
             .stage_hunk, .unstage_hunk => .{ .source = .fresh, .status = .fresh },
             .stage_file, .unstage_file, .discard_file, .commit => .{ .source = .fresh, .status = .fresh },
-            .push, .fetch => .{ .branch = .fresh },
-            .pull, .create_stash => .{ .status = .fresh, .branch = .fresh },
+            .push, .pull, .fetch => .{ .branch = .fresh },
+            .create_stash => .{ .status = .fresh, .branch = .fresh },
         };
     }
 };
@@ -319,7 +319,7 @@ test "action requirements do not globally couple auxiliary members" {
         Action.push.requirements(),
     );
     try std.testing.expectEqual(
-        Requirements{ .status = .fresh, .branch = .fresh },
+        Requirements{ .branch = .fresh },
         Action.pull.requirements(),
     );
     try std.testing.expectEqual(

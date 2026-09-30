@@ -332,7 +332,7 @@ test "clean empty state hides stale branch status chrome" {
     try app_test_support.expectSnapshotContains(&ts, "0 files / 0 hunks");
 }
 
-test "clean empty state advertises pull only when clean status snapshot is fresh" {
+test "clean empty state advertises pull without a file status snapshot" {
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(110, 18);
     defer ts.deinit();
@@ -364,16 +364,7 @@ test "clean empty state advertises pull only when clean status snapshot is fresh
     syncTestActivation(&app);
 
     try app.view(&ts.surface);
-    try app_test_support.expectSnapshotNotContains(&ts, "U to fetch + fast-forward");
-
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
-    try app.pages.changes.git_status.replace("/repo", &status_bundle);
-
-    var ts_ready: chasen.testing.TestSurface = undefined;
-    try ts_ready.init(110, 18);
-    defer ts_ready.deinit();
-    try app.view(&ts_ready.surface);
-    try app_test_support.expectSnapshotContains(&ts_ready, "U to fetch + fast-forward");
+    try app_test_support.expectSnapshotContains(&ts, "U to fetch + fast-forward");
 }
 
 test "clean empty state shows bound fetch key from effective keymap" {

@@ -252,10 +252,14 @@ Applying a stash keeps the saved entry and does not restore its original
 staged/unstaged classification. Dropping a stash removes that saved entry;
 it does not discard the current worktree's changes.
 
-Pull requires an upstream and a clean worktree, including no untracked
-files. It does not merge or rebase divergent branches. Resolve divergence
-with Git before retrying. Remote operations use your existing Git
-authentication setup; see [Troubleshooting](#troubleshooting) if one fails.
+Pull requires an upstream and supports fast-forward only. Local changes,
+including staged changes and untracked files, are allowed when Git can
+preserve them. Git refuses updates that would overwrite local changes;
+GitFrame does not automatically stash them. If there are no incoming
+commits, Pull succeeds without changing the branch, even if it is ahead.
+Resolve divergence with Git before retrying. Remote operations use your
+existing Git authentication setup; see [Troubleshooting](#troubleshooting)
+if one fails.
 
 ### Repository
 
@@ -390,7 +394,10 @@ For commit failures, check Git's reported error, including author identity,
 hooks, or signing setup. For push and pull failures, check the remote,
 upstream, and your Git credential helper or SSH agent. If a push error dialog
 offers `i` for an interactive retry, use it to run the operation in the
-foreground. Pull requires a clean worktree and supports fast-forward only.
+foreground. Pull requires an upstream and supports fast-forward only.
+Local changes are allowed when Git can preserve them. If Git refuses an
+update because it would overwrite local changes or cannot fast-forward,
+resolve the reported problem with Git before retrying.
 
 For an unresolved problem, open a
 [GitHub issue](https://github.com/hiroaqii/gitframe/issues) with the output of

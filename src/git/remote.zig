@@ -1339,11 +1339,11 @@ fn runSecureGitPull(
     };
     const ahead_behind = parseRevListAheadBehind(ahead_behind_bytes) catch
         return remoteFailureResult(.failed, warnings);
-    if (ahead_behind.ahead == 0 and ahead_behind.behind == 0)
+    if (ahead_behind.behind == 0)
         return remoteSuccessResult(.already_up_to_date, warnings);
     if (ahead_behind.ahead != 0) return remoteFailureResult(.failed, warnings);
 
-    const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", request.upstream_ref };
+    const merge_argv = [_][]const u8{ "git", "merge", "--ff-only", "--no-autostash", request.upstream_ref };
     var merge = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &merge_argv);
     defer merge.deinit();
     if (commandFailure(&merge, false, .after_update)) |failure| return remoteFailureResult(failure, warnings);
@@ -1377,14 +1377,7 @@ fn securePullPreconditionsMatch(
         !std.mem.eql(u8, actual.remote_branch, request.remote_branch) or
         !std.mem.eql(u8, actual.full_ref, request.upstream_ref)) return .mismatch;
 
-    const status_argv = [_][]const u8{ "git", "status", "--porcelain=v1", "-z", "-uall" };
-    var status = runSensitiveRemoteCommand(allocator, io, operation.root.dir(), &operation.environment.map, operation.control, &status_argv);
-    defer status.deinit();
-    if (commandFailure(&status, false, phase)) |failure| return .{ .failed = failure };
-    return switch (status) {
-        .completed => |*result| if (result.stdout.bytes().len == 0) .matches else .mismatch,
-        else => unreachable,
-    };
+    return .matches;
 }
 
 fn secureRemoteBranchSnapshotMatches(
@@ -3143,6 +3136,128 @@ fn gitOutputAlloc(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
     }
     freeRunResult(std.testing.allocator, result);
     return error.GitCommandFailed;
+}
+
+test "remote pull preserves local changes and delegates overwrite refusal to Git" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = enum { preserved, tracked_overlap, untracked_overlap, diverged, equal, ahead_only };
+    for (std.enums.values(Case)) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try runTestGit(io, &.{ "git", "init", "--bare", "remote.git" }, tmp.dir);
+        try tmp.dir.createDir(io, "work", .default_dir);
+        var work = try tmp.dir.openDir(io, "work", .{});
+        defer work.close(io);
+        var remote = try tmp.dir.openDir(io, "remote.git", .{});
+        defer remote.close(io);
+        try runTestGit(io, &.{ "git", "init", "--initial-branch=main" }, work);
+        try runTestGit(io, &.{ "git", "config", "user.name", "Test" }, work);
+        try runTestGit(io, &.{ "git", "config", "user.email", "test@example.invalid" }, work);
+        try runTestGit(io, &.{ "git", "remote", "add", "origin", "../remote.git" }, work);
+        try work.writeFile(io, .{ .sub_path = "local.txt", .data = "base\n" });
+        try work.writeFile(io, .{ .sub_path = "incoming.txt", .data = "base\n" });
+        try runTestGit(io, &.{ "git", "add", "." }, work);
+        try runTestGit(io, &.{ "git", "commit", "-m", "base" }, work);
+        try runTestGit(io, &.{ "git", "push", "-u", "origin", "main" }, work);
+        const base = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(base);
+
+        if (case != .equal and case != .ahead_only) {
+            try runTestGit(io, &.{ "git", "switch", "-c", "incoming" }, work);
+            try work.writeFile(io, .{ .sub_path = "incoming.txt", .data = "remote\n" });
+            try work.writeFile(io, .{ .sub_path = "new.txt", .data = "remote new\n" });
+            try runTestGit(io, &.{ "git", "add", "." }, work);
+            try runTestGit(io, &.{ "git", "commit", "-m", "incoming" }, work);
+            try runTestGit(io, &.{ "git", "push", "origin", "HEAD:main" }, work);
+            try runTestGit(io, &.{ "git", "switch", "main" }, work);
+            // Prove fetch effects separately from local HEAD effects.
+            try runTestGit(io, &.{ "git", "update-ref", "refs/remotes/origin/main", trimLineEnd(base) }, work);
+        }
+        if (case == .diverged or case == .ahead_only)
+            try runTestGit(io, &.{ "git", "commit", "--allow-empty", "-m", "local" }, work);
+        if (case == .tracked_overlap) {
+            try work.writeFile(io, .{ .sub_path = "incoming.txt", .data = "saved stash\n" });
+            try runTestGit(io, &.{ "git", "stash", "push", "-m", "existing stash" }, work);
+            try work.writeFile(io, .{ .sub_path = "incoming.txt", .data = "local overlap\n" });
+        }
+        if (case == .untracked_overlap)
+            try work.writeFile(io, .{ .sub_path = "new.txt", .data = "local untracked\n" });
+        try work.writeFile(io, .{ .sub_path = "local.txt", .data = "staged\n" });
+        try runTestGit(io, &.{ "git", "add", "local.txt" }, work);
+        try work.writeFile(io, .{ .sub_path = "local.txt", .data = "unstaged\n" });
+        try work.writeFile(io, .{ .sub_path = "loose.txt", .data = "untracked\n" });
+        try runTestGit(io, &.{ "git", "config", "merge.autoStash", "true" }, work);
+
+        const head_before = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(head_before);
+        const remote_head = try gitOutputAlloc(io, remote, &.{ "git", "rev-parse", "refs/heads/main" });
+        defer allocator.free(remote_head);
+        const status_before = try gitOutputAlloc(io, work, &.{ "git", "status", "--porcelain=v1", "-uall" });
+        defer allocator.free(status_before);
+        const staged_before = try gitOutputAlloc(io, work, &.{ "git", "diff", "--cached", "--binary" });
+        defer allocator.free(staged_before);
+        const stash_before = try gitOutputAlloc(io, work, &.{ "git", "stash", "list", "--format=%H" });
+        defer allocator.free(stash_before);
+
+        const repo_root = try tmp.dir.realPathFileAlloc(io, "work", allocator);
+        defer allocator.free(repo_root);
+        var root = try root_capability.RootCapability.openCanonical(repo_root);
+        defer root.deinit();
+        var environment = try buildRemoteEnvironment(allocator, null, .background);
+        defer environment.deinit();
+        const result = runOperation(allocator, io, .{
+            .root = &root,
+            .environment = &environment,
+            .control = .{},
+            .kind = .{ .pull_refresh_ff_only = .{
+                .branch = "main",
+                .remote = "origin",
+                .remote_branch = "main",
+                .upstream_ref = "refs/remotes/origin/main",
+                .oid = trimLineEnd(head_before),
+            } },
+        });
+        const expected: RemoteOperationOutcome = switch (case) {
+            .preserved => .{ .ok = .completed },
+            .equal, .ahead_only => .{ .ok = .already_up_to_date },
+            .tracked_overlap, .untracked_overlap, .diverged => .{ .failed = .failed },
+        };
+        try std.testing.expectEqual(expected, result.outcome);
+        const head = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "HEAD" });
+        defer allocator.free(head);
+        try std.testing.expectEqualStrings(if (case == .preserved) remote_head else head_before, head);
+        const fetched = try gitOutputAlloc(io, work, &.{ "git", "rev-parse", "refs/remotes/origin/main" });
+        defer allocator.free(fetched);
+        try std.testing.expectEqualStrings(remote_head, fetched);
+        const status_after = try gitOutputAlloc(io, work, &.{ "git", "status", "--porcelain=v1", "-uall" });
+        defer allocator.free(status_after);
+        try std.testing.expectEqualStrings(status_before, status_after);
+        const staged_after = try gitOutputAlloc(io, work, &.{ "git", "diff", "--cached", "--binary" });
+        defer allocator.free(staged_after);
+        try std.testing.expectEqualStrings(staged_before, staged_after);
+        const stash_after = try gitOutputAlloc(io, work, &.{ "git", "stash", "list", "--format=%H" });
+        defer allocator.free(stash_after);
+        try std.testing.expectEqualStrings(stash_before, stash_after);
+        const local = try work.readFileAlloc(io, "local.txt", allocator, .limited(1024));
+        defer allocator.free(local);
+        try std.testing.expectEqualStrings("unstaged\n", local);
+        const loose = try work.readFileAlloc(io, "loose.txt", allocator, .limited(1024));
+        defer allocator.free(loose);
+        try std.testing.expectEqualStrings("untracked\n", loose);
+        const incoming = try work.readFileAlloc(io, "incoming.txt", allocator, .limited(1024));
+        defer allocator.free(incoming);
+        try std.testing.expectEqualStrings(switch (case) {
+            .preserved => "remote\n",
+            .tracked_overlap => "local overlap\n",
+            else => "base\n",
+        }, incoming);
+        if (case == .untracked_overlap) {
+            const collision = try work.readFileAlloc(io, "new.txt", allocator, .limited(1024));
+            defer allocator.free(collision);
+            try std.testing.expectEqualStrings("local untracked\n", collision);
+        }
+    }
 }
 
 test "remote push failure phase preserves actual effects" {

@@ -236,10 +236,6 @@ pub const PullTargetResult = union(enum) {
     no_upstream,
     upstream_not_remote_branch,
     branch_status_unavailable,
-    status_loading,
-    status_stale,
-    dirty_worktree,
-    untracked_files_present,
 };
 
 pub const FetchTargetResult = union(enum) {
@@ -317,13 +313,6 @@ pub const RemoteActionContext = struct {
     branch_status: BranchStatusSnapshot,
 };
 
-pub const PullActionContext = struct {
-    source: diff_source.SourceMode,
-    repo_root: ?[]const u8,
-    branch_status: BranchStatusSnapshot,
-    status: StatusSnapshot,
-};
-
 pub fn pushTarget(ctx: RemoteActionContext) PushTargetResult {
     if (!diff_source.sourceAllowsStageProjection(ctx.source)) return .unavailable_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
@@ -361,7 +350,7 @@ pub fn pushTarget(ctx: RemoteActionContext) PushTargetResult {
     } };
 }
 
-pub fn pullTarget(ctx: PullActionContext) PullTargetResult {
+pub fn pullTarget(ctx: RemoteActionContext) PullTargetResult {
     if (!diff_source.sourceAllowsStageProjection(ctx.source)) return .unavailable_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     if (!ctx.branch_status.freshFor(repo_root)) return .loading_branch_status;
@@ -377,17 +366,6 @@ pub fn pullTarget(ctx: PullActionContext) PullTargetResult {
     const oid = branch_status.oid orelse return .branch_status_unavailable;
     const ahead_behind = branch_status.ahead_behind orelse return .branch_status_unavailable;
 
-    // This App-side clean-worktree gate is for immediate feedback. The backend
-    // repeats the check before and after fetch to close confirmation/task and
-    // network-time races where files can change after this snapshot.
-    if (ctx.status.loading) return .status_loading;
-    if (!ctx.status.isFreshFor(repo_root)) return .status_stale;
-    switch (pullWorktreeState(ctx.status.entries)) {
-        .clean => {},
-        .untracked_only => return .untracked_files_present,
-        .dirty => return .dirty_worktree,
-    }
-
     return .{ .ready = .{
         .repo_root = repo_root,
         .branch = branch,
@@ -401,9 +379,8 @@ pub fn pullTarget(ctx: PullActionContext) PullTargetResult {
 }
 
 pub fn fetchTarget(ctx: RemoteActionContext) FetchTargetResult {
-    // Fetch only needs a repository and branch status. Unlike pull, it does not
-    // depend on file status projection or a clean-worktree decision, so range
-    // views remain eligible here.
+    // Fetch only needs a repository and branch status. It does not mutate the
+    // worktree, so range views remain eligible here.
     if (!diff_source.sourceRequiresRepo(ctx.source)) return .unavailable_source;
     const repo_root = ctx.repo_root orelse return .no_repo;
     if (!ctx.branch_status.freshFor(repo_root)) return .loading_branch_status;
@@ -437,26 +414,6 @@ pub fn branchSwitchTarget(repo_root: []const u8, branch_status: git_branch_statu
         .branch = branch,
         .oid = oid,
     } };
-}
-
-const PullWorktreeState = enum {
-    clean,
-    untracked_only,
-    dirty,
-};
-
-fn pullWorktreeState(entries: []const git_status.StatusEntry) PullWorktreeState {
-    var saw_untracked = false;
-    for (entries) |entry| {
-        if (entry.isIgnored()) continue;
-        if (entry.isConflict() or entry.isStaged()) return .dirty;
-        if (entry.isUntracked()) {
-            saw_untracked = true;
-            continue;
-        }
-        if (entry.isUnstaged()) return .dirty;
-    }
-    return if (saw_untracked) .untracked_only else .clean;
 }
 
 pub fn stageTarget(ctx: TargetContext) StageTargetResult {
@@ -868,7 +825,7 @@ test "pushTarget proposes set-upstream push for branch without upstream" {
     }
 }
 
-test "pullTarget requires behind-only branch and clean status" {
+test "pullTarget snapshots a fresh upstream branch" {
     const status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
@@ -880,7 +837,6 @@ test "pullTarget requires behind-only branch and clean status" {
         .source = .unstaged,
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = status },
-        .status = .{ .repo_root = "/repo", .loading = false, .entries = &.{} },
     })) {
         .ready => |target| {
             try std.testing.expectEqualStrings("/repo", target.repo_root);
@@ -1031,7 +987,7 @@ test "pushTarget rejects unsafe or incomplete branch states" {
     }));
 }
 
-test "pullTarget rejects unsafe branch and worktree states" {
+test "pullTarget requires branch authority before remote refresh" {
     const ready_status: git_branch_status.BranchStatus = .{
         .oid = "abc123",
         .head = .{ .branch = "feature" },
@@ -1039,13 +995,10 @@ test "pullTarget rejects unsafe branch and worktree states" {
         .ahead_behind = .{ .ahead = 0, .behind = 1 },
     };
 
-    const clean_status: StatusSnapshot = .{ .repo_root = "/repo", .loading = false, .entries = &.{} };
-
     try std.testing.expectEqual(PullTargetResult.unavailable_source, pullTarget(.{
         .source = .{ .patch_file = "change.patch" },
         .repo_root = "/repo",
         .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = clean_status,
     }));
     switch (pullTarget(.{
         .source = .unstaged,
@@ -1056,7 +1009,6 @@ test "pullTarget rejects unsafe branch and worktree states" {
             .upstream = ready_status.upstream,
             .ahead_behind = .{ .ahead = 1, .behind = 1 },
         } },
-        .status = clean_status,
     })) {
         .ready => {},
         else => return error.ExpectedAheadPullTargetReady,
@@ -1070,38 +1022,21 @@ test "pullTarget rejects unsafe branch and worktree states" {
             .upstream = ready_status.upstream,
             .ahead_behind = .{ .ahead = 0, .behind = 0 },
         } },
-        .status = clean_status,
     })) {
         .ready => {},
         else => return error.ExpectedUpToDatePullTargetReady,
     }
-    try std.testing.expectEqual(PullTargetResult.status_loading, pullTarget(.{
+    try std.testing.expectEqual(PullTargetResult.loading_branch_status, pullTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/repo", .loading = true, .entries = &.{} },
+        .branch_status = .{ .repo_root = "/other", .loading = false, .status = ready_status },
     }));
-    try std.testing.expectEqual(PullTargetResult.status_stale, pullTarget(.{
+    var no_upstream = ready_status;
+    no_upstream.upstream = null;
+    try std.testing.expectEqual(PullTargetResult.no_upstream, pullTarget(.{
         .source = .unstaged,
         .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/other", .loading = false, .entries = &.{} },
-    }));
-
-    const staged = [_]git_status.StatusEntry{.{ .path = "src/app.zig", .raw = .{ 'M', ' ' }, .index = .modified, .worktree = .unmodified }};
-    try std.testing.expectEqual(PullTargetResult.dirty_worktree, pullTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/repo", .loading = false, .entries = &staged },
-    }));
-
-    const untracked = [_]git_status.StatusEntry{.{ .path = "new.txt", .raw = .{ '?', '?' }, .index = .unmodified, .worktree = .untracked }};
-    try std.testing.expectEqual(PullTargetResult.untracked_files_present, pullTarget(.{
-        .source = .unstaged,
-        .repo_root = "/repo",
-        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = ready_status },
-        .status = .{ .repo_root = "/repo", .loading = false, .entries = &untracked },
+        .branch_status = .{ .repo_root = "/repo", .loading = false, .status = no_upstream },
     }));
 }
 

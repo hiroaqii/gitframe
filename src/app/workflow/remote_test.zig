@@ -742,7 +742,7 @@ test "requestPush snapshots set-upstream target for branch without upstream" {
     try std.testing.expect(confirmation.ahead_behind == null);
 }
 
-test "requestPull snapshots the active branch target" {
+test "requestPull snapshots the active branch target with local changes" {
     var app: RemoteHarness = .{ .allocator = std.testing.allocator };
     const repo_root = try installCurrentRepoForTest(&app, std.testing.allocator);
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
@@ -758,7 +758,7 @@ test "requestPull snapshots the active branch target" {
         .behind = 2,
     });
     try app.pages.changes.branch_status.replace(repo_root, &bundle);
-    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "");
+    var status_bundle = try git_status.StatusBundle.parseOwned(std.testing.allocator, "MM local.txt\x00?? new.txt\x00");
     try app.pages.changes.git_status.replace(repo_root, &status_bundle);
     syncTestActivation(&app);
 
@@ -2764,7 +2764,7 @@ test "structured upstream selects the exact slash remote for push fetch and pull
         defer allocator.free(unstaged);
         try std.testing.expectEqualStrings("worktree guard\n", unstaged);
 
-        // Pull preserves a clean, unrelated file, as required by its existing gate.
+        // Keep this upstream-routing fixture focused on the selected remote.
         try runAppTestGit(allocator, io, &.{ "git", "restore", "--staged", "--worktree", "--", "README.md" }, work);
         if (coexisting_remote) {
             const stale_tracking = git_remote.runOperation(allocator, io, .{

@@ -220,9 +220,9 @@ pub const PushConfirmation = struct {
 
 /// Owned snapshot for pull confirmation.
 ///
-/// Branch status and file status can reload while the popup is open, so the
+/// Branch status can reload while the popup is open, so the
 /// displayed target is copied. The backend then fetches the confirmed remote
-/// and re-checks branch/upstream/clean state before deciding whether to
+/// and re-checks branch/HEAD/upstream before deciding whether to
 /// fast-forward.
 pub const PullConfirmation = struct {
     repository_identity: remote_request.RepositoryIdentity = .{

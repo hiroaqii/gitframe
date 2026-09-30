@@ -321,12 +321,6 @@ pub const View = struct {
                 .fresh = members.branch.satisfies(requirements.branch),
                 .status = self.page.branch_status.status,
             },
-            .status = .{
-                .repo_root = self.page.git_status.repo_root,
-                .loading = requirements.status != .unused and members.status == .pending,
-                .fresh = members.status.satisfies(requirements.status),
-                .entries = self.page.git_status.document.entries,
-            },
         });
     }
 
@@ -1435,7 +1429,7 @@ test "mutation fence makes retained Changes operation targets inert" {
         .ready => {},
         else => return error.ExpectedReadyPushTarget,
     }
-    try std.testing.expect(view.pullTarget() == .dirty_worktree);
+    try std.testing.expect(view.pullTarget() == .ready);
     switch (view.fetchTarget()) {
         .ready => {},
         else => return error.ExpectedReadyFetchTarget,
@@ -1474,14 +1468,14 @@ test "mutation fence makes retained Changes operation targets inert" {
         .ready => {},
         else => return error.ExpectedRestoredPushTarget,
     }
-    try std.testing.expect(view.pullTarget() == .dirty_worktree);
+    try std.testing.expect(view.pullTarget() == .ready);
     switch (view.fetchTarget()) {
         .ready => {},
         else => return error.ExpectedRestoredFetchTarget,
     }
 }
 
-test "pull remains gated by pending and stale file status" {
+test "pull accepts pending and stale file status while requiring a fresh branch" {
     const allocator = std.testing.allocator;
     var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
@@ -1496,10 +1490,12 @@ test "pull remains gated by pending and stale file status" {
     try page.branch_status.replace("/repo", &branch);
 
     page.status_load.pending = .{ .generation = 1 };
-    try std.testing.expect(testView(&page, .unstaged).pullTarget() == .status_loading);
+    try std.testing.expect(testView(&page, .unstaged).pullTarget() == .ready);
     page.status_load.pending = null;
     page.status_load.freshness = .stale_refresh;
-    try std.testing.expect(testView(&page, .unstaged).pullTarget() == .status_stale);
+    try std.testing.expect(testView(&page, .unstaged).pullTarget() == .ready);
+    page.branch_status_load.freshness = .stale_refresh;
+    try std.testing.expect(testView(&page, .unstaged).pullTarget() == .loading_branch_status);
 }
 
 test "stage target skips only fresh staged-only files" {

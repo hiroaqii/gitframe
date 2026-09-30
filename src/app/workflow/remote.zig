@@ -280,10 +280,6 @@ pub const Controller = struct {
             .no_upstream => return self.reject("pull unavailable: no upstream branch"),
             .upstream_not_remote_branch => return self.reject("pull unavailable: unsupported upstream"),
             .branch_status_unavailable => return self.reject("pull unavailable: branch status is incomplete"),
-            .status_loading => return self.reject("status is still loading"),
-            .status_stale => return self.reject("pull unavailable: status is stale"),
-            .dirty_worktree => return self.reject("pull blocked: commit, stage, or discard local changes first"),
-            .untracked_files_present => return self.reject("pull blocked: untracked files present"),
         };
         const repository_identity = self.currentRepositoryIdentity() orelse
             return self.reject("pull unavailable: repository authority changed");
