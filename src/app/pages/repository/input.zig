@@ -102,6 +102,8 @@ pub fn selectionKeyToMsg(comptime Msg: type, context: Context, key: chasen.Key) 
 fn publicActionToMsg(comptime Msg: type, context: Context, action: keymap.PublicAction) ?Msg {
     if (keymap.isDocumentNavigationAction(action)) return documentNavigationActionToMsg(Msg, context, action);
     return switch (action) {
+        .push => if (context.selection_owner == .none) voidMsg(Msg, "request_push") else voidMsg(Msg, "selection_owned_noop"),
+        .pull => if (context.selection_owner == .none) voidMsg(Msg, "request_pull") else voidMsg(Msg, "selection_owned_noop"),
         .open_editor => if (context.selection_owner == .none)
             voidMsg(Msg, "open_selected_file_in_editor")
         else
@@ -163,6 +165,8 @@ fn payload(comptime Msg: type, comptime field: []const u8, value: anytype) Msg {
 }
 
 const TestMsg = union(enum) {
+    request_push,
+    request_pull,
     open_selected_file_in_editor,
     selection_action: selection_action.Action,
     selection_owned_noop,
@@ -437,9 +441,28 @@ test "repository configured Space action claims normal input but not prompts" {
     try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .tree, .keymap = search_keymap }, space) == null);
     try std.testing.expectEqual(TestMsg.enter_source_search, keyToMsg(TestMsg, .{ .focus = .tree, .source_available = true, .keymap = search_keymap }, space).?);
 
-    var non_repository_config: keymap.Config = .{};
-    non_repository_config.set(.push, .{ .named = .space });
-    try std.testing.expect(keymap.validateConfig(non_repository_config));
-    try std.testing.expect(keyToMsg(TestMsg, .{ .focus = .tree, .keymap = keymap.Effective.fromConfig(non_repository_config) }, space) == null);
-    try std.testing.expect(keyToMsg(TestMsg, .{ .source_query_len = 1 }, .{ .codepoint = 'p', .mods = .{ .shift = true } }) == null);
+    var push_config: keymap.Config = .{};
+    push_config.set(.push, .{ .named = .space });
+    try std.testing.expect(keymap.validateConfig(push_config));
+    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{ .focus = .tree, .keymap = keymap.Effective.fromConfig(push_config) }, space).?);
+    try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, .{ .source_query_len = 1 }, .{ .codepoint = 'p', .mods = .{ .shift = true } }).?);
+}
+
+test "Repository push pull share bindings while search and selection own input" {
+    var config: keymap.Config = .{};
+    config.set(.push, .{ .plain_codepoint = 'x' });
+    config.set(.pull, .{ .plain_codepoint = 'z' });
+    for ([_]model.Focus{ .tree, .source }) |focus| {
+        const normal: Context = .{ .focus = focus, .source_available = true };
+        try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, normal, .{ .codepoint = 'P' }).?);
+        try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, normal, .{ .codepoint = 'U' }).?);
+        var custom = normal;
+        custom.keymap = keymap.Effective.fromConfig(config);
+        try std.testing.expectEqual(TestMsg.request_push, keyToMsg(TestMsg, custom, .{ .codepoint = 'x' }).?);
+        try std.testing.expectEqual(TestMsg.request_pull, keyToMsg(TestMsg, custom, .{ .codepoint = 'z' }).?);
+    }
+    try std.testing.expectEqual(TestMsg{ .source_search_insert = 'P' }, keyToMsg(TestMsg, .{ .source_search_mode = true }, .{ .codepoint = 'P' }).?);
+    try std.testing.expectEqual(TestMsg{ .file_search_insert = 'U' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'U' }).?);
+    try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, .{ .selection_owner = .keyboard_line }, .{ .codepoint = 'P' }).?);
+    try std.testing.expectEqual(TestMsg.selection_owned_noop, keyToMsg(TestMsg, .{ .selection_owner = .mouse }, .{ .codepoint = 'U' }).?);
 }

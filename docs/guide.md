@@ -237,7 +237,8 @@ files. These marks track your review during the current session; they do
 not stage files or create commits. `F` cycles the file filter. If files seem
 to be missing, check both the filter and whether reviewed files are hidden.
 
-Other operations are available from Changes:
+Other operations are available from Changes. Push and pull are also available
+from Repository, using the same keys, confirmation, cancellation, and retry flow:
 
 | Key | Operation | Behavior |
 | --- | --- | --- |
@@ -262,6 +263,18 @@ existing Git authentication setup; see [Troubleshooting](#troubleshooting)
 if one fails.
 
 ### Repository
+
+Press `P` to push or `U` to pull the current repository's branch while browsing
+either the file tree or source. These operate on the repository, not the selected
+file, and do not require opening Changes first. Custom push/pull key bindings
+apply on both pages. Search and selection modes retain their input ownership.
+
+Confirmation, progress, and errors stay on the page where the action started.
+On both Changes and Repository, page switching is blocked while a confirmation
+is open, a push/pull is running (including cancellation), or an error dialog is
+open. Close the dialog and wait for the action to finish before switching pages.
+After push, branch synchronization information refreshes; after pull, the file
+tree, source content, and Changes data refresh when their page is displayed.
 
 Repository shows full source files, including files with no changes. Switch
 from Changes with `2` to open the selected file's current source when that

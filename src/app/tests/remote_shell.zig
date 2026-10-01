@@ -99,6 +99,10 @@ fn beginAcceptedTestAction(
     kind: app_actions.ActionKind,
 ) app_actions.PendingAction {
     if (app.allocator == null) app.allocator = std.testing.allocator;
+    if (kind == .push or kind == .pull) app.remote_workflow.owner = .{
+        .origin = remoteWorkflow(app).branch_origin.?,
+        .root_identity = app.repo_session.view().activeIdentity() orelse test_action_root_identity,
+    };
     const prepared = actionLifecycle(app).prepare(kind);
     const pending = actionLifecycle(app).acceptSpawn(app.allocator.?, prepared).pending;
     switch (kind) {
@@ -226,10 +230,10 @@ fn remoteWorkflow(app: *App) workflow_remote.Controller {
         .lifecycle = actionLifecycle(app),
         .operations = changesOperationController(app),
         .repo = app.repo_session.view(),
+        .remote_context = if (app.active_page == .repository) app.pages.repository.remoteActionContext(app.repo_session.view().activeRoot(), app.repo_session.view().epoch(), app.repo_session.view().activeIdentity()) else changesOperationController(app).view().remoteActionContext(),
         .current_changes_root = currentChangesActionRoot(app),
         .env_map = app.env_map,
         .active_page = app.active_page,
-        .changes_origin = origins.changes(),
         .branch_origin = switch (app.active_page) {
             .changes => origins.changes(),
             .repository => origins.repository(),
@@ -1638,7 +1642,7 @@ test "push inspection surface blocks page switching until canceled" {
     try std.testing.expectEqualStrings("finish foreground command before switching pages", app.status.text());
 }
 
-test "inactive Changes accepts push inspection diagnostic without redraw" {
+test "expired remote inspection page cleans up without reopening a hidden overlay" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1666,8 +1670,10 @@ test "inactive Changes accepts push inspection diagnostic without redraw" {
     app.active_page = .repository;
     try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
 
-    try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try std.testing.expectEqualStrings("push retry unavailable: branch changed; reload and try again", app.pages.changes.status.text());
+    try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
+    try std.testing.expect(app.remote_workflow.owner == null);
+    try std.testing.expect(!app.overlay.isRemoteError());
+    try std.testing.expectEqualStrings("checking push retry target...", app.pages.changes.status.text());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 
@@ -1722,8 +1728,8 @@ test "inactive Changes foreground completions retain diagnostics without effects
     var app = try mutationFenceRepoTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    app.active_page = .repository;
     const pending = beginAcceptedTestAction(&app, .push);
+    app.active_page = .repository;
     app.remote_workflow.push_retry.state = .{ .foreground = .{
         .request_id = .{ .id = 7 },
         .pending = pending,
@@ -2350,4 +2356,182 @@ fn branchCompareFinished(
             .diff = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) },
         } },
     };
+}
+
+fn drainRepositoryRemoteTasks(app: *App, ctx: *chasen.Ctx(App.Msg)) !void {
+    var rounds: usize = 0;
+    while (ctx._pending_tasks_len > 0) : (rounds += 1) {
+        try std.testing.expect(rounds < 32);
+        const pending = ctx.takePendingTasks();
+        const batch = try ctx.allocator().dupe(@TypeOf(pending[0]), pending);
+        defer ctx.allocator().free(batch);
+        var index: usize = 0;
+        defer for (batch[index..]) |entry| entry.discard(ctx.allocator());
+        while (index < batch.len) {
+            const entry = batch[index];
+            index += 1;
+            const msg = try entry.run(ctx.allocator(), ctx.io());
+            try app.update(msg, ctx);
+        }
+    }
+}
+
+fn sendRepositoryRemoteKey(app: *App, ctx: *chasen.Ctx(App.Msg), codepoint: u21) !void {
+    const msg = app.handleEvent(.{ .key_press = .{ .codepoint = codepoint } }) orelse return error.ExpectedRemoteKey;
+    try app.update(msg, ctx);
+}
+
+fn expectRemotePageSwitchBlocked(app: *App, ctx: *chasen.Ctx(App.Msg)) !void {
+    const before = app.active_page;
+    const target: page.Id = if (before == .repository) .changes else .repository;
+    if (app.handleEvent(.{ .key_press = .{ .codepoint = if (target == .changes) '1' else '2' } })) |msg| try app.update(msg, ctx);
+    try std.testing.expectEqual(before, app.active_page);
+    const bar = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).page_bar.?;
+    if (app.handleEvent(app_test_support.mouseEvent(bar.col + page.tab(target).col, bar.row, .left))) |msg| try app.update(msg, ctx);
+    try std.testing.expectEqual(before, app.active_page);
+    try app.update(.{ .switch_page = target }, ctx);
+    try std.testing.expectEqual(before, app.active_page);
+}
+
+test "Repository remote product route pushes then pulls actual Git without loading Changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fixture = try setupPushRetryRepoForTest(allocator, io, &tmp);
+    defer allocator.free(fixture.repo_root);
+    defer allocator.free(fixture.oid);
+    var work = try tmp.dir.openDir(io, "work", .{});
+    defer work.close(io);
+    var app: App = .{
+        .allocator = allocator,
+        .active_page = .repository,
+        .terminal_size = .{ .width = 120, .height = 32 },
+        .repo_session = .{ .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, fixture.repo_root) } },
+    };
+    app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(fixture.repo_root);
+    defer app.deinit(.{ .allocator = allocator, .io = io });
+    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    defer ctx.runtimeClearPendingEffectCopies();
+    app.pages.repository.activate(0, app.repo_session.view().activeIdentity().?);
+    try app.update(.reload, &ctx);
+    try drainRepositoryRemoteTasks(&app, &ctx);
+    try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
+    try std.testing.expect(app.pages.repository.branch.freshness == .fresh);
+    {
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(120, 32);
+        defer surface.deinit();
+        try app.view(&surface.surface);
+        const snapshot = try surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "P: push") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "U: pull") == null);
+    }
+    try sendRepositoryRemoteKey(&app, &ctx, 'P');
+    try std.testing.expect(app.overlay.isPushBranch());
+    try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
+    try std.testing.expectEqualStrings("main", app.remote_workflow.push_confirmation.?.branch);
+    try expectRemotePageSwitchBlocked(&app, &ctx);
+    try sendRepositoryRemoteKey(&app, &ctx, chasen.Key.enter);
+    try std.testing.expect(actionLifecycle(&app).view().hasPending());
+    try expectRemotePageSwitchBlocked(&app, &ctx);
+    try drainRepositoryRemoteTasks(&app, &ctx);
+    try std.testing.expect(!actionLifecycle(&app).view().hasPending());
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(!app.overlay.isRemoteError());
+    const pushed = try appGitOutputAlloc(allocator, io, tmp.dir, &.{ "git", "--git-dir=remote.git", "rev-parse", "refs/heads/main" });
+    defer allocator.free(pushed);
+    try std.testing.expectEqualStrings(fixture.oid, std.mem.trim(u8, pushed, " \r\n"));
+    try std.testing.expect(app.pages.repository.branch.snapshot.status.upstream != null);
+    {
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(120, 32);
+        defer surface.deinit();
+        try app.view(&surface.surface);
+        const snapshot = try surface.snapshot(allocator);
+        defer allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "P: push / U: pull") != null);
+    }
+    try runAppTestGit(allocator, io, &.{ "git", "clone", "--branch=main", "remote.git", "peer" }, tmp.dir);
+    var peer = try tmp.dir.openDir(io, "peer", .{});
+    defer peer.close(io);
+    try peer.writeFile(io, .{ .sub_path = "README.md", .data = "pulled through Repository\n" });
+    try peer.writeFile(io, .{ .sub_path = "new.txt", .data = "new file\n" });
+    try runAppTestGit(allocator, io, &.{ "git", "add", "." }, peer);
+    try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "remote update" }, peer);
+    try runAppTestGit(allocator, io, &.{ "git", "push", "origin", "main" }, peer);
+    try work.writeFile(io, .{ .sub_path = "local.txt", .data = "preserved local change\n" });
+    try sendRepositoryRemoteKey(&app, &ctx, 'U');
+    try std.testing.expect(app.overlay.isPullBranch());
+    try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
+    try sendRepositoryRemoteKey(&app, &ctx, chasen.Key.enter);
+    try drainRepositoryRemoteTasks(&app, &ctx);
+    try std.testing.expectEqual(page.Id.repository, app.active_page);
+    try std.testing.expect(!app.overlay.isRemoteError());
+    try std.testing.expect(app.pages.repository.branch.freshness == .fresh);
+    try std.testing.expectEqualStrings("pulled through Repository\n", app.pages.repository.displayed_document.?.value.source.bytes);
+    const files = try appGitOutputAlloc(allocator, io, work, &.{ "git", "ls-files", "new.txt" });
+    defer allocator.free(files);
+    try std.testing.expectEqualStrings("new.txt\n", files);
+    const local = try work.readFileAlloc(io, "local.txt", allocator, .limited(1024));
+    defer allocator.free(local);
+    try std.testing.expectEqualStrings("preserved local change\n", local);
+    try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
+    // The same Repository-owned failure and retry inspection stays on its caller.
+    try work.writeFile(io, .{ .sub_path = "README.md", .data = "local retry commit\n" });
+    try runAppTestGit(allocator, io, &.{ "git", "add", "README.md" }, work);
+    try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "retry" }, work);
+    try runAppTestGit(allocator, io, &.{ "git", "config", "remote.origin.pushurl", "../missing.git" }, work);
+    try app.update(.reload, &ctx);
+    try drainRepositoryRemoteTasks(&app, &ctx);
+    try sendRepositoryRemoteKey(&app, &ctx, 'P');
+    try sendRepositoryRemoteKey(&app, &ctx, chasen.Key.enter);
+    try drainRepositoryRemoteTasks(&app, &ctx);
+    try std.testing.expect(app.overlay.isRemoteError());
+    try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
+    try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
+    try expectRemotePageSwitchBlocked(&app, &ctx);
+    try app.update(.run_interactive_push, &ctx);
+    try std.testing.expectEqual(page.Id.repository, app.remote_workflow.push_retry.state.inspecting.origin.page_id);
+    const inspection = ctx.takePendingTasks();
+    try std.testing.expectEqual(@as(usize, 1), inspection.len);
+    try app.update(inspection[0].failed(error.ConcurrencyUnavailable, allocator), &ctx);
+    try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
+    try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
+    try app.update(.close_remote_error, &ctx);
+    try std.testing.expect(app.remote_workflow.owner == null);
+    try sendRepositoryRemoteKey(&app, &ctx, '1');
+    try std.testing.expectEqual(page.Id.changes, app.active_page);
+    try drainRepositoryRemoteTasks(&app, &ctx);
+    try std.testing.expect(app.pages.changes.activation.currentIdentity() != null);
+}
+
+test "remote confirmation execution cancellation and errors block both page directions" {
+    const allocator = std.testing.allocator;
+    for ([_]page.Id{ .changes, .repository }) |caller| {
+        var app: App = .{ .allocator = allocator, .active_page = caller, .terminal_size = .{ .width = 120, .height = 32 } };
+        defer app.deinit(.{ .allocator = allocator, .io = std.testing.io });
+        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        defer ctx.runtimeClearPendingEffectCopies();
+        app.overlay.openPushBranch(caller);
+        try expectRemotePageSwitchBlocked(&app, &ctx);
+        app.overlay.close();
+        const pending = beginAcceptedTestAction(&app, .pull);
+        try expectRemotePageSwitchBlocked(&app, &ctx);
+        try app.update(.cancel_remote_action, &ctx);
+        try std.testing.expect(actionLifecycle(&app).view().hasPending());
+        try expectRemotePageSwitchBlocked(&app, &ctx);
+        _ = actionLifecycle(&app).finishExact(allocator, pending, "/repo", null);
+        _ = app.remote_workflow.action_control.finish(pending.generation);
+        app.remote_workflow.remote_error_operation = .pull;
+        app.overlay.openRemoteError(caller);
+        try expectRemotePageSwitchBlocked(&app, &ctx);
+        try app.update(.close_remote_error, &ctx);
+        try std.testing.expect(app.remote_workflow.owner == null);
+        try sendRepositoryRemoteKey(&app, &ctx, if (caller == .changes) '2' else '1');
+        try std.testing.expectEqual(if (caller == .changes) page.Id.repository else page.Id.changes, app.active_page);
+    }
 }

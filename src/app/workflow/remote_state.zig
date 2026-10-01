@@ -9,7 +9,13 @@ const remote_request = @import("../remote_request.zig");
 const app_state = @import("../state.zig");
 const app_actions = @import("../actions.zig");
 
+pub const RemoteOwner = struct {
+    origin: @import("../effect_origin.zig").PageOrigin,
+    root_identity: @import("../../repo/root_capability.zig").Identity,
+};
+
 pub const State = struct {
+    owner: ?RemoteOwner = null,
     push_confirmation: ?app_state.PushConfirmation = null,
     pull_confirmation: ?app_state.PullConfirmation = null,
     remote_error_operation: ?app_state.GitErrorOperation = null,
@@ -57,6 +63,12 @@ pub const State = struct {
         allocator: std.mem.Allocator,
         overlay: *app_state.OverlayState,
     ) void {
+        self.owner = null;
+        if (self.push_confirmation) |*confirmation| confirmation.deinit(allocator);
+        if (self.pull_confirmation) |*confirmation| confirmation.deinit(allocator);
+        self.push_confirmation = null;
+        self.pull_confirmation = null;
+        if (overlay.isPushBranch() or overlay.isPullBranch()) overlay.close();
         if (self.remote_error_message) |message| allocator.free(message);
         self.remote_error_operation = null;
         self.remote_error_message = null;

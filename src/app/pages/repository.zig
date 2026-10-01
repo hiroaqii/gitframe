@@ -8,6 +8,7 @@ const chasen = @import("chasen");
 const text_projection = @import("chasen_ui").text_projection;
 const keymap = @import("keymap");
 const app_direction = @import("../direction.zig");
+const git_ops = @import("../git_ops.zig");
 const app_state = @import("../state.zig");
 const drag_auto_scroll = @import("../drag_auto_scroll.zig");
 const selection_action = @import("../selection_action.zig");
@@ -142,6 +143,8 @@ pub const ChangeDecoration = union(enum) {
 };
 
 pub const Msg = union(enum) {
+    request_push,
+    request_pull,
     open_selected_file_in_editor,
     manifest_finished: repository_tasks.ManifestFinished,
     branch_finished: repository_branch.Finished,
@@ -1079,7 +1082,33 @@ pub const RepositoryPageState = struct {
         self.needs_change_map_request = self.currentSource() != null;
     }
 
-    pub const ReloadCause = enum { manual, branch_switch, editor };
+    /// A fresh page-local read is required in addition to current repository authority.
+    pub fn remoteActionContext(self: *const RepositoryPageState, repo_root: ?[]const u8, repo_epoch: u64, root_identity: ?root_capability.Identity) git_ops.RemoteActionContext {
+        const fresh = if (root_identity) |identity|
+            self.active and self.repo_epoch == repo_epoch and self.root_identity != null and
+                self.root_identity.?.eql(identity) and
+                self.branch.snapshot.matches(.{ .repo_epoch = repo_epoch, .root_identity = identity }) and
+                self.branch.freshness == .fresh and self.branch.pending == null and !self.branch.needs_revalidation
+        else
+            false;
+        return .{
+            .source = .unstaged,
+            .repo_root = repo_root,
+            .branch_status = .{
+                .repo_root = repo_root,
+                .fresh = fresh,
+                .loading = self.branch.pending != null or self.branch.needs_revalidation,
+                .status = self.branch.snapshot.status,
+            },
+        };
+    }
+
+    pub fn invalidateRemoteBranch(self: *RepositoryPageState, has_repository: bool) void {
+        self.branch.pending = null;
+        self.branch.requestReload(self.active, self.repo_epoch, if (has_repository) self.root_identity else null);
+    }
+
+    pub const ReloadCause = enum { manual, branch_switch, editor, remote_operation };
 
     pub fn requestReload(self: *RepositoryPageState, has_repository: bool, cause: ReloadCause) void {
         // The shared authority transition clears borrowed source storage and
@@ -1974,7 +2003,7 @@ pub const RepositoryPageState = struct {
                 };
                 self.refreshFileSearch();
             },
-            .open_selected_file_in_editor, .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
+            .request_push, .request_pull, .open_selected_file_in_editor, .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
         }
         if (!optionalPathEql(previous, self.selected_path)) {
             self.invalidateSelectedDocument(allocator);
@@ -9743,4 +9772,24 @@ test "screen transition Repository waits for selected document and consumes read
         try std.testing.expectEqual(terminal != .unreadable, effect.publish(request.identity, state.transition_publication));
         try std.testing.expect(if (terminal == .unreadable) effect == .idle else effect == .running);
     }
+}
+
+test "Repository remote admission requires its exact fresh branch snapshot" {
+    const identity: root_capability.Identity = .{ .device = 7, .inode = 9 };
+    var state: RepositoryPageState = .{ .active = true, .repo_epoch = 4, .root_identity = identity };
+    state.branch.snapshot.identity = .{ .repo_epoch = 4, .root_identity = identity };
+    state.branch.snapshot.status = .{ .head = .{ .branch = "main" }, .oid = "abc" };
+    state.branch.freshness = .fresh;
+    try std.testing.expect(git_ops.pushTarget(state.remoteActionContext("/repo", 4, identity)) == .ready);
+    try std.testing.expect(git_ops.pullTarget(state.remoteActionContext("/repo", 4, identity)) == .no_upstream);
+    try std.testing.expect(git_ops.pushTarget(state.remoteActionContext("/repo", 5, identity)) == .loading_branch_status);
+    try std.testing.expect(git_ops.pushTarget(state.remoteActionContext("/repo", 4, .{ .device = 7, .inode = 10 })) == .loading_branch_status);
+    state.branch.needs_revalidation = true;
+    try std.testing.expect(git_ops.pushTarget(state.remoteActionContext("/repo", 4, identity)) == .loading_branch_status);
+    state.branch.needs_revalidation = false;
+    state.branch.freshness = .{ .failed = .load_failed };
+    try std.testing.expect(git_ops.pushTarget(state.remoteActionContext("/repo", 4, identity)) == .loading_branch_status);
+    state.branch.freshness = .fresh;
+    state.active = false;
+    try std.testing.expect(git_ops.pushTarget(state.remoteActionContext("/repo", 4, identity)) == .loading_branch_status);
 }

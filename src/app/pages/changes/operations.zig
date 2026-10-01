@@ -23,7 +23,6 @@ const diff_source = @import("../../../diff/source.zig");
 const auto_reload = @import("../../auto_reload.zig");
 const app_load = @import("../../load.zig");
 const app_page = @import("../../page.zig");
-const remote_request = @import("../../remote_request.zig");
 const action_fence = @import("action_fence.zig");
 const test_support = if (builtin.is_test) @import("../../test_support.zig") else struct {};
 
@@ -90,47 +89,6 @@ pub const OwnedUnstageProposal = struct {
     }
 };
 
-pub const OwnedPushProposal = struct {
-    repository_identity: remote_request.RepositoryIdentity,
-    mode: git_ops.PushMode,
-    repo_root: []u8,
-    branch: []u8,
-    remote: []u8,
-    remote_branch: []u8,
-    oid: []u8,
-    ahead_behind: ?@import("../../../git/branch_status.zig").AheadBehind,
-
-    fn deinit(self: *OwnedPushProposal, allocator: std.mem.Allocator) void {
-        allocator.free(self.repo_root);
-        allocator.free(self.branch);
-        allocator.free(self.remote);
-        allocator.free(self.remote_branch);
-        allocator.free(self.oid);
-        self.* = undefined;
-    }
-};
-
-pub const OwnedPullProposal = struct {
-    repo_root: []u8,
-    branch: []u8,
-    remote: []u8,
-    remote_branch: []u8,
-    upstream_ref: []u8,
-    oid: []u8,
-    ahead: u32,
-    behind: u32,
-
-    fn deinit(self: *OwnedPullProposal, allocator: std.mem.Allocator) void {
-        allocator.free(self.repo_root);
-        allocator.free(self.branch);
-        allocator.free(self.remote);
-        allocator.free(self.remote_branch);
-        allocator.free(self.upstream_ref);
-        allocator.free(self.oid);
-        self.* = undefined;
-    }
-};
-
 pub const OwnedFetchProposal = struct {
     repo_root: []u8,
     remote: []u8,
@@ -151,8 +109,6 @@ pub const OwnedOperationProposal = union(enum) {
     stage_hunk: OwnedHunkProposal,
     unstage_hunk: OwnedHunkProposal,
     discard: OwnedDiscardProposal,
-    push: OwnedPushProposal,
-    pull: OwnedPullProposal,
     fetch: OwnedFetchProposal,
 
     pub fn deinit(self: *OwnedOperationProposal, allocator: std.mem.Allocator) void {
@@ -294,49 +250,31 @@ pub const View = struct {
         return git_ops.discardTarget(self.targetContext(.discard_file));
     }
 
-    pub fn pushTarget(self: View) git_ops.PushTargetResult {
+    pub fn remoteActionContext(self: View) git_ops.RemoteActionContext {
         const members = self.activationMembers();
         const requirements = authority.Action.push.requirements();
-        return git_ops.pushTarget(.{
+        return .{
             .source = self.source,
             .repo_root = self.repo_root,
             .branch_status = .{
                 .repo_root = self.page.branch_status.repo_root,
-                .loading = requirements.branch != .unused and members.branch == .pending,
+                .loading = members.branch == .pending,
                 .fresh = members.branch.satisfies(requirements.branch),
                 .status = self.page.branch_status.status,
             },
-        });
+        };
+    }
+
+    pub fn pushTarget(self: View) git_ops.PushTargetResult {
+        return git_ops.pushTarget(self.remoteActionContext());
     }
 
     pub fn pullTarget(self: View) git_ops.PullTargetResult {
-        const members = self.activationMembers();
-        const requirements = authority.Action.pull.requirements();
-        return git_ops.pullTarget(.{
-            .source = self.source,
-            .repo_root = self.repo_root,
-            .branch_status = .{
-                .repo_root = self.page.branch_status.repo_root,
-                .loading = requirements.branch != .unused and members.branch == .pending,
-                .fresh = members.branch.satisfies(requirements.branch),
-                .status = self.page.branch_status.status,
-            },
-        });
+        return git_ops.pullTarget(self.remoteActionContext());
     }
 
     pub fn fetchTarget(self: View) git_ops.FetchTargetResult {
-        const members = self.activationMembers();
-        const requirements = authority.Action.fetch.requirements();
-        return git_ops.fetchTarget(.{
-            .source = self.source,
-            .repo_root = self.repo_root,
-            .branch_status = .{
-                .repo_root = self.page.branch_status.repo_root,
-                .loading = requirements.branch != .unused and members.branch == .pending,
-                .fresh = members.branch.satisfies(requirements.branch),
-                .status = self.page.branch_status.status,
-            },
-        });
+        return git_ops.fetchTarget(self.remoteActionContext());
     }
 
     pub fn canOpenCommitPanel(self: View) bool {
@@ -437,19 +375,6 @@ pub const View = struct {
 
     pub fn ownUnstageHunkProposal(_: View, allocator: std.mem.Allocator, target: *git_ops.HunkUnstageTarget) !OwnedOperationProposal {
         return .{ .unstage_hunk = try consumeHunkProposal(allocator, target) };
-    }
-
-    pub fn ownPushProposal(
-        _: View,
-        allocator: std.mem.Allocator,
-        repository_identity: remote_request.RepositoryIdentity,
-        target: git_ops.PushTarget,
-    ) !OwnedOperationProposal {
-        return .{ .push = try clonePushProposal(allocator, repository_identity, target) };
-    }
-
-    pub fn ownPullProposal(_: View, allocator: std.mem.Allocator, target: git_ops.PullTarget) !OwnedOperationProposal {
-        return .{ .pull = try clonePullProposal(allocator, target) };
     }
 
     pub fn ownFetchProposal(_: View, allocator: std.mem.Allocator, target: git_ops.FetchTarget) !OwnedOperationProposal {
@@ -843,31 +768,6 @@ pub const Controller = struct {
     }
 };
 
-fn clonePushProposal(
-    allocator: std.mem.Allocator,
-    repository_identity: remote_request.RepositoryIdentity,
-    target: git_ops.PushTarget,
-) !OwnedPushProposal {
-    const repo_root = try allocator.dupe(u8, target.repo_root);
-    errdefer allocator.free(repo_root);
-    const branch = try allocator.dupe(u8, target.branch);
-    errdefer allocator.free(branch);
-    const remote = try allocator.dupe(u8, target.remote);
-    errdefer allocator.free(remote);
-    const remote_branch = try allocator.dupe(u8, target.remote_branch);
-    errdefer allocator.free(remote_branch);
-    return .{
-        .repository_identity = repository_identity,
-        .mode = target.mode,
-        .repo_root = repo_root,
-        .branch = branch,
-        .remote = remote,
-        .remote_branch = remote_branch,
-        .oid = try allocator.dupe(u8, target.oid),
-        .ahead_behind = target.ahead_behind,
-    };
-}
-
 fn clonePathProposal(
     allocator: std.mem.Allocator,
     repo_root_value: []const u8,
@@ -905,29 +805,6 @@ fn consumeHunkProposal(allocator: std.mem.Allocator, target: *git_ops.HunkStageT
         .patch = patch,
         .session_mark_mutation = target.session_mark_mutation,
         .reload_after_success = target.reload_after_success,
-    };
-}
-
-fn clonePullProposal(allocator: std.mem.Allocator, target: git_ops.PullTarget) !OwnedPullProposal {
-    const repo_root = try allocator.dupe(u8, target.repo_root);
-    errdefer allocator.free(repo_root);
-    const branch = try allocator.dupe(u8, target.branch);
-    errdefer allocator.free(branch);
-    const remote = try allocator.dupe(u8, target.remote);
-    errdefer allocator.free(remote);
-    const remote_branch = try allocator.dupe(u8, target.remote_branch);
-    errdefer allocator.free(remote_branch);
-    const upstream_ref = try allocator.dupe(u8, target.upstream_ref);
-    errdefer allocator.free(upstream_ref);
-    return .{
-        .repo_root = repo_root,
-        .branch = branch,
-        .remote = remote,
-        .remote_branch = remote_branch,
-        .upstream_ref = upstream_ref,
-        .oid = try allocator.dupe(u8, target.oid),
-        .ahead = target.ahead,
-        .behind = target.behind,
     };
 }
 
@@ -1222,46 +1099,6 @@ fn pathTestCommand(cwd: std.Io.Dir, argv: []const []const u8) ![]u8 {
         else => {},
     }
     return error.GitCommandFailed;
-}
-
-test "owned operation proposal frees every cloned field" {
-    const allocator = std.testing.allocator;
-    const view: View = undefined;
-    var proposal = try view.ownPushProposal(allocator, .{
-        .repo_epoch = 1,
-        .root_identity = .{ .device = 2, .inode = 3 },
-    }, .{
-        .mode = .upstream,
-        .repo_root = "/repo",
-        .branch = "main",
-        .remote = "origin",
-        .remote_branch = "main",
-        .oid = "abc",
-        .ahead_behind = .{ .ahead = 1, .behind = 0 },
-    });
-    proposal.deinit(allocator);
-}
-
-test "owned operation proposal construction frees partial clones" {
-    const backing = std.testing.allocator;
-    var fail_index: usize = 0;
-    while (fail_index < 5) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
-        const view: View = undefined;
-        const result = view.ownPushProposal(failing.allocator(), .{
-            .repo_epoch = 1,
-            .root_identity = .{ .device = 2, .inode = 3 },
-        }, .{
-            .mode = .upstream,
-            .repo_root = "/repo",
-            .branch = "main",
-            .remote = "origin",
-            .remote_branch = "main",
-            .oid = "abc",
-            .ahead_behind = .{ .ahead = 1, .behind = 0 },
-        });
-        try std.testing.expectError(error.OutOfMemory, result);
-    }
 }
 
 test "accepted hunk stage keeps mandatory reload when local mark allocation fails" {

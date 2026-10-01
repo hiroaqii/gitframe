@@ -415,11 +415,11 @@ pub const App = struct {
             .state = &self.remote_workflow,
             .lifecycle = self.actionLifecycle(),
             .operations = self.changesOperationController(),
+            .remote_context = if (self.active_page == .repository) self.pages.repository.remoteActionContext(self.repoSessionView().activeRoot(), self.repoSessionView().epoch(), self.repoSessionView().activeIdentity()) else self.changesOperationController().view().remoteActionContext(),
             .repo = self.repoSessionView(),
             .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
             .active_page = self.active_page,
-            .changes_origin = origins.changes(),
             .branch_origin = switch (self.active_page) {
                 .changes => origins.changes(),
                 .repository => origins.repository(),
@@ -1122,6 +1122,10 @@ pub const App = struct {
     ) !?drag_auto_scroll.StepOutcome {
         var outcome = self.repositoryCoordinator().update(ctx, msg);
         defer outcome.deinit(ctx.allocator());
+        if (outcome.remote_action) |action| switch (action) {
+            .push => try self.requestRemotePush(ctx),
+            .pull => try self.requestRemotePull(ctx),
+        };
         if (outcome.editor_target) |target| try self.shellEffects().requestEditor(
             ctx,
             target,
@@ -1291,6 +1295,11 @@ pub const App = struct {
     ) !void {
         if (outcome.cancel_local_confirmations) {
             self.localWorkflow().cancelConfirmations(ctx.allocator());
+        }
+        switch (outcome.repository_reload) {
+            .none => {},
+            .branch => self.pages.repository.invalidateRemoteBranch(self.repoSessionView().activeRoot() != null),
+            .full => self.repositoryCoordinator().requestReload(.remote_operation),
         }
         if (outcome.reload != .none) {
             try self.changesRead().applyEffectReload(ctx, outcome.reload);

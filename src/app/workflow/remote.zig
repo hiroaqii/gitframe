@@ -1,8 +1,8 @@
 //! Remote Git operations and shared branch-switch ownership.
 //!
 //! This controller owns push, pull, fetch, branch-switch, retry inspection,
-//! interactive-push, and upstream-finalization state. Changes supplies synchronous target
-//! and outcome ports; branch switching captures its own caller and snapshot.
+//! interactive-push, and upstream-finalization state. Each page supplies a synchronous
+//! remote context; operation ownership captures its caller and repository identity.
 //! The root shell consumes typed reload intent. The module
 //! never imports the root App, local workflow, read coordinator, or shell
 //! effects.
@@ -107,6 +107,7 @@ pub const BranchReload = union(enum) {
 
 pub const Outcome = struct {
     branch_reload: ?BranchReload = null,
+    repository_reload: enum { none, branch, full } = .none,
     reload: changes_action_fence.ReloadIntent = .none,
     cancel_local_confirmations: bool = false,
     quit_after_terminal: bool = false,
@@ -116,11 +117,11 @@ pub const Controller = struct {
     state: *State,
     lifecycle: action_lifecycle.Controller,
     operations: changes_operations.Controller,
+    remote_context: git_ops.RemoteActionContext,
     repo: repo_session.View,
     current_changes_root: ?[]const u8,
     env_map: ?*std.process.Environ.Map,
     active_page: page.Id,
-    changes_origin: effect_origin.PageOrigin,
     branch_origin: ?effect_origin.PageOrigin,
     repository_status: *app_state.StatusMessage,
     history_status: *app_state.StatusMessage,
@@ -155,11 +156,13 @@ pub const Controller = struct {
 
     pub fn requestPush(self: Controller, allocator: std.mem.Allocator) !Outcome {
         if (self.lifecycle.view().hasPending()) {
-            self.setStatus("another git action is running", .{});
+            self.branchStatus(self.active_page).set("another git action is running", .{});
             return .{};
         }
 
-        const target = switch (self.operations.view().pushTarget()) {
+        if (self.active_page != .changes and self.active_page != .repository) return .{};
+        if (self.branch_origin == null) return self.reject("remote action unavailable: page authority changed");
+        const target = switch (git_ops.pushTarget(self.remote_context)) {
             .ready => |target| target,
             .unavailable_source => return self.reject("push unavailable for this source"),
             .no_repo => return self.reject("push unavailable: no repository"),
@@ -183,23 +186,10 @@ pub const Controller = struct {
         self.cancelPullConfirmation(allocator);
         self.clearRemoteError(allocator);
 
-        var proposal = try self.operations.view().ownPushProposal(allocator, repository_identity, target);
-        var proposal_consumed = false;
-        defer if (!proposal_consumed) proposal.deinit(allocator);
-        const owned = proposal.push;
-        self.state.push_confirmation = .{
-            .repository_identity = owned.repository_identity,
-            .mode = owned.mode,
-            .repo_root = owned.repo_root,
-            .branch = owned.branch,
-            .remote = owned.remote,
-            .remote_branch = owned.remote_branch,
-            .oid = owned.oid,
-            .ahead_behind = owned.ahead_behind,
-        };
-        proposal_consumed = true;
-        self.operations.navigation.clearDiffSelection();
-        self.overlay.openPushBranch();
+        self.state.push_confirmation = try app_state.PushConfirmation.init(allocator, repository_identity, target);
+        self.state.owner = .{ .origin = self.branch_origin.?, .root_identity = repository_identity.root_identity };
+        if (self.active_page == .changes) self.operations.navigation.clearDiffSelection();
+        self.overlay.openPushBranch(self.active_page);
         return .{ .cancel_local_confirmations = true };
     }
 
@@ -210,9 +200,10 @@ pub const Controller = struct {
         }
         var confirmation = self.state.push_confirmation orelse return;
         self.state.push_confirmation = null;
+        defer self.releaseIdleOwner();
         var confirmation_consumed = false;
         defer if (!confirmation_consumed) confirmation.deinit(ctx.allocator());
-        if (!self.repositoryMatches(confirmation.repository_identity) or
+        if (self.liveRemotePage() == null or !self.repositoryMatches(confirmation.repository_identity) or
             self.repo.activeRoot() == null or
             !std.mem.eql(u8, self.repo.activeRoot().?, confirmation.repo_root))
         {
@@ -262,15 +253,18 @@ pub const Controller = struct {
     pub fn cancelPushConfirmation(self: Controller, allocator: std.mem.Allocator) void {
         if (self.state.push_confirmation) |*confirmation| confirmation.deinit(allocator);
         self.state.push_confirmation = null;
+        self.releaseIdleOwner();
         if (self.overlay.isPushBranch()) self.overlay.close();
     }
 
     pub fn requestPull(self: Controller, allocator: std.mem.Allocator) !Outcome {
         if (self.lifecycle.view().hasPending()) {
-            self.setStatus("another git action is running", .{});
+            self.branchStatus(self.active_page).set("another git action is running", .{});
             return .{};
         }
-        const target = switch (self.operations.view().pullTarget()) {
+        if (self.active_page != .changes and self.active_page != .repository) return .{};
+        if (self.branch_origin == null) return self.reject("remote action unavailable: page authority changed");
+        const target = switch (git_ops.pullTarget(self.remote_context)) {
             .ready => |target| target,
             .unavailable_source => return self.reject("pull unavailable for this source"),
             .no_repo => return self.reject("pull unavailable: no repository"),
@@ -291,24 +285,10 @@ pub const Controller = struct {
         self.cancelPushConfirmation(allocator);
         self.cancelPullConfirmation(allocator);
         self.clearRemoteError(allocator);
-        var proposal = try self.operations.view().ownPullProposal(allocator, target);
-        var proposal_consumed = false;
-        defer if (!proposal_consumed) proposal.deinit(allocator);
-        const owned = proposal.pull;
-        self.state.pull_confirmation = .{
-            .repository_identity = repository_identity,
-            .repo_root = owned.repo_root,
-            .branch = owned.branch,
-            .remote = owned.remote,
-            .remote_branch = owned.remote_branch,
-            .upstream_ref = owned.upstream_ref,
-            .oid = owned.oid,
-            .ahead = owned.ahead,
-            .behind = owned.behind,
-        };
-        proposal_consumed = true;
-        self.operations.navigation.clearDiffSelection();
-        self.overlay.openPullBranch();
+        self.state.pull_confirmation = try app_state.PullConfirmation.init(allocator, repository_identity, target);
+        self.state.owner = .{ .origin = self.branch_origin.?, .root_identity = repository_identity.root_identity };
+        if (self.active_page == .changes) self.operations.navigation.clearDiffSelection();
+        self.overlay.openPullBranch(self.active_page);
         return .{ .cancel_local_confirmations = true };
     }
 
@@ -319,9 +299,10 @@ pub const Controller = struct {
         }
         var confirmation = self.state.pull_confirmation orelse return;
         self.state.pull_confirmation = null;
+        defer self.releaseIdleOwner();
         var confirmation_consumed = false;
         defer if (!confirmation_consumed) confirmation.deinit(ctx.allocator());
-        if (!self.repositoryMatches(confirmation.repository_identity) or
+        if (self.liveRemotePage() == null or !self.repositoryMatches(confirmation.repository_identity) or
             self.repo.activeRoot() == null or
             !std.mem.eql(u8, self.repo.activeRoot().?, confirmation.repo_root))
         {
@@ -371,6 +352,7 @@ pub const Controller = struct {
     pub fn cancelPullConfirmation(self: Controller, allocator: std.mem.Allocator) void {
         if (self.state.pull_confirmation) |*confirmation| confirmation.deinit(allocator);
         self.state.pull_confirmation = null;
+        self.releaseIdleOwner();
         if (self.overlay.isPullBranch()) self.overlay.close();
     }
 
@@ -635,6 +617,7 @@ pub const Controller = struct {
     pub fn clearRemoteError(self: Controller, allocator: std.mem.Allocator) void {
         self.clearRemoteErrorPresentation(allocator);
         self.state.push_retry.state.deinit(allocator);
+        self.releaseIdleOwner();
     }
 
     pub fn clearBranchSwitch(self: Controller, allocator: std.mem.Allocator) void {
@@ -650,79 +633,74 @@ pub const Controller = struct {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
-        const active_matches = terminal.target == .current_changes;
+        defer self.releaseIdleOwner();
         const quit_after_terminal = self.finishRemoteControl(result.pending);
-        if (!self.remoteRequestMatches(result.identity) or
-            result.identity.operation_generation != result.pending.generation)
+        if (!self.remoteRequestMatches(result.identity) or result.identity.operation_generation != result.pending.generation)
             return .{ .quit_after_terminal = quit_after_terminal };
+        const refresh = switch (result.result.outcome) {
+            .ok => true,
+            .failed => |failure| remoteOutcomeUnknown(failure),
+        };
+        const outcome: Outcome = .{
+            .reload = if (refresh and terminal.target == .current_changes) .source_and_aux else .none,
+            .repository_reload = if (refresh) .branch else .none,
+            .quit_after_terminal = quit_after_terminal,
+        };
+        const owner_page = self.remotePage() orelse return outcome;
         switch (result.result.outcome) {
-            .ok => |success| {
-                if (success == .push_tracking_incomplete) {
-                    self.setRemoteStatus(result.result.warnings, "push succeeded; local upstream was not configured; repository reload required", .{});
-                    return .{
-                        .reload = if (active_matches) .source_and_aux else .none,
-                        .quit_after_terminal = quit_after_terminal,
-                    };
-                }
-                if (active_matches) {
-                    self.setRemoteStatus(result.result.warnings, "pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                    return .{ .reload = .source_and_aux, .quit_after_terminal = quit_after_terminal };
-                }
-                self.setRemoteStatus(result.result.warnings, "pushed: {s}", .{result.repo_root});
+            .ok => |success| if (success == .push_tracking_incomplete) {
+                self.setRemoteStatus(result.result.warnings, "push succeeded; local upstream was not configured; repository reload required", .{});
+            } else {
+                self.setRemoteStatus(result.result.warnings, "pushed: {s} -> {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
             },
             .failed => |failure| {
                 self.setRemoteFailureStatus(result.result.warnings, .push, failure);
-                const retry_allowed = failure != .http_userinfo_rejected and
-                    failure != .canceled and failure != .timed_out and !remoteOutcomeUnknown(failure);
-                const retry_target = if (retry_allowed) try pushRetryTargetFromFinished(allocator, result) else null;
-                errdefer if (retry_target) |owned_target| {
-                    var target = owned_target;
-                    target.deinit(allocator);
-                };
-                const presentation = try remoteFailurePresentationAlloc(allocator, .push, failure, result.result.warnings);
+                if (owner_page != self.active_page) return outcome;
+                // Diagnostics are best effort; allocation failure must not lose read recovery.
+                const retry_allowed = failure != .http_userinfo_rejected and failure != .canceled and
+                    failure != .timed_out and !remoteOutcomeUnknown(failure);
+                var retry_target = if (retry_allowed) pushRetryTargetFromFinished(allocator, result) catch return outcome else null;
+                defer if (retry_target) |*target| target.deinit(allocator);
+                const presentation = remoteFailurePresentationAlloc(allocator, .push, failure, result.result.warnings) catch return outcome;
                 defer allocator.free(presentation);
-                try self.setRemoteErrorWithRetry(allocator, .push, presentation, retry_target, .changes);
-                return .{
-                    .reload = if (active_matches and remoteOutcomeUnknown(failure)) .source_and_aux else .none,
-                    .quit_after_terminal = quit_after_terminal,
-                };
+                self.setRemoteErrorWithRetry(allocator, .push, presentation, retry_target, owner_page) catch return outcome;
+                retry_target = null;
             },
         }
-        return .{ .quit_after_terminal = quit_after_terminal };
+        return outcome;
     }
 
     pub fn finishPull(self: Controller, allocator: std.mem.Allocator, finished: app_actions.PullFinished) !Outcome {
         var result = finished;
         defer result.deinit(allocator);
         const terminal = self.acceptTerminal(allocator, result.pending, result.repo_root) orelse return .{};
+        defer self.releaseIdleOwner();
         const quit_after_terminal = self.finishRemoteControl(result.pending);
-        if (!self.remoteRequestMatches(result.identity) or
-            result.identity.operation_generation != result.pending.generation)
+        if (!self.remoteRequestMatches(result.identity) or result.identity.operation_generation != result.pending.generation)
             return .{ .quit_after_terminal = quit_after_terminal };
-        const active_matches = terminal.target == .current_changes;
+        const outcome: Outcome = .{
+            .reload = if (terminal.target == .current_changes) .source_and_aux else .none,
+            .repository_reload = .full,
+            .quit_after_terminal = quit_after_terminal,
+        };
+        const owner_page = self.remotePage() orelse return outcome;
         switch (result.result.outcome) {
             .ok => |success| switch (success) {
-                .completed => if (active_matches) {
-                    self.setRemoteStatus(result.result.warnings, "pulled: {s} <- {s}/{s}", .{ result.branch, result.remote, result.remote_branch });
-                } else {
-                    self.setRemoteStatus(result.result.warnings, "pulled: {s}", .{result.repo_root});
-                },
+                .completed => self.setRemoteStatus(result.result.warnings, "pulled: {s} <- {s}/{s}", .{ result.branch, result.remote, result.remote_branch }),
                 .already_up_to_date => self.setRemoteStatus(result.result.warnings, "already up to date", .{}),
-                .push_tracking_incomplete => unreachable, // Only push produces this terminal.
+                .push_tracking_incomplete => unreachable,
             },
             .failed => |failure| {
                 self.setRemoteFailureStatus(result.result.warnings, .pull, failure);
+                if (owner_page != self.active_page) return outcome;
                 if (pullFailureHasDetails(failure)) {
-                    const presentation = try remoteFailurePresentationAlloc(allocator, .pull, failure, result.result.warnings);
+                    const presentation = remoteFailurePresentationAlloc(allocator, .pull, failure, result.result.warnings) catch return outcome;
                     defer allocator.free(presentation);
-                    try self.setRemoteErrorWithRetry(allocator, .pull, presentation, null, .changes);
+                    self.setRemoteErrorWithRetry(allocator, .pull, presentation, null, owner_page) catch return outcome;
                 }
             },
         }
-        return .{
-            .reload = if (active_matches) .source_and_aux else .none,
-            .quit_after_terminal = quit_after_terminal,
-        };
+        return outcome;
     }
 
     pub fn finishFetch(self: Controller, allocator: std.mem.Allocator, finished: app_actions.FetchFinished) Outcome {
@@ -900,10 +878,12 @@ pub const Controller = struct {
         };
         if (!inspecting.accepts(result)) return;
         self.state.push_retry.state = .idle;
+        defer self.releaseIdleOwner();
         if (!self.remoteRequestMatches(result.identity)) return;
         const origin: effect_origin.Origin = .{ .page = result.origin };
-        if (effect_origin.classify(origin, self.effect_snapshot) == .stale) {
+        if (effect_origin.classify(origin, self.effect_snapshot) != .live_active) {
             self.clearRemoteErrorPresentation(ctx.allocator());
+            self.redraw.requestSkip();
             return;
         }
         switch (result.outcome) {
@@ -939,6 +919,7 @@ pub const Controller = struct {
         };
         if (foreground.request_id.id != result.request_id.id) return .{};
         self.state.push_retry.state = .idle;
+        defer self.releaseIdleOwner();
 
         const origin: effect_origin.Origin = .{ .page = foreground.origin };
         const liveness = effect_origin.classify(origin, self.effect_snapshot);
@@ -1021,7 +1002,7 @@ pub const Controller = struct {
         const active_matches = terminal.target == .current_changes;
         if (liveness == .stale) {
             self.redraw.requestSkip();
-            return .{};
+            return .{ .reload = if (active_matches) .source_and_aux else .none, .repository_reload = .branch };
         }
         switch (result.outcome) {
             .exited => |code| if (code == 0) {
@@ -1030,13 +1011,10 @@ pub const Controller = struct {
             .signaled => |signal| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push signal: {d}", .{signal}) else self.setForegroundStatus(foreground.warnings, "interactive push signal for {s}: {d}", .{ foreground.target.repo_root, signal }),
             .stopped => |signal| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push stopped and terminated: {d}", .{signal}) else self.setForegroundStatus(foreground.warnings, "interactive push stopped and terminated for {s}: {d}", .{ foreground.target.repo_root, signal }),
             .failed => |failure| if (active_matches) self.setForegroundStatus(foreground.warnings, "interactive push {s} failed: {s}", .{ @tagName(failure.stage), failure.error_name }) else self.setForegroundStatus(foreground.warnings, "interactive push {s} failed for {s}: {s}", .{ @tagName(failure.stage), foreground.target.repo_root, failure.error_name }),
-            .runtime_abandoned => return .{},
+            .runtime_abandoned => return .{ .reload = if (active_matches) .source_and_aux else .none, .repository_reload = .branch },
         }
-        if (liveness == .live_inactive) {
-            self.redraw.requestSkip();
-            return .{};
-        }
-        return .{ .reload = if (active_matches) .source_and_aux else .none };
+        if (liveness == .live_inactive) self.redraw.requestSkip();
+        return .{ .reload = if (active_matches) .source_and_aux else .none, .repository_reload = .branch };
     }
 
     pub fn finishPushUpstreamFinalize(self: Controller, allocator: std.mem.Allocator, result: app_push_retry.FinalizeFinished) Outcome {
@@ -1046,11 +1024,12 @@ pub const Controller = struct {
         };
         if (!finalizing.accepts(result)) return .{};
         self.state.push_retry.state = .idle;
+        defer self.releaseIdleOwner();
         const request_matches = self.remoteRequestMatches(result.identity);
         const terminal = self.acceptTerminal(
             allocator,
             finalizing.pending,
-            if (request_matches) self.current_changes_root orelse "" else "",
+            if (request_matches) self.repo.activeRoot() orelse "" else "",
         ) orelse return .{};
         const quit_after_terminal = self.takeDeferredQuit();
         if (!request_matches) {
@@ -1061,7 +1040,7 @@ pub const Controller = struct {
         const liveness = effect_origin.classify(origin, self.effect_snapshot);
         if (liveness == .stale) {
             self.redraw.requestSkip();
-            return .{ .quit_after_terminal = quit_after_terminal };
+            return .{ .reload = if (terminal.target == .current_changes) .source_and_aux else .none, .repository_reload = .branch, .quit_after_terminal = quit_after_terminal };
         }
         switch (result.outcome) {
             .configured, .already_configured => self.setRemoteStatus(
@@ -1077,6 +1056,7 @@ pub const Controller = struct {
         }
         if (liveness == .live_inactive) self.redraw.requestSkip();
         return .{
+            .repository_reload = .branch,
             .reload = if (terminal.target == .current_changes) .source_and_aux else .none,
             .quit_after_terminal = quit_after_terminal,
         };
@@ -1104,7 +1084,10 @@ pub const Controller = struct {
             .inspection,
         );
         defer if (environment) |*owned| owned.deinit();
-        var started = self.state.push_retry.beginInspection(self.changes_origin) orelse return self.rejectVoid(unavailable_message);
+        const owner_page = self.liveRemotePage() orelse return self.rejectVoid("push retry unavailable: page authority changed");
+        const origin = self.branch_origin orelse return;
+        if (origin.page_id != owner_page) return;
+        var started = self.state.push_retry.beginInspection(origin) orelse return self.rejectVoid(unavailable_message);
         app_push_retry.startInspection(app_message.Msg, ctx, started.metadata, &root, &environment, &started.target) catch |err| {
             self.restorePushRetryTarget(ctx.allocator(), started.target.take());
             self.setStatus("could not start push retry inspection", .{});
@@ -1196,7 +1179,9 @@ pub const Controller = struct {
         owner_page: page.Id,
     ) !void {
         std.debug.assert(operation == .push or retry_target == null);
+        const owner = self.state.owner;
         self.clearRemoteError(allocator);
+        self.state.owner = owner;
         self.state.remote_error_message = try allocator.dupe(u8, message);
         self.state.remote_error_operation = operation;
         if (retry_target) |target| self.state.push_retry.state = .{ .available = .{ .target = target } };
@@ -1213,8 +1198,12 @@ pub const Controller = struct {
 
     fn restorePushRetryTarget(self: Controller, allocator: std.mem.Allocator, target: app_state.PushRetryTarget) void {
         self.state.push_retry.restoreAvailable(allocator, target);
-        self.operations.navigation.clearDiffSelection();
-        self.overlay.openRemoteError(.changes);
+        const owner_page = self.liveRemotePage() orelse {
+            self.clearRemoteError(allocator);
+            return;
+        };
+        if (owner_page == .changes) self.operations.navigation.clearDiffSelection();
+        self.overlay.openRemoteError(owner_page);
     }
 
     fn finishUpstreamPartial(
@@ -1235,7 +1224,8 @@ pub const Controller = struct {
         }
         if (liveness != .live_active) self.redraw.requestSkip();
         return .{
-            .reload = if (liveness != .stale and terminal.target == .current_changes and self.remoteRequestMatches(identity)) .source_and_aux else .none,
+            .repository_reload = if (self.remoteRequestMatches(identity)) .branch else .none,
+            .reload = if (terminal.target == .current_changes and self.remoteRequestMatches(identity)) .source_and_aux else .none,
             .quit_after_terminal = quit_after_terminal,
         };
     }
@@ -1298,7 +1288,7 @@ pub const Controller = struct {
     }
 
     fn reject(self: Controller, message: []const u8) Outcome {
-        self.setStatus("{s}", .{message});
+        self.branchStatus(self.active_page).set("{s}", .{message});
         return .{};
     }
 
@@ -1307,7 +1297,28 @@ pub const Controller = struct {
     }
 
     fn setStatus(self: Controller, comptime fmt: []const u8, args: anytype) void {
-        self.status.set(fmt, args);
+        if (self.state.owner != null) {
+            const owner_page = self.remotePage() orelse return;
+            self.branchStatus(owner_page).set(fmt, args);
+        } else self.status.set(fmt, args);
+    }
+
+    fn liveRemotePage(self: Controller) ?page.Id {
+        const owner_page = self.remotePage() orelse return null;
+        return if (owner_page == self.active_page) owner_page else null;
+    }
+
+    fn remotePage(self: Controller) ?page.Id {
+        const owner = self.state.owner orelse return null;
+        if (!self.repositoryMatches(.{ .repo_epoch = owner.origin.repo_epoch, .root_identity = owner.root_identity })) return null;
+        if (effect_origin.classify(.{ .page = owner.origin }, self.effect_snapshot) == .stale) return null;
+        return owner.origin.page_id;
+    }
+
+    fn releaseIdleOwner(self: Controller) void {
+        if (!self.lifecycle.view().hasPending() and self.state.push_confirmation == null and
+            self.state.pull_confirmation == null and self.state.remote_error_operation == null and
+            self.state.push_retry.state == .idle) self.state.owner = null;
     }
 
     fn setRemoteStatus(
@@ -1317,12 +1328,12 @@ pub const Controller = struct {
         args: anytype,
     ) void {
         const warning = remoteWarningMessage(warnings) orelse {
-            self.status.set(fmt, args);
+            self.setStatus(fmt, args);
             return;
         };
         var buffer: [112]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, fmt, args) catch "remote operation completed";
-        self.status.set("{s}; {s}", .{ warning, message });
+        self.setStatus("{s}; {s}", .{ warning, message });
     }
 
     fn setRemoteFailureStatus(
@@ -1336,10 +1347,10 @@ pub const Controller = struct {
             return;
         }
         const warning = remoteWarningMessage(warnings) orelse {
-            self.status.set("{s} failed: {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure) });
+            self.setStatus("{s} failed: {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure) });
             return;
         };
-        self.status.set("{s} failed: {s}; {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure), warning });
+        self.setStatus("{s} failed: {s}; {s}", .{ @tagName(kind), remoteFailureMessage(kind, failure), warning });
     }
 
     fn setForegroundStatus(
@@ -1349,12 +1360,12 @@ pub const Controller = struct {
         args: anytype,
     ) void {
         const warning = remoteWarningMessage(warnings) orelse {
-            self.status.set(fmt, args);
+            self.setStatus(fmt, args);
             return;
         };
         var buffer: [112]u8 = undefined;
         const message = std.fmt.bufPrint(&buffer, fmt, args) catch "interactive push completed";
-        self.status.set("{s}; {s}", .{ warning, message });
+        self.setStatus("{s}; {s}", .{ warning, message });
     }
 };
 
@@ -1519,6 +1530,11 @@ pub const testing = if (builtin.is_test) struct {
         message: []const u8,
         retry_target: ?app_state.PushRetryTarget,
     ) !void {
+        if (controller.currentRepositoryIdentity()) |identity| {
+            if (controller.branch_origin) |origin| {
+                controller.state.owner = .{ .origin = origin, .root_identity = identity.root_identity };
+            }
+        }
         try controller.setRemoteErrorWithRetry(allocator, operation, message, retry_target, .changes);
     }
 

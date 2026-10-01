@@ -155,14 +155,10 @@ const RemoteHarness = struct {
             .lifecycle = self.actionLifecycle(),
             .operations = self.changesOperationController(),
             .repo = self.repoSessionView(),
+            .remote_context = self.changesOperationController().view().remoteActionContext(),
             .current_changes_root = self.currentChangesActionRoot(),
             .env_map = self.env_map,
             .active_page = self.active_page,
-            .changes_origin = .{
-                .page_id = .changes,
-                .repo_epoch = self.repoSessionView().epoch(),
-                .activation_id = snapshot.changes_activation_id,
-            },
             .branch_origin = switch (self.active_page) {
                 .changes, .repository => .{
                     .page_id = self.active_page,
@@ -311,6 +307,10 @@ fn beginAcceptedTestAction(
     app: *RemoteHarness,
     kind: app_actions.ActionKind,
 ) app_actions.PendingAction {
+    if (kind == .push or kind == .pull) app.remote_workflow.owner = .{
+        .origin = app.remoteWorkflow().branch_origin.?,
+        .root_identity = app.repoSessionView().activeIdentity() orelse .{ .device = 0, .inode = 0 },
+    };
     const prepared = app.actionLifecycle().prepare(kind);
     return app.actionLifecycle().acceptSpawn(
         app.allocator orelse std.testing.allocator,
@@ -493,6 +493,7 @@ fn installPushConfirmationForTest(
     allocator: std.mem.Allocator,
 ) !void {
     const repository = repositoryIdentityForTest(app);
+    app.remote_workflow.owner = .{ .origin = app.remoteWorkflow().branch_origin.?, .root_identity = app.repoSessionView().activeIdentity().? };
     app.remote_workflow.push_confirmation = .{
         .repository_identity = repository,
         .mode = .upstream,
@@ -503,7 +504,7 @@ fn installPushConfirmationForTest(
         .oid = try allocator.dupe(u8, "abc123"),
         .ahead_behind = .{ .ahead = 1, .behind = 0 },
     };
-    app.overlay.openPushBranch();
+    app.overlay.openPushBranch(.changes);
 }
 
 fn installFetchTargetForTest(
@@ -1555,7 +1556,8 @@ test "confirmPush rejects a proposal after repository authority changes" {
     try std.testing.expect(!app.overlay.isPushBranch());
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
-    try std.testing.expectEqualStrings("push unavailable: repository authority changed", app.pages.changes.status.text());
+    try std.testing.expectEqualStrings("", app.pages.changes.status.text());
+    try std.testing.expect(app.remote_workflow.owner == null);
 }
 
 test "confirmPush rejects a proposal with a stale root identity" {
@@ -2603,7 +2605,8 @@ test "interactive push foreground terminals publish proxy warning once for both 
         });
 
         const status = app.pages.changes.status.text();
-        try std.testing.expectEqual(@as(@TypeOf(completion.reload), if (case.outcome == .runtime_abandoned) .none else .source_and_aux), completion.reload);
+        try std.testing.expectEqual(@as(@TypeOf(completion.reload), .source_and_aux), completion.reload);
+        try std.testing.expect(completion.repository_reload == .branch);
         try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
         try std.testing.expect(app.overlay.kind == .none);
         try std.testing.expectEqualStrings(case.expected, status);
@@ -2830,5 +2833,43 @@ test "structured upstream selects the exact slash remote for push fetch and pull
         const config_merge = try appGitOutputAlloc(allocator, io, work, &.{ "git", "config", "branch.main.merge" });
         defer allocator.free(config_merge);
         try std.testing.expectEqualStrings("refs/heads/main\n", config_merge);
+    }
+}
+
+test "Repository pull terminal preserves refresh when error allocation fails or origin expires" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |replaced| {
+        var app: RemoteHarness = .{ .allocator = allocator, .active_page = .repository };
+        const root = try installCurrentRepoForTest(&app, allocator);
+        defer app.repo_session.deinit(allocator);
+        defer app.remote_workflow.deinit(allocator);
+        const pending = beginAcceptedTestAction(&app, .pull);
+        app.remote_workflow.action_control.begin(pending.generation);
+        const finished: app_actions.PullFinished = .{
+            .pending = pending,
+            .identity = .{ .repo_epoch = app.repoSessionView().epoch(), .root_identity = app.repoSessionView().activeIdentity().?, .operation_generation = pending.generation },
+            .repo_root = try allocator.dupe(u8, root),
+            .branch = try allocator.dupe(u8, "main"),
+            .remote = try allocator.dupe(u8, "origin"),
+            .remote_branch = try allocator.dupe(u8, "main"),
+            .oid = try allocator.dupe(u8, "abc"),
+            .result = .{ .outcome = .{ .failed = .authentication_required } },
+        };
+        if (replaced) app.repo_session.repo_epoch += 1;
+        app.pages.changes.status.set("Changes untouched", .{});
+        app.repository_status.set("Repository original", .{});
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        const outcome = try app.remoteWorkflow().finishPull(failing.allocator(), finished);
+        try std.testing.expect(outcome.repository_reload == @as(@TypeOf(outcome.repository_reload), if (replaced) .none else .full));
+        try std.testing.expectEqualStrings("Changes untouched", app.pages.changes.status.text());
+        if (replaced) {
+            try std.testing.expectEqualStrings("Repository original", app.repository_status.text());
+        } else {
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(std.mem.startsWith(u8, app.repository_status.text(), "pull failed:"));
+        }
+        try std.testing.expect(!app.actionLifecycleView().hasPending());
+        try std.testing.expect(app.remote_workflow.owner == null);
+        try std.testing.expect(!app.overlay.isRemoteError());
     }
 }

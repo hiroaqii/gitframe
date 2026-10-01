@@ -1,4 +1,5 @@
 const std = @import("std");
+const git_ops = @import("git_ops.zig");
 const ui = @import("chasen_ui");
 const app_prompt = @import("prompt.zig");
 const git_branch_status = @import("../git/branch_status.zig");
@@ -129,14 +130,14 @@ pub const OverlayState = struct {
         self.owner_page = .changes;
     }
 
-    pub fn openPushBranch(self: *OverlayState) void {
+    pub fn openPushBranch(self: *OverlayState, owner_page: page.Id) void {
         self.kind = .push_branch;
-        self.owner_page = .changes;
+        self.owner_page = owner_page;
     }
 
-    pub fn openPullBranch(self: *OverlayState) void {
+    pub fn openPullBranch(self: *OverlayState, owner_page: page.Id) void {
         self.kind = .pull_branch;
-        self.owner_page = .changes;
+        self.owner_page = owner_page;
     }
 
     pub fn openSwitchBranch(self: *OverlayState, owner_page: page.Id) void {
@@ -208,6 +209,31 @@ pub const PushConfirmation = struct {
     oid: []u8,
     ahead_behind: ?git_branch_status.AheadBehind,
 
+    pub fn init(
+        allocator: std.mem.Allocator,
+        repository_identity: remote_request.RepositoryIdentity,
+        target: git_ops.PushTarget,
+    ) !PushConfirmation {
+        const repo_root = try allocator.dupe(u8, target.repo_root);
+        errdefer allocator.free(repo_root);
+        const branch = try allocator.dupe(u8, target.branch);
+        errdefer allocator.free(branch);
+        const remote = try allocator.dupe(u8, target.remote);
+        errdefer allocator.free(remote);
+        const remote_branch = try allocator.dupe(u8, target.remote_branch);
+        errdefer allocator.free(remote_branch);
+        return .{
+            .repository_identity = repository_identity,
+            .mode = target.mode,
+            .repo_root = repo_root,
+            .branch = branch,
+            .remote = remote,
+            .remote_branch = remote_branch,
+            .oid = try allocator.dupe(u8, target.oid),
+            .ahead_behind = target.ahead_behind,
+        };
+    }
+
     pub fn deinit(self: *PushConfirmation, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
         allocator.free(self.branch);
@@ -237,6 +263,30 @@ pub const PullConfirmation = struct {
     oid: []u8,
     ahead: u32,
     behind: u32,
+
+    pub fn init(allocator: std.mem.Allocator, repository_identity: remote_request.RepositoryIdentity, target: git_ops.PullTarget) !PullConfirmation {
+        const repo_root = try allocator.dupe(u8, target.repo_root);
+        errdefer allocator.free(repo_root);
+        const branch = try allocator.dupe(u8, target.branch);
+        errdefer allocator.free(branch);
+        const remote = try allocator.dupe(u8, target.remote);
+        errdefer allocator.free(remote);
+        const remote_branch = try allocator.dupe(u8, target.remote_branch);
+        errdefer allocator.free(remote_branch);
+        const upstream_ref = try allocator.dupe(u8, target.upstream_ref);
+        errdefer allocator.free(upstream_ref);
+        return .{
+            .repository_identity = repository_identity,
+            .repo_root = repo_root,
+            .branch = branch,
+            .remote = remote,
+            .remote_branch = remote_branch,
+            .upstream_ref = upstream_ref,
+            .oid = try allocator.dupe(u8, target.oid),
+            .ahead = target.ahead,
+            .behind = target.behind,
+        };
+    }
 
     pub fn deinit(self: *PullConfirmation, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_root);
@@ -863,4 +913,64 @@ test "StagedHunkMarks deduplicates rebind and preserves unrelated exact lineages
     try std.testing.expect(marks.containsExact("/repo", "src/other.zig", .{ .content = from, .display_hunk_index = 1 }));
     try std.testing.expect(marks.containsExact("/other", "src/app.zig", .{ .content = from, .display_hunk_index = 1 }));
     try std.testing.expectEqual(@as(usize, 3), marks.items.items.len);
+}
+
+test "owned push confirmation frees every cloned field" {
+    const allocator = std.testing.allocator;
+    var proposal = try PushConfirmation.init(allocator, .{
+        .repo_epoch = 1,
+        .root_identity = .{ .device = 2, .inode = 3 },
+    }, .{
+        .mode = .upstream,
+        .repo_root = "/repo",
+        .branch = "main",
+        .remote = "origin",
+        .remote_branch = "main",
+        .oid = "abc",
+        .ahead_behind = .{ .ahead = 1, .behind = 0 },
+    });
+    proposal.deinit(allocator);
+}
+
+test "owned push confirmation construction frees partial clones" {
+    const backing = std.testing.allocator;
+    var fail_index: usize = 0;
+    while (fail_index < 5) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        const result = PushConfirmation.init(failing.allocator(), .{
+            .repo_epoch = 1,
+            .root_identity = .{ .device = 2, .inode = 3 },
+        }, .{
+            .mode = .upstream,
+            .repo_root = "/repo",
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .oid = "abc",
+            .ahead_behind = .{ .ahead = 1, .behind = 0 },
+        });
+        try std.testing.expectError(error.OutOfMemory, result);
+    }
+}
+
+test "owned pull confirmation frees partial construction and complete snapshot" {
+    for (0..7) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const result = PullConfirmation.init(failing.allocator(), .{ .repo_epoch = 1, .root_identity = .{ .device = 2, .inode = 3 } }, .{
+            .repo_root = "/repo",
+            .branch = "main",
+            .remote = "origin",
+            .remote_branch = "main",
+            .upstream_ref = "refs/remotes/origin/main",
+            .oid = "abc",
+            .ahead = 0,
+            .behind = 1,
+        });
+        if (fail_index < 6) {
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else {
+            var confirmation = try result;
+            confirmation.deinit(failing.allocator());
+        }
+    }
 }

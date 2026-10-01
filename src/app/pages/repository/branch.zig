@@ -129,7 +129,8 @@ pub const ApplyOutcome = enum {
 };
 
 /// Repository-owned branch lifecycle. It intentionally owns no timer, task,
-/// App callback, rendering, push authority, or primary page diagnostic.
+/// App callback, rendering, or primary page diagnostic. The page adapter requires
+/// an exact fresh snapshot before exposing a remote action context.
 pub const State = struct {
     snapshot: Snapshot = .{},
     generation: u64 = 0,

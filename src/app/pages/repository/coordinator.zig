@@ -42,6 +42,7 @@ pub const ClipboardEffect = struct {
 };
 
 pub const UpdateOutcome = struct {
+    remote_action: ?enum { push, pull } = null,
     redraw: Redraw = .default,
     clipboard: ?ClipboardEffect = null,
     auto_scroll: ?drag_auto_scroll.StepOutcome = null,
@@ -72,6 +73,10 @@ pub const Controller = struct {
         msg: repository_page.Msg,
     ) UpdateOutcome {
         switch (msg) {
+            .request_push, .request_pull => {
+                if (self.active_page != .repository) return .{ .redraw = .skip };
+                return .{ .remote_action = if (msg == .request_push) .push else .pull };
+            },
             .open_selected_file_in_editor => {
                 if (self.active_page != .repository) return .{ .redraw = .skip };
                 return .{ .editor_target = if (self.page_state.repo_epoch != self.repo.epoch())

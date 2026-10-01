@@ -2454,7 +2454,7 @@ test "Repository tree omits duplicate branch row and starts one row earlier" {
     try std.testing.expectEqual(@as(u16, 2), layout.header_rows);
     try std.testing.expectEqual(@as(u16, 6), layout.treeRows(size.height));
     try std.testing.expectEqual(repository_page.Msg{ .mouse_toggle_row = 0 }, state.mouseToMsg(.{ .col = 1, .row = 2 }, .left, size).?);
-    try std.testing.expect(repository_input.keyToMsg(repository_page.Msg, .{}, .{ .codepoint = 'P' }) == null);
+    try std.testing.expectEqual(repository_page.Msg.request_push, repository_input.keyToMsg(repository_page.Msg, .{}, .{ .codepoint = 'P' }).?);
 }
 
 test "Repository page header requires matching epoch and physical root" {

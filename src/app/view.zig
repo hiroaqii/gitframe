@@ -241,15 +241,25 @@ fn activePageHeaderLineStats(app: Context) ?file_tree.Stats {
 }
 
 fn activePageHeaderRemoteActions(app: Context) ?PageBarRemoteActions {
-    if (app.active_page != .changes) return null;
-    if (app.changes.page.search.mode or app.changes.page.file_search.mode) return null;
-    switch (app.changes.page.load.state) {
-        .loaded => {},
-        .empty => |reason| if (reason != .no_changes) return null,
+    const presentation = switch (app.active_page) {
+        .changes => blk: {
+            if (app.changes.page.search.mode or app.changes.page.file_search.mode) return null;
+            switch (app.changes.page.load.state) {
+                .loaded => {},
+                .empty => |reason| if (reason != .no_changes) return null,
+                else => return null,
+            }
+            break :blk changes_view.pageHeaderPresentation(app.changes) orelse return null;
+        },
+        .repository => blk: {
+            const state = app.repository.page_state;
+            if (state.source_search.mode or state.file_search.mode or state.selection_owner != .none) return null;
+            const context = state.remoteActionContext(app.repository.repo_root, state.repo_epoch, state.root_identity);
+            if (!context.branch_status.fresh) return null;
+            break :blk repository_view.pageHeaderPresentation(app.repository) orelse return null;
+        },
         else => return null,
-    }
-
-    const presentation = changes_view.pageHeaderPresentation(app.changes) orelse return null;
+    };
     return switch (presentation) {
         .head => |head| switch (head) {
             .branch => |branch| .{
@@ -3934,6 +3944,8 @@ const help_compare_sections = [_]HelpSection{
 };
 
 const help_repository_global_items = help_common_global_actions ++ [_]HelpItem{
+    .{ .key = .{ .action = .push }, .description = "push current branch" },
+    .{ .key = .{ .action = .pull }, .description = "pull current branch (ff-only)" },
     .{ .key = .{ .action = .reload }, .description = "force reload" },
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
