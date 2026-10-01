@@ -1544,6 +1544,7 @@ pub const App = struct {
                 .page_state = &self.pages.repository,
                 .palette = self.theme,
                 .keymap = self.keymap,
+                .command_line = self.commandLineView(),
                 .repo_root = self.repoSessionView().activeRoot(),
             },
             .history = .{
@@ -1564,7 +1565,6 @@ pub const App = struct {
             .remote_canceling = remote.canceling(),
             .status = &self.status,
             .page_status = self.activePageStatus(),
-            .command_line = self.commandLineView(),
             .commit_panel = local.commitPanel(),
             .repo_picker = picker.model,
             .repo_picker_pending_workspace_root = picker.pending_workspace_root,

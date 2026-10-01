@@ -8,8 +8,8 @@ const std = @import("std");
 const chasen = @import("chasen");
 const source = @import("../../../repository/source.zig");
 
-/// Fixed Repository source chrome. The accepted path owns row 0, source search
-/// presentation or the normal separator exclusively owns row 1, and row 2 is
+/// Fixed Repository source chrome. The accepted path owns row 0; command input,
+/// search, selection status, or the separator owns row 1; and row 2 is
 /// the same non-interactive spacer used above the Review and Changes bodies.
 /// Drawing and input both consume `source_body_first_row`, so no chrome or
 /// spacer row can accidentally become selectable source content.

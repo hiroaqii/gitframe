@@ -6,6 +6,8 @@ const text_projection = @import("chasen_ui").text_projection;
 const draw = @import("draw");
 const keymap = @import("keymap");
 const theme = @import("theme");
+const command_line = @import("../../command_line.zig");
+const view_primitives = @import("../../view_primitives.zig");
 const page_header = @import("../../page_header.zig");
 const git_branch_status = @import("../../../git/branch_status.zig");
 const page_link = @import("../../page_link.zig");
@@ -41,6 +43,7 @@ pub const ViewContext = struct {
     page_state: *const RepositoryPageState,
     palette: theme.Palette,
     keymap: keymap.Effective = .{},
+    command_line: ?*const command_line.Active = null,
     /// Borrowed active canonical root. The page owns object identity but does
     /// not duplicate path metadata merely to render its safe basename.
     repo_root: ?[]const u8 = null,
@@ -197,8 +200,11 @@ pub fn view(context: ViewContext, surface: *chasen.Surface) !void {
         try drawSourceHeaderWithStatus(
             &right,
             state.sourceHeaderPresentation().?,
-            state.source_search,
-            selection_status,
+            .{
+                .search = state.source_search,
+                .selection = selection_status,
+                .command = context.command_line,
+            },
             state.viewer.focus == .source,
             state.sourceHeaderSelected(),
             context.palette,
@@ -447,10 +453,9 @@ pub fn sourceTextWidth(width: u16, document: *const source.Document, line_number
     return source_geometry.SourceGeometry.init(.{ .width = width, .height = 0 }, document, line_numbers).text_width;
 }
 
-/// Draws the fixed two-row Repository source header. Search presentation owns
-/// row 1 whenever a query is active or retained; otherwise the row is a
-/// non-interactive separator. Keeping the choice here prevents the normal rule
-/// from being painted underneath search text by separate callers.
+/// Draws the fixed two-row Repository source header. Command input, search,
+/// and selection status share row 1; otherwise it is a separator. Keeping the
+/// choice here prevents multiple presentations from painting the same row.
 pub fn drawSourceHeader(
     surface: *chasen.Surface,
     presentation: source_header.Presentation,
@@ -462,19 +467,23 @@ pub fn drawSourceHeader(
     return drawSourceHeaderWithStatus(
         surface,
         presentation,
-        search,
-        null,
+        .{ .search = search },
         source_active,
         path_selected,
         palette,
     );
 }
 
+const SourceHeaderStatus = struct {
+    search: model.SourceSearchState = .{},
+    selection: ?selection_action.StatusPresentation = null,
+    command: ?*const command_line.Active = null,
+};
+
 pub fn drawSourceHeaderWithStatus(
     surface: *chasen.Surface,
     presentation: source_header.Presentation,
-    search: model.SourceSearchState,
-    selection_status: ?selection_action.StatusPresentation,
+    status: SourceHeaderStatus,
     source_active: bool,
     path_selected: bool,
     palette: theme.Palette,
@@ -531,8 +540,12 @@ pub fn drawSourceHeaderWithStatus(
         ) catch {};
     }
     if (size.height <= source_geometry.source_search_or_rule_row) return;
-    if (search.mode and drawSearchRow(surface, search, palette)) return;
-    if (selection_status) |selected| {
+    if (status.command) |active| {
+        drawCommandRow(surface, active, palette);
+        return;
+    }
+    if (status.search.mode and drawSearchRow(surface, status.search, palette)) return;
+    if (status.selection) |selected| {
         try selection_action.drawStatusLine(
             surface,
             source_geometry.source_search_or_rule_row,
@@ -544,7 +557,7 @@ pub fn drawSourceHeaderWithStatus(
         );
         return;
     }
-    if (drawSearchRow(surface, search, palette)) return;
+    if (drawSearchRow(surface, status.search, palette)) return;
     const style = sourceHeaderRuleStyle(source_active, palette);
     for (0..size.width) |col| {
         _ = surface.borrowTextAt(@intCast(col), source_geometry.source_search_or_rule_row, "─", style);
@@ -925,6 +938,26 @@ fn fileSearchWindowStart(focused: usize, len: usize, visible_rows: usize) usize 
     return if (clamped_focus < visible_rows) 0 else clamped_focus - visible_rows + 1;
 }
 
+fn drawCommandRow(surface: *chasen.Surface, active: *const command_line.Active, palette: theme.Palette) void {
+    const size = surface.size();
+    if (size.width == 0 or size.height <= source_geometry.source_search_or_rule_row) return;
+    const row = source_geometry.source_search_or_rule_row;
+    const colon_col: u16 = if (size.width > 1) 1 else 0;
+    const style = palette.style(.pane_command_fg);
+    draw.copyClippedTextAt(surface, colon_col, row, ":", style) catch {};
+    const input_col = colon_col + 1;
+    if (input_col >= size.width) {
+        surface.showCursor(colon_col, row);
+        return;
+    }
+
+    var input_area = surface.child(.{ .col = input_col, .row = row, .width = size.width - input_col, .height = 1 });
+    const text = active.input.slice();
+    const visible = text[view_primitives.inputVisibleStart(text, active.input.cursor, input_area.size().width)..];
+    draw.copyClippedTextAt(&input_area, 0, 0, visible, style) catch {};
+    view_primitives.showInputCursor(&input_area, 0, 0, text, active.input.cursor);
+}
+
 fn drawSearchRow(surface: *chasen.Surface, search: model.SourceSearchState, palette: theme.Palette) bool {
     if (!search.mode and search.query.len == 0) return false;
     if (surface.size().height <= source_geometry.source_search_or_rule_row) return true;
@@ -1286,7 +1319,7 @@ test "repository source search checkpoint appears without moving source rows" {
     try std.testing.expect(!search_cell.style.bold);
 }
 
-test "repository source retained search result replaces the normal separator" {
+test "repository source command input replaces retained search in the fixed header row" {
     const palette: theme.Palette = .default();
     var search: model.SourceSearchState = .{
         .match = .{ .line = 0, .start = 0, .end = 6 },
@@ -1305,6 +1338,48 @@ test "repository source retained search result replaces the normal separator" {
     const status_cell = test_surface.surface.readCell(1, source_geometry.source_search_or_rule_row) orelse
         return error.ExpectedSourceSearchStatusCell;
     try std.testing.expect(status_cell.style.fg.eql(palette.color(.muted)));
+
+    var command: command_line.Active = .{};
+    try command.input.insertSlice("12🐈3456789");
+    for ([_]chasen.Size{
+        .{ .width = 1, .height = 3 },
+        .{ .width = 2, .height = 3 },
+        .{ .width = 8, .height = 3 },
+        .{ .width = 28, .height = 3 },
+        .{ .width = 28, .height = 1 },
+    }) |size| {
+        var command_surface: chasen.testing.TestSurface = undefined;
+        try command_surface.init(size.width, size.height);
+        defer command_surface.deinit();
+        try drawSourceHeaderWithStatus(
+            &command_surface.surface,
+            sourceHeaderPresentationForTest("src/main.zig"),
+            .{ .search = search, .command = &command },
+            true,
+            false,
+            palette,
+        );
+        if (size.height <= source_geometry.source_search_or_rule_row) {
+            try std.testing.expect(!command_surface.screen.cursor_vis);
+            continue;
+        }
+        const colon_col: u16 = if (size.width > 1) 1 else 0;
+        try command_surface.expectCellText(colon_col, source_geometry.source_search_or_rule_row, ":");
+        try std.testing.expect(command_surface.surface.readCell(colon_col, source_geometry.source_search_or_rule_row).?.style.fg.eql(palette.color(.pane_command_fg)));
+        try std.testing.expect(command_surface.screen.cursor_vis);
+        try std.testing.expectEqual(source_geometry.source_search_or_rule_row, command_surface.screen.cursor.row);
+        try std.testing.expect(command_surface.screen.cursor.col < size.width);
+        const command_snapshot = try command_surface.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(command_snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, command_snapshot, "match:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, command_snapshot, "─") == null);
+        if (size.width >= 8) try std.testing.expect(std.mem.indexOf(u8, command_snapshot, "6789") != null);
+        if (size.width == 28) {
+            try command_surface.expectCellText(4, source_geometry.source_search_or_rule_row, "🐈");
+            try command_surface.expectCellText(6, source_geometry.source_search_or_rule_row, "3");
+            try std.testing.expectEqual(@as(u16, 13), command_surface.screen.cursor.col);
+        }
+    }
 }
 
 test "repository selection status replaces the fixed separator without moving source rows" {
@@ -1319,8 +1394,7 @@ test "repository selection status replaces the fixed separator without moving so
     try drawSourceHeaderWithStatus(
         &test_surface.surface,
         sourceHeaderPresentationForTest("src/main.zig"),
-        .{},
-        .{ .line_count = 2 },
+        .{ .selection = .{ .line_count = 2 } },
         true,
         false,
         .default(),
