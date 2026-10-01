@@ -3447,7 +3447,7 @@ test "help popup uses effective document navigation labels and reaches its tail 
         const shared_section_index: usize = if (help_page == .compare) 2 else 3;
         const diff_help: HelpContext = .{ .page = help_page, .keymap = harness.keymap };
         harness.overlay.help_scroll = rowsForSections(diff_help, content.width, sections[0..shared_section_index]) + 1 +
-            rowsForSections(diff_help, content.width, &.{.{ .title = "Diff", .items = help_diff_items[0..8] }});
+            rowsForSections(diff_help, content.width, &.{.{ .title = "Diff", .items = help_diff_items[0..9] }});
         context = harness.context();
         context.active_page = help_page;
 
@@ -3536,7 +3536,7 @@ test "History help explains every commit picker marker" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         snapshot,
-        "x                 copy commit / range detail",
+        "x                 copy detail (detail pane)",
     ) != null);
     for ([_][]const u8{
         "commit in selected range",
@@ -3846,6 +3846,16 @@ const HelpSection = struct {
 
 const help_group_separator: HelpItem = .{ .kind = .information, .key = .{ .text = "" }, .description = "" };
 
+const help_remote_items = [_]HelpItem{
+    .{ .key = .{ .action = .push }, .description = "push current branch" },
+    .{ .key = .{ .action = .pull }, .description = "pull from upstream (fast-forward only)" },
+};
+
+const help_reviewed_items = [_]HelpItem{
+    .{ .key = .{ .action = .mark_reviewed }, .description = "toggle reviewed mark for current file" },
+    .{ .key = .{ .action = .hide_reviewed }, .description = "show / hide reviewed files" },
+};
+
 const help_git_command_items = [_]HelpItem{
     .{ .key = .{ .text = "Space (file tree)" }, .description = "stage / unstage file or dir" },
     .{ .key = .{ .text = "Space (diff)" }, .description = "stage / unstage hunk" },
@@ -3853,10 +3863,10 @@ const help_git_command_items = [_]HelpItem{
     .{ .key = .{ .action = .amend }, .description = "amend last commit" },
     .{ .key = .{ .action = .create_stash }, .description = "create stash (all / staged changes)" },
     .{ .key = .{ .action = .stash_list }, .description = "list stashes / apply or drop" },
-    .{ .key = .{ .action = .push }, .description = "push current branch" },
-    .{ .key = .{ .action = .pull }, .description = "pull current branch" },
+} ++ help_remote_items ++ [_]HelpItem{
+    .{ .key = .{ .action = .fetch }, .description = "fetch upstream remote (no branch update)" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
-    .{ .key = .{ .action = .discard }, .description = "discard selected file changes" },
+    .{ .key = .{ .action = .discard }, .description = "discard unstaged changes in selected tracked file" },
 };
 
 const help_global_items = [_]HelpItem{
@@ -3891,7 +3901,8 @@ const help_common_global_navigation = [_]HelpItem{
 const help_compare_items = [_]HelpItem{
     .{ .key = .{ .text = "m" }, .description = "change comparison base" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
-    .{ .key = .{ .pair = .{ .left = .mark_reviewed, .right = .hide_reviewed } }, .description = "mark / hide reviewed" },
+    .{ .key = .{ .action = .changed_file_filter }, .description = "filter files by change type" },
+} ++ help_reviewed_items ++ [_]HelpItem{
     help_group_separator,
     .{ .kind = .navigation, .key = .{ .text = "Tab / j / k" }, .description = "focus and navigate files or diff" },
 };
@@ -3905,9 +3916,9 @@ const help_compare_global_items = help_common_global_actions ++ [_]HelpItem{
 const help_history_items = [_]HelpItem{
     .{ .key = .{ .text = "Space" }, .description = "start / clear range (History)" },
     .{ .key = .{ .text = "Enter" }, .description = "open diff / load older commits" },
-    .{ .key = .{ .action = .copy_history_detail }, .description = "copy commit / range detail" },
+    .{ .key = .{ .action = .copy_history_detail }, .description = "copy detail (detail pane)" },
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize History pane" },
-    .{ .key = .{ .text = "m" }, .description = "select commits again" },
+    .{ .key = .{ .text = "m" }, .description = "select commits again (from diff)" },
     .{ .key = .{ .action = .search }, .description = "search diff (not commits)" },
     .{ .key = .{ .text = "Esc" }, .description = "cancel / back to accepted diff" },
     help_group_separator,
@@ -3943,9 +3954,7 @@ const help_compare_sections = [_]HelpSection{
     .{ .title = "Diff", .items = &help_diff_items },
 };
 
-const help_repository_global_items = help_common_global_actions ++ [_]HelpItem{
-    .{ .key = .{ .action = .push }, .description = "push current branch" },
-    .{ .key = .{ .action = .pull }, .description = "pull current branch (ff-only)" },
+const help_repository_global_items = help_common_global_actions ++ help_remote_items ++ [_]HelpItem{
     .{ .key = .{ .action = .reload }, .description = "force reload" },
     .{ .key = .{ .action = .open_editor }, .description = "open selected file in editor" },
     .{ .key = .{ .action = .branch_switch }, .description = "checkout branch / open worktree" },
@@ -3955,14 +3964,14 @@ const help_repository_global_items = help_common_global_actions ++ [_]HelpItem{
 const help_repository_tree_items = [_]HelpItem{
     .{ .key = .{ .text = "Enter / Space" }, .description = "toggle directory" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
-    .{ .key = .{ .action = .changed_file_filter }, .description = "cycle file filter" },
+    .{ .key = .{ .action = .changed_file_filter }, .description = "show all / changed files" },
     .{ .key = .{ .action = .toggle_sidebar }, .description = "show / hide file tree" },
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize file tree" },
     help_group_separator,
     .{ .kind = .navigation, .key = .{ .text = "Tab" }, .description = "focus file tree / source" },
     .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "move selection" },
     .{ .kind = .navigation, .key = .{ .text = "Home / End" }, .description = "first / last file tree row" },
-    .{ .kind = .navigation, .key = .{ .text = "h / l" }, .description = "scroll file tree horizontally" },
+    .{ .kind = .navigation, .key = .{ .text = "←/→ h/l" }, .description = "scroll file tree horizontally" },
 };
 
 const help_repository_source_items = [_]HelpItem{
@@ -3979,7 +3988,8 @@ const help_repository_source_items = [_]HelpItem{
     .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_backward, .right = .page_forward } }, .description = "page backward / forward" },
     .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page up / down" },
     .{ .kind = .navigation, .key = .{ .text = "Home / End" }, .description = "first / last source row" },
-    .{ .kind = .navigation, .key = .{ .text = "h / l" }, .description = "scroll source horizontally" },
+    .{ .kind = .navigation, .key = .{ .text = ":number Enter" }, .description = "go to source line" },
+    .{ .kind = .navigation, .key = .{ .text = "←/→ h/l" }, .description = "scroll source horizontally" },
     .{ .kind = .navigation, .key = .{ .text = "n / N / p" }, .description = "next / previous source match" },
 };
 
@@ -3992,9 +4002,8 @@ const help_repository_sections = [_]HelpSection{
 const help_sidebar_items = [_]HelpItem{
     .{ .key = .{ .text = "Enter" }, .description = "toggle directory" },
     .{ .key = .{ .action = .file_search }, .description = "search files" },
-    .{ .key = .{ .action = .changed_file_filter }, .description = "cycle file filter" },
-    .{ .key = .{ .action = .mark_reviewed }, .description = "mark reviewed" },
-    .{ .key = .{ .pair = .{ .left = .hide_reviewed, .right = .toggle_line_numbers } }, .description = "hide reviewed / line numbers" },
+    .{ .key = .{ .action = .changed_file_filter }, .description = "filter files by change type" },
+} ++ help_reviewed_items ++ [_]HelpItem{
     .{ .key = .{ .pair = .{ .left = .decrease_sidebar_width, .right = .increase_sidebar_width } }, .description = "resize file tree" },
     help_group_separator,
     .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "move selection" },
@@ -4010,13 +4019,14 @@ const help_diff_items = [_]HelpItem{
     .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
     .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
     .{ .key = .{ .text = "Enter" }, .description = "fold / unfold hunk" },
+    .{ .key = .{ .text = "y / Esc" }, .description = "copy / clear selection" },
     help_group_separator,
     .{ .kind = .navigation, .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (diff focus)" },
-    .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "scroll" },
-    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last source row" },
+    .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "move one diff row" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .document_first, .right = .document_last } }, .description = "first / last diff row" },
     .{ .kind = .navigation, .key = .{ .pair = .{ .left = .half_page_up, .right = .half_page_down } }, .description = "half page up / down" },
     .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_backward, .right = .page_forward } }, .description = "page backward / forward" },
-    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page scroll" },
+    .{ .kind = .navigation, .key = .{ .pair = .{ .left = .page_up, .right = .page_down } }, .description = "page up / down" },
     .{ .kind = .navigation, .key = .{ .text = "←/→" }, .description = "horizontal scroll" },
     .{ .kind = .navigation, .key = .{ .text = "J / K" }, .description = "next / previous hunk" },
     .{ .kind = .navigation, .key = .{ .text = "n / p" }, .description = "next / previous match or hunk" },

@@ -284,7 +284,7 @@ in Changes when it is present there.
 Use `Tab` to focus the tree or source, `Enter` to expand or collapse a
 directory, and `f` to find a file. `F` switches between all files and changed
 files. In the source pane, use `/` to search, `[` / `]` to move between files,
-and `L` to toggle line numbers.
+and `L` to toggle line numbers. Type `:42` and press `Enter` to go to source line 42.
 
 Press `e` to open the selected file in an external editor. GitFrame returns
 to the view when that editor command exits. Editor discovery checks `VISUAL`,
