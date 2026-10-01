@@ -14,9 +14,12 @@ signed or notarized; browser downloads can require a Gatekeeper override.
 ## Prepare the version and release notes
 
 For every release, update the version in `build.zig.zon` and write the release
-body in `.github/release-notes/vMAJOR.MINOR.PATCH.md`. For example, `v0.1.1`
-requires `.github/release-notes/v0.1.1.md`. Commit and push both changes before
-running the workflow or creating the tag.
+body in `.github/release-notes/vMAJOR.MINOR.PATCH.md`, using the same version
+with a `v` prefix. Commit and push both changes before running the workflow or
+creating the tag.
+
+Run the commands below from the repository root. They derive the release tag
+from `build.zig.zon` using `scripts/release.py version`.
 
 The Markdown file is used as the complete release body. No generated changelog
 is appended. A missing, empty, or whitespace-only file stops the workflow
@@ -34,8 +37,8 @@ release configuration or notes also run these checks without publishing.
 The artifact contains:
 
 ```text
-gitframe-v0.1.0-linux-x86_64.tar.gz
-gitframe-v0.1.0-macos-arm64.tar.gz
+gitframe-vMAJOR.MINOR.PATCH-linux-x86_64.tar.gz
+gitframe-vMAJOR.MINOR.PATCH-macos-arm64.tar.gz
 SHA256SUMS
 ```
 
@@ -46,11 +49,14 @@ matching its filename without `.tar.gz`.
 ## Publish
 
 After the artifacts and release documentation have been checked, push a
-stable `vMAJOR.MINOR.PATCH` tag matching `build.zig.zon`. For the first release:
+stable `vMAJOR.MINOR.PATCH` tag matching `build.zig.zon`:
 
 ```sh
-git tag -a v0.1.0 -m "GitFrame v0.1.0"
-git push origin v0.1.0
+release_tag="$(python3 scripts/release.py version)" &&
+release_tag="${release_tag#tag=}" &&
+python3 scripts/release.py notes --tag "$release_tag" &&
+git tag -a "$release_tag" -m "GitFrame $release_tag" &&
+git push origin "$release_tag"
 ```
 
 Tag pushes build and test both platforms again. Only after both succeed and
@@ -83,10 +89,11 @@ the workflow.
 
 ```sh
 python3 -m unittest discover -s scripts -p 'release_test.py' -v
-python3 scripts/release.py version --tag v0.1.0
-python3 scripts/release.py notes --tag v0.1.0
+release_tag="$(python3 scripts/release.py version)"
+release_tag="${release_tag#tag=}"
+python3 scripts/release.py notes --tag "$release_tag"
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux.5.15-gnu.2.35 -Dcpu=baseline
-python3 scripts/release.py package --tag v0.1.0 --platform linux-x86_64 \
+python3 scripts/release.py package --tag "$release_tag" --platform linux-x86_64 \
   --binary zig-out/bin/gitframe --output release
 ```
 
