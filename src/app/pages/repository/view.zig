@@ -629,6 +629,9 @@ pub fn drawSourceWithRetained(
         if (source_active and current) fillSourceCursorRow(surface, row, palette.color(.pane_cursor_bg));
         const base_style = sourceRowStyle(palette.style(.foreground), source_active, current, palette);
 
+        const cursor_style = sourceGutterStyle(palette.boldStyle(.diff_cursor), source_active, current, palette);
+        _ = surface.borrowTextAt(geometry.cursor_col, row, if (current) "▌" else " ", cursor_style);
+
         const change = if (changes) |map| map.row(line_index) else .none;
         const gutter: []const u8 = if (change == .none) " " else "▌";
         const gutter_role: theme.Role = switch (change) {
@@ -636,14 +639,11 @@ pub fn drawSourceWithRetained(
             .added => .diff_added,
             .modified => .diff_modified,
         };
-        _ = surface.borrowTextAt(0, row, gutter, sourceRowStyle(palette.style(gutter_role), source_active, current, palette));
+        const gutter_style = sourceGutterStyle(palette.style(gutter_role), source_active, current, palette);
+        _ = surface.borrowTextAt(geometry.gutter_col, row, gutter, gutter_style);
         if (viewer.line_numbers) {
             const number = try std.fmt.allocPrint(surface.frameAllocator(), "{d}", .{line_index + 1});
             const number_col: u16 = @intCast(@as(usize, geometry.line_number_col) + geometry.line_number_width - chasen.text.displayWidth(number));
-            // Repository has no separate Changes-style cursor gutter marker.
-            // Promote only the active current line-number digits so retained
-            // source position never looks focused while the tree is active.
-            // The dedicated role keeps this focus cue distinct from syntax.
             const number_role: theme.Role = if (source_active and current) .pane_active_line_number else .diff_line_number;
             draw.copyClippedTextAt(surface, number_col, row, number, sourceRowStyle(palette.style(number_role), source_active, current, palette)) catch {};
         }
@@ -978,11 +978,19 @@ fn sourceHeaderRuleStyle(_: bool, _: theme.Palette) chasen.TextStyle {
 
 /// Current-row presentation is active-source chrome. It contributes only a
 /// background, leaving semantic foreground ownership to gutter, syntax, and
-/// search. Pane focus never rewrites intrinsic style flags, and inactive
+/// search. Row composition never rewrites intrinsic style flags, and inactive
 /// source content therefore has no false active-row signal.
 fn sourceRowStyle(style: chasen.TextStyle, active: bool, current: bool, palette: theme.Palette) chasen.TextStyle {
     var composed = style;
     if (active and current) composed.bg = palette.color(.pane_cursor_bg);
+    return composed;
+}
+
+/// Cursor and change markers share the same focus treatment as Changes:
+/// dim while the pane is inactive, preserving their semantic colors.
+fn sourceGutterStyle(style: chasen.TextStyle, active: bool, current: bool, palette: theme.Palette) chasen.TextStyle {
+    var composed = sourceRowStyle(style, active, current, palette);
+    composed.dim = !active;
     return composed;
 }
 
@@ -1011,7 +1019,7 @@ test "repository source view reserves gutter and renders plain text" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "2 second") != null);
 }
 
-test "repository source gutter renders added and modified rows without moving text" {
+test "repository source gutter keeps cursor and change markers separate with stable text columns" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "added\nmodified\nplain\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
@@ -1019,23 +1027,36 @@ test "repository source gutter renders added and modified rows without moving te
     var map = repository_change_map.Map{ .rows = try allocator.dupe(repository_change_map.Kind, &.{ .added, .modified, .none }) };
     defer map.deinit(allocator);
     const palette: theme.Palette = .default();
-    var test_surface: chasen.testing.TestSurface = undefined;
-    try test_surface.init(40, 6);
-    defer test_surface.deinit();
 
-    try drawSource(&test_surface.surface, &document, null, &map, .{ .focus = .source, .source_cursor = 1 }, .{}, null, palette);
-    const first = source_geometry.source_body_first_row;
-    try test_surface.expectCellText(0, first, "▌");
-    try test_surface.expectCellText(0, first + 1, "▌");
-    try test_surface.expectCellText(0, first + 2, " ");
-    try test_surface.expectCellText(3, first, "a");
-    try test_surface.expectCellText(3, first + 1, "m");
-    try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(0, first).?.style.fg);
-    try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(0, first + 1).?.style.fg);
-    try std.testing.expect(!test_surface.surface.readCell(0, first).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(0, first + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(3, first + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
-    try std.testing.expect(test_surface.surface.readCell(39, first + 1).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+    for ([_]bool{ true, false }) |line_numbers| {
+        for (0..3) |cursor| {
+            var test_surface: chasen.testing.TestSurface = undefined;
+            try test_surface.init(40, 6);
+            defer test_surface.deinit();
+            const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, line_numbers);
+            const first = geometry.body_first_row;
+            try drawSource(&test_surface.surface, &document, null, &map, .{ .focus = .source, .source_cursor = cursor, .line_numbers = line_numbers }, .{}, null, palette);
+            for (0..3) |line| {
+                const row = first + @as(u16, @intCast(line));
+                try test_surface.expectCellText(geometry.cursor_col, row, if (line == cursor) "▌" else " ");
+                try test_surface.expectCellText(geometry.gutter_col, row, if (line == 2) " " else "▌");
+                const cell = test_surface.surface.readCell(geometry.cursor_col, row).?;
+                try std.testing.expectEqual(line == cursor, cell.style.bg.eql(palette.color(.pane_cursor_bg)));
+                if (line == cursor) {
+                    try std.testing.expect(cell.style.fg.eql(palette.color(.diff_cursor)));
+                    try std.testing.expect(cell.style.bold);
+                    try std.testing.expect(test_surface.surface.readCell(geometry.gutter_col, row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+                    try std.testing.expect(test_surface.surface.readCell(geometry.text_col, row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+                    try std.testing.expect(test_surface.surface.readCell(39, row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
+                }
+            }
+            try test_surface.expectCellText(geometry.text_col, first, "a");
+            try test_surface.expectCellText(geometry.text_col, first + 1, "m");
+            try test_surface.expectCellText(geometry.text_col, first + 2, "p");
+            try std.testing.expectEqual(palette.color(.diff_added), test_surface.surface.readCell(geometry.gutter_col, first).?.style.fg);
+            try std.testing.expectEqual(palette.color(.diff_modified), test_surface.surface.readCell(geometry.gutter_col, first + 1).?.style.fg);
+        }
+    }
 }
 
 test "repository empty source keeps one synthetic viewer row" {
@@ -1047,8 +1068,10 @@ test "repository empty source keeps one synthetic viewer row" {
     try test_surface.init(12, 4);
     defer test_surface.deinit();
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, null, .default());
-    try test_surface.expectCellText(0, source_geometry.source_body_first_row, " ");
-    try test_surface.expectCellText(1, source_geometry.source_body_first_row, "1");
+    const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, true);
+    try test_surface.expectCellText(geometry.cursor_col, geometry.body_first_row, "▌");
+    try test_surface.expectCellText(geometry.gutter_col, geometry.body_first_row, " ");
+    try test_surface.expectCellText(geometry.line_number_col, geometry.body_first_row, "1");
 }
 
 test "repository source geometry handles narrow line-number transitions" {
@@ -1059,9 +1082,9 @@ test "repository source geometry handles narrow line-number transitions" {
     const ten_bytes = try allocator.dupe(u8, "\n\n\n\n\n\n\n\n\n\nx");
     var ten = try source.Document.initOwned(allocator, ten_bytes, .init(ten_bytes));
     defer ten.deinit(allocator);
-    try std.testing.expectEqual(@as(u16, 7), sourceTextWidth(10, &nine, true));
-    try std.testing.expectEqual(@as(u16, 6), sourceTextWidth(10, &ten, true));
-    try std.testing.expectEqual(@as(u16, 9), sourceTextWidth(10, &ten, false));
+    try std.testing.expectEqual(@as(u16, 6), sourceTextWidth(10, &nine, true));
+    try std.testing.expectEqual(@as(u16, 5), sourceTextWidth(10, &ten, true));
+    try std.testing.expectEqual(@as(u16, 8), sourceTextWidth(10, &ten, false));
     try std.testing.expectEqual(@as(u16, 0), sourceTextWidth(1, &ten, true));
 }
 
@@ -1436,8 +1459,9 @@ test "repository source match overlay remains distinct on the cursor line" {
     };
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source, .source_cursor = 0 }, search, null, palette);
     const first = source_geometry.source_body_first_row;
-    const match_cell = test_surface.surface.readCell(7, first) orelse return error.ExpectedMatchCell;
-    const plain_cell = test_surface.surface.readCell(3, first) orelse return error.ExpectedPlainCell;
+    const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, true);
+    const match_cell = test_surface.surface.readCell(geometry.text_col + 4, first) orelse return error.ExpectedMatchCell;
+    const plain_cell = test_surface.surface.readCell(geometry.text_col, first) orelse return error.ExpectedPlainCell;
     try std.testing.expect(match_cell.style.fg.eql(palette.color(.warning)));
     try std.testing.expect(match_cell.style.bold);
     try std.testing.expect(match_cell.style.bg.eql(palette.color(.pane_cursor_bg)));
@@ -1472,10 +1496,11 @@ test "repository source syntax uses neutral styles below the search overlay" {
     defer syntax_surface.deinit();
     try drawSource(&syntax_surface.surface, &document, &spans, null, .{ .focus = .source }, .{}, null, palette);
     const first = source_geometry.source_body_first_row;
-    const keyword_cell = syntax_surface.surface.readCell(3, first) orelse return error.ExpectedKeywordCell;
-    const plain_cell = syntax_surface.surface.readCell(9, first) orelse return error.ExpectedPlainCell;
-    const comment_cell = syntax_surface.surface.readCell(3, first + 1) orelse return error.ExpectedCommentCell;
-    const foreground_cell = syntax_surface.surface.readCell(3, first + 2) orelse return error.ExpectedForegroundCell;
+    const geometry = source_geometry.SourceGeometry.init(syntax_surface.surface.size(), &document, true);
+    const keyword_cell = syntax_surface.surface.readCell(geometry.text_col, first) orelse return error.ExpectedKeywordCell;
+    const plain_cell = syntax_surface.surface.readCell(geometry.text_col + 6, first) orelse return error.ExpectedPlainCell;
+    const comment_cell = syntax_surface.surface.readCell(geometry.text_col, first + 1) orelse return error.ExpectedCommentCell;
+    const foreground_cell = syntax_surface.surface.readCell(geometry.text_col, first + 2) orelse return error.ExpectedForegroundCell;
     try std.testing.expectEqual(palette.color(.syntax_keyword), keyword_cell.style.fg);
     try std.testing.expectEqual(palette.color(.foreground), plain_cell.style.fg);
     try std.testing.expectEqual(palette.color(.syntax_comment), comment_cell.style.fg);
@@ -1490,11 +1515,11 @@ test "repository source syntax uses neutral styles below the search overlay" {
     try drawSource(&search_surface.surface, &document, &spans, null, .{ .focus = .source }, .{
         .match = .{ .line = 0, .start = 0, .end = 5 },
     }, null, palette);
-    const match_cell = search_surface.surface.readCell(3, first) orelse return error.ExpectedMatchCell;
+    const match_cell = search_surface.surface.readCell(geometry.text_col, first) orelse return error.ExpectedMatchCell;
     try std.testing.expectEqual(palette.color(.warning), match_cell.style.fg);
 }
 
-test "repository source focus does not dim semantic foregrounds" {
+test "repository source focus dims change markers while preserving text styles" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, "const value plain\n");
     var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
@@ -1551,10 +1576,11 @@ test "repository source focus does not dim semantic foregrounds" {
         col: u16,
         row: u16,
         role: theme.Role,
+        inactive_dim: bool = false,
     }{
         .{ .col = 1, .row = source_geometry.source_path_row, .role = .accent },
         .{ .col = 1, .row = source_geometry.source_search_or_rule_row, .role = .muted },
-        .{ .col = 0, .row = body_row, .role = .diff_added },
+        .{ .col = geometry.gutter_col, .row = body_row, .role = .diff_added, .inactive_dim = true },
         .{ .col = geometry.line_number_col, .row = body_row, .role = .diff_line_number },
         .{ .col = geometry.text_col, .row = body_row, .role = .syntax_keyword },
         .{ .col = geometry.text_col + 6, .row = body_row, .role = .warning },
@@ -1566,7 +1592,7 @@ test "repository source focus does not dim semantic foregrounds" {
         try std.testing.expect(active_cell.style.fg.eql(palette.color(point.role)));
         try std.testing.expect(inactive_cell.style.fg.eql(palette.color(point.role)));
         try std.testing.expect(!active_cell.style.dim);
-        try std.testing.expect(!inactive_cell.style.dim);
+        try std.testing.expectEqual(point.inactive_dim, inactive_cell.style.dim);
     }
     try std.testing.expect(active.surface.readCell(geometry.text_col + 6, body_row).?.style.bold);
     try std.testing.expect(inactive.surface.readCell(geometry.text_col + 6, body_row).?.style.bold);
@@ -1623,7 +1649,8 @@ test "repository source cursor row composes semantic overlays and active-only ba
 
     const geometry = source_geometry.SourceGeometry.init(active.surface.size(), &document, true);
     const cursor_row = geometry.body_first_row;
-    const gutter = active.surface.readCell(0, cursor_row) orelse return error.ExpectedCursorGutter;
+    const cursor = active.surface.readCell(geometry.cursor_col, cursor_row) orelse return error.ExpectedCursorMarker;
+    const gutter = active.surface.readCell(geometry.gutter_col, cursor_row) orelse return error.ExpectedCursorGutter;
     const line_number = active.surface.readCell(geometry.line_number_col, cursor_row) orelse return error.ExpectedCursorLineNumber;
     const keyword = active.surface.readCell(geometry.text_col, cursor_row) orelse return error.ExpectedCursorKeyword;
     const searched = active.surface.readCell(geometry.text_col + 6, cursor_row) orelse return error.ExpectedCursorSearch;
@@ -1631,7 +1658,12 @@ test "repository source cursor row composes semantic overlays and active-only ba
     const trailing = active.surface.readCell(29, cursor_row) orelse return error.ExpectedCursorTrailingCell;
     const non_current_line_number = active.surface.readCell(geometry.line_number_col, cursor_row + 1) orelse
         return error.ExpectedNonCurrentLineNumber;
+    try active.expectCellText(geometry.cursor_col, cursor_row, "▌");
+    try std.testing.expect(cursor.style.fg.eql(palette.color(.diff_cursor)));
+    try std.testing.expect(cursor.style.bold);
+    try std.testing.expect(!cursor.style.dim);
     try std.testing.expect(gutter.style.fg.eql(palette.color(.diff_modified)));
+    try std.testing.expect(!gutter.style.dim);
     try std.testing.expect(line_number.style.fg.eql(palette.color(.pane_active_line_number)));
     try std.testing.expect(!line_number.style.bold);
     try std.testing.expect(non_current_line_number.style.fg.eql(palette.color(.diff_line_number)));
@@ -1639,7 +1671,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
     try std.testing.expect(keyword.style.fg.eql(palette.color(.syntax_keyword)));
     try std.testing.expect(searched.style.fg.eql(palette.color(.warning)));
     try std.testing.expect(searched.style.bold);
-    for ([_]chasen.TextStyle{ gutter.style, line_number.style, keyword.style, searched.style, trailing.style }) |style| {
+    for ([_]chasen.TextStyle{ cursor.style, gutter.style, line_number.style, keyword.style, searched.style, trailing.style }) |style| {
         try std.testing.expect(style.bg.eql(palette.color(.pane_cursor_bg)));
     }
     try std.testing.expect(selected.style.fg.eql(palette.color(.foreground)));
@@ -1660,17 +1692,19 @@ test "repository source cursor row composes semantic overlays and active-only ba
         null,
         palette,
     );
-    for ([_]struct { col: u16, role: theme.Role }{
-        .{ .col = 0, .role = .diff_modified },
+    for ([_]struct { col: u16, role: theme.Role, inactive_dim: bool = false }{
+        .{ .col = geometry.cursor_col, .role = .diff_cursor, .inactive_dim = true },
+        .{ .col = geometry.gutter_col, .role = .diff_modified, .inactive_dim = true },
         .{ .col = geometry.line_number_col, .role = .diff_line_number },
         .{ .col = geometry.text_col, .role = .syntax_keyword },
         .{ .col = geometry.text_col + 6, .role = .warning },
     }) |point| {
         const cell = inactive.surface.readCell(point.col, cursor_row) orelse return error.ExpectedInactiveCursorCell;
         try std.testing.expect(cell.style.fg.eql(palette.color(point.role)));
-        try std.testing.expect(!cell.style.dim);
+        try std.testing.expectEqual(point.inactive_dim, cell.style.dim);
         try std.testing.expect(!cell.style.bg.eql(palette.color(.pane_cursor_bg)));
     }
+    try inactive.expectCellText(geometry.cursor_col, cursor_row, "▌");
     try std.testing.expect(!inactive.surface.readCell(29, cursor_row).?.style.bg.eql(palette.color(.pane_cursor_bg)));
 }
 
@@ -1771,9 +1805,10 @@ test "repository selection whole-line style covers gutter numbers body and trail
     try drawSource(&test_surface.surface, &document, null, null, .{ .focus = .source }, .{}, live, palette);
     const geometry = source_geometry.SourceGeometry.init(test_surface.surface.size(), &document, true);
     for ([_]struct { col: u16, row: u16 }{
-        .{ .col = 0, .row = geometry.body_first_row },
-        .{ .col = 1, .row = geometry.body_first_row },
-        .{ .col = 3, .row = geometry.body_first_row },
+        .{ .col = geometry.cursor_col, .row = geometry.body_first_row },
+        .{ .col = geometry.gutter_col, .row = geometry.body_first_row },
+        .{ .col = geometry.line_number_col, .row = geometry.body_first_row },
+        .{ .col = geometry.text_col, .row = geometry.body_first_row },
         .{ .col = 19, .row = geometry.body_first_row },
         .{ .col = 0, .row = geometry.body_first_row + 1 },
         .{ .col = 19, .row = geometry.body_first_row + 1 },

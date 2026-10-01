@@ -18,6 +18,9 @@ pub const source_search_or_rule_row: u16 = 1;
 pub const source_spacer_row: u16 = 2;
 pub const source_body_first_row: u16 = 3;
 
+// Keep cursor position and Git change status in separate, fixed columns.
+const source_gutter_width: u16 = 2;
+
 pub const Region = enum {
     gutter,
     line_number,
@@ -28,8 +31,9 @@ pub const Region = enum {
 pub const SourceGeometry = struct {
     width: u16,
     height: u16,
-    gutter_col: u16 = 0,
-    line_number_col: u16 = 1,
+    cursor_col: u16 = 0,
+    gutter_col: u16 = 1,
+    line_number_col: u16 = source_gutter_width,
     line_number_width: u16,
     separator_col: ?u16,
     text_col: u16,
@@ -39,12 +43,12 @@ pub const SourceGeometry = struct {
 
     pub fn init(size: chasen.Size, document: *const source.Document, line_numbers: bool) SourceGeometry {
         const number_width: u16 = if (line_numbers) @intCast(decimalDigits(document.rowCount())) else 0;
-        const text_col = 1 +| number_width +| @as(u16, if (line_numbers) 1 else 0);
+        const text_col = source_gutter_width +| number_width +| @as(u16, if (line_numbers) 1 else 0);
         return .{
             .width = size.width,
             .height = size.height,
             .line_number_width = number_width,
-            .separator_col = if (line_numbers) 1 +| number_width else null,
+            .separator_col = if (line_numbers) source_gutter_width +| number_width else null,
             .text_col = text_col,
             .text_width = size.width -| text_col,
             .body_first_row = source_body_first_row,
@@ -58,7 +62,7 @@ pub const SourceGeometry = struct {
 
     pub fn regionAt(self: SourceGeometry, col: u16) ?Region {
         if (col >= self.width) return null;
-        if (col == self.gutter_col) return .gutter;
+        if (col == self.cursor_col or col == self.gutter_col) return .gutter;
         if (self.line_number_width > 0 and
             col >= self.line_number_col and col < self.line_number_col + self.line_number_width)
         {
@@ -98,14 +102,16 @@ test "repository selection geometry shares narrow line number and body boundarie
 
     const numbered = SourceGeometry.init(.{ .width = 10, .height = 5 }, &document, true);
     try std.testing.expectEqual(@as(u16, 2), numbered.line_number_width);
-    try std.testing.expectEqual(@as(?u16, 3), numbered.separator_col);
-    try std.testing.expectEqual(@as(u16, 4), numbered.text_col);
-    try std.testing.expectEqual(@as(u16, 6), numbered.text_width);
+    try std.testing.expectEqual(@as(?u16, 4), numbered.separator_col);
+    try std.testing.expectEqual(@as(u16, 5), numbered.text_col);
+    try std.testing.expectEqual(@as(u16, 5), numbered.text_width);
     try std.testing.expectEqual(numbered.height -| numbered.body_first_row, numbered.visible_source_rows);
     try std.testing.expectEqual(Region.gutter, numbered.regionAt(0).?);
+    try std.testing.expectEqual(Region.gutter, numbered.regionAt(1).?);
     try std.testing.expectEqual(Region.line_number, numbered.regionAt(2).?);
-    try std.testing.expectEqual(Region.separator, numbered.regionAt(3).?);
-    try std.testing.expectEqual(Region.text, numbered.regionAt(4).?);
+    try std.testing.expectEqual(Region.line_number, numbered.regionAt(3).?);
+    try std.testing.expectEqual(Region.separator, numbered.regionAt(4).?);
+    try std.testing.expectEqual(Region.text, numbered.regionAt(5).?);
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_path_row, 0, &document));
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_search_or_rule_row, 0, &document));
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_spacer_row, 0, &document));
@@ -113,10 +119,20 @@ test "repository selection geometry shares narrow line number and body boundarie
     try std.testing.expectEqual(@as(?usize, 1), numbered.contentLineAt(numbered.body_first_row + 1, 0, &document));
     try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(numbered.height, 0, &document));
 
+    const unnumbered = SourceGeometry.init(.{ .width = 10, .height = 5 }, &document, false);
+    try std.testing.expectEqual(@as(?u16, null), unnumbered.separator_col);
+    try std.testing.expectEqual(@as(u16, 2), unnumbered.text_col);
+    try std.testing.expectEqual(@as(u16, 8), unnumbered.text_width);
+    try std.testing.expectEqual(Region.gutter, unnumbered.regionAt(0).?);
+    try std.testing.expectEqual(Region.gutter, unnumbered.regionAt(1).?);
+    try std.testing.expectEqual(Region.text, unnumbered.regionAt(2).?);
+
     const narrow = SourceGeometry.init(.{ .width = 1, .height = 1 }, &document, true);
     try std.testing.expectEqual(@as(u16, 0), narrow.text_width);
     try std.testing.expectEqual(@as(u16, 0), narrow.visible_source_rows);
     try std.testing.expectEqual(@as(usize, 1), narrow.navigationRows());
+    try std.testing.expectEqual(Region.gutter, narrow.regionAt(0).?);
+    try std.testing.expectEqual(@as(?Region, null), narrow.regionAt(1));
 }
 
 test "repository selection geometry rejects the empty document synthetic row" {

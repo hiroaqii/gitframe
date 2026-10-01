@@ -6789,9 +6789,11 @@ test "repository selection live gesture fixes mode and resumes after leaving the
     defer line_release.deinit(allocator);
     try std.testing.expect(!state.activeMouseSourceRange());
 
-    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.line_number_col, .row = first_row } }, size);
-    try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
-    state.cancelMouseOwner();
+    for ([_]u16{ geometry.cursor_col, geometry.line_number_col }) |col| {
+        _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = col, .row = first_row } }, size);
+        try std.testing.expectEqual(repository_selection.Mode.line, state.selection_owner.activeSource().?.mode);
+        state.cancelMouseOwner();
+    }
 }
 
 test "repository selection hit testing applies scroll once and follows line number geometry" {
@@ -6823,7 +6825,7 @@ test "repository selection hit testing applies scroll once and follows line numb
     state.viewer.source_horizontal_scroll = 0;
     _ = state.applyNavigation(allocator, .toggle_line_numbers, size);
     geometry = state.sourceGeometry(size, document);
-    try std.testing.expectEqual(@as(u16, 1), geometry.text_col);
+    try std.testing.expectEqual(@as(u16, 2), geometry.text_col);
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = geometry.body_first_row } }, size);
     try std.testing.expectEqual(repository_selection.Mode.character, state.selection_owner.activeSource().?.mode);
     try std.testing.expectEqual(@as(usize, 0), state.selection_owner.activeSource().?.anchor.leading_byte);

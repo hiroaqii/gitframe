@@ -495,7 +495,8 @@ test "repository selection navigation clamps cursor scroll and horizontal cells"
     try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 2), viewer.source_vertical_scroll);
     scrollSourceHorizontal(&viewer, &document, 8, geometry);
-    try std.testing.expectEqual(@as(usize, 6), viewer.source_horizontal_scroll);
+    // Two gutter columns, a line number, and a separator leave three text cells.
+    try std.testing.expectEqual(@as(usize, 7), viewer.source_horizontal_scroll);
 }
 
 test "repository repeated navigation uses precomputed width for admitted worst shapes" {
