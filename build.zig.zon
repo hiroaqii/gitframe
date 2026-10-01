@@ -1,6 +1,6 @@
 .{
     .name = .gitframe,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x424bfbfaa0066315, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
