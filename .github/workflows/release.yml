@@ -8,6 +8,7 @@ on:
       - .github/workflows/release.yml
       - .github/release-notes/**
       - scripts/release*
+      - scripts/prepare-release.py
       - scripts/publish-release.sh
       - build.zig
       - build.zig.zon
@@ -35,7 +36,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Check release scripts
-        run: python3 -m unittest discover -s scripts -p 'release_test.py' -v
+        run: python3 -m unittest discover -s scripts -p 'release*_test.py' -v
       - name: Validate version
         id: version
         env:
