@@ -1407,10 +1407,13 @@ test "repository document task builds the bounded source model before delivery" 
         },
     };
     const root_observer = task.request.root;
-    var ctx: chasen.Ctx(TaskTestMsg) = .{ ._allocator = allocator };
-    _ = try ctx.task().spawnOwned(task, .{ .run = Document.run, .failed = Document.failed, .cleanup = Document.destroy });
-    const entries = ctx.takePendingTasks();
-    var message = try entries[0].run(allocator, std.testing.io);
+    var ctx: chasen.testing.TestCtx(TaskTestMsg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    _ = try ctx.ctx.task().spawnOwned(task, .{ .run = Document.run, .failed = Document.failed, .cleanup = Document.destroy });
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    var message = try entries.run();
     try std.testing.expectError(error.InvalidRootCapability, root_observer.duplicate());
     defer message.repository.deinitUndelivered(allocator);
     switch (message.repository) {

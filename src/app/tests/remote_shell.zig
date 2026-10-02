@@ -308,8 +308,10 @@ fn commitDiscovery(
     active_index: usize,
     origin: repo_session.CommitOrigin,
 ) !repo_session.CommitOutcome {
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    return repoSession(app).commitDiscovered(&ctx.ctx, result, active_index, origin);
 }
 
 fn mutationFenceRepoTestApp(
@@ -411,23 +413,23 @@ fn setDiffSearchQuery(app: *App, query: []const u8) void {
 
 fn runOnlyPushInspectionTaskForTest(
     app: *App,
-    ctx: *chasen.Ctx(App.Msg),
-    io: std.Io,
+    ctx: *chasen.testing.TestCtx(App.Msg),
 ) !void {
-    const pending = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), pending.len);
-    const msg = try pending[0].run(ctx.allocator(), io);
-    try app.update(msg, ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending = ctx.takeTask(0).?;
+    defer pending.deinit();
+    const msg = try pending.run();
+    try app.update(msg, &ctx.ctx);
 }
 
 fn deinitOnlyPushInspectionTaskForTest(
-    ctx: *chasen.Ctx(App.Msg),
-    io: std.Io,
+    ctx: *chasen.testing.TestCtx(App.Msg),
 ) !void {
-    const pending = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), pending.len);
-    var msg = try pending[0].run(ctx.allocator(), io);
-    msg.deinitUndelivered(ctx.allocator());
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending = ctx.takeTask(0).?;
+    defer pending.deinit();
+    var msg = try pending.run();
+    msg.deinitUndelivered(ctx.ctx.allocator());
 }
 
 fn runAppTestGit(
@@ -523,17 +525,18 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         );
         const epoch_before_rejection =
             app.pages.changes.repository_read_authority.epoch;
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-        defer ctx.runtimeClearPendingEffectCopies();
-        _ = try ctx.terminal().runForegroundCommand(.{
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, io);
+        defer ctx.deinit();
+        _ = try ctx.ctx.terminal().runForegroundCommand(.{
             .argv = &.{"true"},
             .cwd = .inherit,
             .environment = .inherit,
             .finished = DummyForeground.done,
         });
 
-        try app.update(.run_interactive_push, &ctx);
-        try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+        try app.update(.run_interactive_push, &ctx.ctx);
+        try runOnlyPushInspectionTaskForTest(&app, &ctx);
 
         try std.testing.expect(!app.action_runtime.view().hasPending());
         try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
@@ -545,10 +548,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
                 epoch_before_rejection,
             ),
         );
-        try std.testing.expectEqual(
-            @as(u8, 1),
-            ctx._pending_foreground_commands_len,
-        );
+        try std.testing.expect(ctx.hasPendingForegroundCommands());
     }
 
     // An accepted foreground command closes the fence only after the runtime
@@ -567,26 +567,21 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         );
         const epoch_before_launch =
             app.pages.changes.repository_read_authority.epoch;
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-        defer ctx.runtimeClearPendingEffectCopies();
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, io);
+        defer ctx.deinit();
 
-        try app.update(.run_interactive_push, &ctx);
-        try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+        try app.update(.run_interactive_push, &ctx.ctx);
+        try runOnlyPushInspectionTaskForTest(&app, &ctx);
         const fence_closed =
             !app.pages.changes.repository_read_authority.mayStartRepositoryRead();
         const epoch_advanced =
             app.pages.changes.repository_read_authority.epoch.eql(
                 epoch_before_launch.next(),
             );
-        const entry =
-            ctx._pending_foreground_commands[0..ctx._pending_foreground_commands_len][0];
-        const completion = entry.finished(.{
-            .request_id = entry.request_id,
-            .outcome = .{ .exited = 1 },
-        });
-        ctx.runtimeClearPendingEffectCopies();
-        try app.update(completion, &ctx);
+        const completion = try ctx.completeForeground(0, .{ .exited = 1 });
+        ctx.discardPendingEffects();
+        try app.update(completion, &ctx.ctx);
 
         try std.testing.expect(fence_closed);
         try std.testing.expect(epoch_advanced);
@@ -595,7 +590,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         try std.testing.expect(
             app.pages.changes.repository_read_authority.mayStartRepositoryRead(),
         );
-        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
     }
 
     // The same accepted foreground owner can become detached before delivery.
@@ -614,23 +609,18 @@ test "Changes mutation read fence follows interactive foreground queue and termi
             repo.repo_root,
             repo.oid,
         );
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-        defer ctx.runtimeClearPendingEffectCopies();
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, io);
+        defer ctx.deinit();
 
-        try app.update(.run_interactive_push, &ctx);
-        try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+        try app.update(.run_interactive_push, &ctx.ctx);
+        try runOnlyPushInspectionTaskForTest(&app, &ctx);
         const fence_closed =
             !app.pages.changes.repository_read_authority.mayStartRepositoryRead();
-        const entry =
-            ctx._pending_foreground_commands[0..ctx._pending_foreground_commands_len][0];
-        const completion = entry.finished(.{
-            .request_id = entry.request_id,
-            .outcome = .{ .exited = 1 },
-        });
-        ctx.runtimeClearPendingEffectCopies();
+        const completion = try ctx.completeForeground(0, .{ .exited = 1 });
+        ctx.discardPendingEffects();
         try replaceMutationFenceTestRepo(&app, allocator, roots.a);
-        try app.update(completion, &ctx);
+        try app.update(completion, &ctx.ctx);
 
         try std.testing.expect(fence_closed);
         try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -638,7 +628,7 @@ test "Changes mutation read fence follows interactive foreground queue and termi
         try std.testing.expect(
             app.pages.changes.repository_read_authority.mayStartRepositoryRead(),
         );
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
         try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
     }
 }
@@ -670,11 +660,13 @@ test "remote request preparation failures clear prior local confirmation" {
     };
     failure_app.overlay.openDiscardFile();
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var failing_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator() };
+    var failing_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    failing_ctx.init(failing.allocator(), std.testing.io);
+    defer failing_ctx.deinit();
 
     try std.testing.expectError(
         error.OutOfMemory,
-        failure_app.update(.{ .changes = .request_push }, &failing_ctx),
+        failure_app.update(.{ .changes = .request_push }, &failing_ctx.ctx),
     );
     try std.testing.expect(failure_app.local_workflow.discard_confirmation == null);
     try std.testing.expect(!failure_app.overlay.isDiscardFile());
@@ -697,18 +689,21 @@ test "remote request preparation failures clear prior local confirmation" {
             return .quit;
         }
     };
-    var saturated_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    for (0..16) |_| _ = try saturated_ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
+    var saturated_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    saturated_ctx.init(allocator, std.testing.io);
+    defer saturated_ctx.deinit();
+    for (0..16) |_| _ = try saturated_ctx.ctx.task().spawn(.{ .run = DummyTask.run, .failed = DummyTask.failed });
 
     try std.testing.expectError(
         error.TaskLimitExceeded,
-        failure_app.update(.request_branch_switch, &saturated_ctx),
+        failure_app.update(.request_branch_switch, &saturated_ctx.ctx),
     );
     try std.testing.expect(failure_app.local_workflow.discard_confirmation == null);
     try std.testing.expect(!failure_app.remote_workflow.branch_switch.hasState());
     try std.testing.expect(failure_app.remote_workflow.branch_switch_load_pending == null);
     try std.testing.expect(!failure_app.overlay.isSwitchBranch());
-    try std.testing.expectEqual(@as(usize, 16), saturated_ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 16), saturated_ctx.pendingTaskCount());
+    saturated_ctx.discardPendingTasks();
 }
 
 test "repository selection copy uses Repository origin without opening AI UI" {
@@ -724,13 +719,14 @@ test "repository selection copy uses Repository origin without opening AI UI" {
         } },
     };
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    copySourceSelection(&app, &ctx, "selected source");
+    copySourceSelection(&app, &ctx.ctx, "selected source");
 
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    const entry = ctx.clipboardAt(0).?;
     try std.testing.expectEqualStrings("selected source", entry.text);
     const state = app.shell_effects_state.clipboard_copies.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
     try std.testing.expectEqual(page.Id.repository, state.origin.page.page_id);
@@ -752,14 +748,15 @@ test "repository source header copy uses byte-exact Repository clipboard effect"
         } },
     };
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
     const path = "src/\xff-main.zig";
 
-    copySourceHeaderPath(&app, &ctx, path);
+    copySourceHeaderPath(&app, &ctx.ctx, path);
 
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    const entry = ctx.clipboardAt(0).?;
     try std.testing.expectEqualSlices(u8, path, entry.text);
     const state = app.shell_effects_state.clipboard_copies.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
     try std.testing.expectEqualStrings("file path", state.label);
@@ -801,18 +798,19 @@ test "repository selection clipboard queue failure retains page candidate" {
     };
     defer app.pages.repository.deinit(allocator);
     defer app.shell_effects_state.clipboard_copies.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     for (0..4) |_| {
-        _ = try ctx.terminal().copyToClipboard(.{
+        _ = try ctx.ctx.terminal().copyToClipboard(.{
             .text = "occupied",
             .finished = App.Msg.clipboardFinished,
         });
     }
 
-    copySourceSelection(&app, &ctx, app.pages.repository.completed_selection.?.text);
+    copySourceSelection(&app, &ctx.ctx, app.pages.repository.completed_selection.?.text);
 
-    try std.testing.expectEqual(@as(u8, 4), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(@as(usize, 4), ctx.pendingClipboardCopyCount());
     try std.testing.expectEqual(@as(usize, 0), app.shell_effects_state.clipboard_copies.count());
     try std.testing.expectEqualStrings("selected source", app.pages.repository.completed_selection.?.text);
     try std.testing.expectEqualStrings("clipboard copy already queued", app.pages.repository.status.text());
@@ -829,27 +827,32 @@ test "copyPopup queues remote error message text" {
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
     app.overlay.openRemoteError(.changes);
 
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.copy_popup, &ctx);
+    try app.update(.copy_popup, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    const entry = ctx.clipboardAt(0).?;
     try std.testing.expectEqualStrings("  fatal\nline two  ", entry.text);
-    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.Msg.clipboardFinished), entry.finished);
-    const state = app.shell_effects_state.clipboard_copies.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
+    const request_id = entry.request_id;
+    var completion = try ctx.completeClipboard(0, .sent);
+    defer ctx.discardMessage(&completion);
+    try std.testing.expectEqualDeep(App.Msg.clipboardFinished(.{ .request_id = request_id, .outcome = .sent }), completion);
+    const state = app.shell_effects_state.clipboard_copies.get(request_id.id) orelse return error.ExpectedClipboardState;
     try std.testing.expectEqual(app.overlay.remote_error_instance_id, state.origin.shell_surface.instance_id);
 }
 
 test "copyPopup reports empty target outside copyable popup" {
     var app: App = .{};
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.copy_popup, &ctx);
+    try app.update(.copy_popup, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingClipboardCopyCount());
     try std.testing.expectEqualStrings("nothing to copy: popup", app.status.text());
 }
 
@@ -859,21 +862,25 @@ test "copyCommitMessage queues formatted commit message text" {
     };
     defer app.local_workflow.commit_panel.deinit();
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     app.local_workflow.commit_panel.open(.commit);
     app.local_workflow.commit_panel.paste("  subject  ");
     app.local_workflow.commit_panel.toggleField();
     app.local_workflow.commit_panel.paste("  body\n\nline two  ");
 
-    try app.update(.copy_commit_message, &ctx);
+    try app.update(.copy_commit_message, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    const entry = ctx._pending_clipboard_copies[0];
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    const entry = ctx.clipboardAt(0).?;
     try std.testing.expectEqualStrings("subject\n\nbody\n\nline two", entry.text);
-    try std.testing.expectEqual(@as(chasen.Ctx(App.Msg).ClipboardCopyFinishedFn, App.Msg.clipboardFinished), entry.finished);
-    const state = app.shell_effects_state.clipboard_copies.get(entry.request_id.id) orelse return error.ExpectedClipboardState;
+    const request_id = entry.request_id;
+    var completion = try ctx.completeClipboard(0, .sent);
+    defer ctx.discardMessage(&completion);
+    try std.testing.expectEqualDeep(App.Msg.clipboardFinished(.{ .request_id = request_id, .outcome = .sent }), completion);
+    const state = app.shell_effects_state.clipboard_copies.get(request_id.id) orelse return error.ExpectedClipboardState;
     try std.testing.expectEqual(app.local_workflow.commit_panel.instance_id, state.origin.shell_surface.instance_id);
 }
 
@@ -883,16 +890,17 @@ test "copyCommitMessage uses same commit panel state for amend mode" {
     };
     defer app.local_workflow.commit_panel.deinit();
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     app.local_workflow.commit_panel.open(.amend);
     app.local_workflow.commit_panel.paste("amend subject");
 
-    try app.update(.copy_commit_message, &ctx);
+    try app.update(.copy_commit_message, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("amend subject", ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    try std.testing.expectEqualStrings("amend subject", ctx.clipboardAt(0).?.text);
 }
 
 test "copyCommitMessage preserves body-only formatMessage shape" {
@@ -901,17 +909,18 @@ test "copyCommitMessage preserves body-only formatMessage shape" {
     };
     defer app.local_workflow.commit_panel.deinit();
     defer app.shell_effects_state.clipboard_copies.deinit(std.testing.allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     app.local_workflow.commit_panel.open(.commit);
     app.local_workflow.commit_panel.toggleField();
     app.local_workflow.commit_panel.paste("body");
 
-    try app.update(.copy_commit_message, &ctx);
+    try app.update(.copy_commit_message, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings("\n\nbody", ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    try std.testing.expectEqualStrings("\n\nbody", ctx.clipboardAt(0).?.text);
 }
 
 test "copyCommitMessage reports empty draft and closed panel" {
@@ -919,18 +928,19 @@ test "copyCommitMessage reports empty draft and closed panel" {
         .local_workflow = .{ .commit_panel = app_commit_panel.State.init(std.testing.allocator) },
     };
     defer app.local_workflow.commit_panel.deinit();
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.copy_commit_message, &ctx);
+    try app.update(.copy_commit_message, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingClipboardCopyCount());
     try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
 
     app.local_workflow.commit_panel.open(.commit);
-    try app.update(.copy_commit_message, &ctx);
+    try app.update(.copy_commit_message, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingClipboardCopyCount());
     try std.testing.expectEqualStrings("nothing to copy: commit message", app.status.text());
 }
 
@@ -960,8 +970,9 @@ test "finishSwitchBranch success clears repo-local changes state and reloads mat
     setDiffSearchQuery(&app, "needle");
 
     const pending = beginAcceptedTestAction(&app, .switch_branch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
@@ -969,7 +980,7 @@ test "finishSwitchBranch success clears repo-local changes state and reloads mat
         .old_branch = try allocator.dupe(u8, "main"),
         .new_branch = try allocator.dupe(u8, "feature"),
         .result = .ok,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(app.screen_transition == .waiting);
     try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -978,7 +989,7 @@ test "finishSwitchBranch success clears repo-local changes state and reloads mat
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.search.query.len);
     try std.testing.expectEqualStrings("switched branch: main -> feature", app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
 }
 
 test "finishSwitchBranch failure owns full details and allows closing and reopening picker" {
@@ -1006,16 +1017,16 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
         "Aborting\n";
     app.pages.changes.search.query = app.pages.changes.search.input;
     const pending = beginAcceptedTestAction(&app, .switch_branch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .old_branch = try allocator.dupe(u8, "main"),
         .new_branch = try allocator.dupe(u8, "feature"),
         .result = .{ .failed = try allocator.dupe(u8, details) },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(app.screen_transition == .idle);
     try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -1026,26 +1037,26 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.staged_hunks.items.items.len);
     try std.testing.expectEqualStrings("needle", app.pages.changes.search.query.slice());
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
-    try app.update(.copy_popup, &ctx);
-    try std.testing.expectEqualStrings(details, ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
+    try app.update(.copy_popup, &ctx.ctx);
+    try std.testing.expectEqualStrings(details, ctx.clipboardAt(0).?.text);
 
     const close = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.enter } }) orelse return error.ExpectedCloseError;
-    try app.update(close, &ctx);
+    try app.update(close, &ctx.ctx);
     try std.testing.expect(!app.overlay.isRemoteError());
     try std.testing.expect(app.remote_workflow.remote_error_message == null);
     try std.testing.expectEqual(page.Id.changes, app.active_page);
 
     // Simulate the branch refresh; file status may still be pending when b reopens.
-    chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    ctx.discardPendingTasks();
     var branch = try branchStatusBundleForRemoteRootTest(allocator, "abc123", "main", .{ .name = "origin/main", .full_ref = "refs/remotes/origin/main", .remote = "origin", .remote_branch = "main" });
     try app.pages.changes.branch_status.replace(roots.a, &branch);
     _ = app.pages.changes.activation.activate(app.repo_session.repo_epoch, .fresh, .pending, .fresh);
     const reopen = app.handleEvent(.{ .key_press = .{ .codepoint = 'b' } }) orelse return error.ExpectedReopenPicker;
-    try app.update(reopen, &ctx);
+    try app.update(reopen, &ctx.ctx);
     try std.testing.expect(app.overlay.isSwitchBranch());
     try std.testing.expect(app.remote_workflow.branch_switch.loading);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
 }
 
 test "finishSwitchBranch success clears completed repo marks when active repo changed" {
@@ -1074,7 +1085,9 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
     try app.pages.changes.staged_hunks.addExact(allocator, "/other", "b", new_key);
 
     const pending = beginAcceptedTestAction(&app, .switch_branch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .switch_branch = .{
         .pending = pending,
@@ -1082,14 +1095,14 @@ test "finishSwitchBranch success clears completed repo marks when active repo ch
         .old_branch = try allocator.dupe(u8, "main"),
         .new_branch = try allocator.dupe(u8, "feature"),
         .result = .ok,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(!try app.pages.changes.reviewed_store.containsFile(allocator, "/repo", app_test_support.files_two[0]));
     try std.testing.expect(try app.pages.changes.reviewed_store.containsFile(allocator, "/other", app_test_support.files_two[1]));
     try std.testing.expect(!app.pages.changes.staged_hunks.containsExact("/repo", "a", old_key));
     try std.testing.expect(app.pages.changes.staged_hunks.containsExact("/other", "b", new_key));
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expectEqualStrings("", app.pages.changes.status.text());
 }
 
@@ -1105,7 +1118,9 @@ test "finishPush does not reload a stale active repository" {
         },
     };
     const pending = beginAcceptedTestAction(&app, .push);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .push = .{
         .pending = pending,
@@ -1121,7 +1136,7 @@ test "finishPush does not reload a stale active repository" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .{ .outcome = .{ .ok = .completed } },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.load.pending == null);
@@ -1140,7 +1155,9 @@ test "finishPull does not reload a stale active repository" {
         },
     };
     const pending = beginAcceptedTestAction(&app, .pull);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
@@ -1150,7 +1167,7 @@ test "finishPull does not reload a stale active repository" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .{ .outcome = .{ .ok = .completed } },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.load.pending == null);
@@ -1170,8 +1187,9 @@ test "finishPull reloads matching active repo after up-to-date success" {
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
@@ -1186,7 +1204,7 @@ test "finishPull reloads matching active repo after up-to-date success" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .{ .outcome = .{ .ok = .already_up_to_date } },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.load.pending != null);
@@ -1206,8 +1224,9 @@ test "finishPull reloads matching active repo after failure" {
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .pull = .{
         .pending = pending,
@@ -1222,7 +1241,7 @@ test "finishPull reloads matching active repo after failure" {
         .remote_branch = try std.testing.allocator.dupe(u8, "main"),
         .oid = try std.testing.allocator.dupe(u8, "abc123"),
         .result = .{ .outcome = .{ .failed = .failed } },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.load.pending != null);
@@ -1248,9 +1267,9 @@ test "classified pull authentication failures open copyable sanitized details" {
         defer app.shell_effects_state.clipboard_copies.deinit(allocator);
         _ = activateChanges(&app);
         const pending = beginAcceptedTestAction(&app, .pull);
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-        defer ctx.runtimeClearPendingEffectCopies();
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
         try app.update(.{ .action_finished = .{ .pull = .{
             .pending = pending,
@@ -1265,7 +1284,7 @@ test "classified pull authentication failures open copyable sanitized details" {
             .remote_branch = try allocator.dupe(u8, "main"),
             .oid = try allocator.dupe(u8, "abc123"),
             .result = .{ .outcome = .{ .failed = failure } },
-        } } }, &ctx);
+        } } }, &ctx.ctx);
 
         try std.testing.expect(app.overlay.isRemoteError());
         try std.testing.expectEqual(app_state.GitErrorOperation.pull, app.remote_workflow.remote_error_operation.?);
@@ -1296,9 +1315,9 @@ test "classified pull authentication failures open copyable sanitized details" {
             else => unreachable,
         }
 
-        try app.update(.copy_popup, &ctx);
-        try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-        try std.testing.expectEqualStrings(details, ctx._pending_clipboard_copies[0].text);
+        try app.update(.copy_popup, &ctx.ctx);
+        try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+        try std.testing.expectEqualStrings(details, ctx.clipboardAt(0).?.text);
         for ([_][]const u8{
             "Authorization: Bearer RAW-AUTH-CANARY",
             "password=RAW-PASSWORD-CANARY",
@@ -1306,7 +1325,7 @@ test "classified pull authentication failures open copyable sanitized details" {
         }) |canary| {
             try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), canary) == null);
             try std.testing.expect(std.mem.indexOf(u8, details, canary) == null);
-            try std.testing.expect(std.mem.indexOf(u8, ctx._pending_clipboard_copies[0].text, canary) == null);
+            try std.testing.expect(std.mem.indexOf(u8, ctx.clipboardAt(0).?.text, canary) == null);
         }
     }
 }
@@ -1328,9 +1347,9 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .push);
     app.remote_workflow.action_control.begin(pending.generation);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .push = .{
         .pending = pending,
@@ -1348,7 +1367,7 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
         .result = .{
             .outcome = .{ .failed = .ssh_public_key },
         },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(!app.remote_workflow.action_control.isActive(pending.generation));
@@ -1373,9 +1392,9 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
     }
     try std.testing.expect(app_view.remoteErrorMaxScroll(.{ .width = 120, .height = 24 }, detail_message, .push) > 0);
 
-    try app.update(.copy_popup, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings(detail_message, ctx._pending_clipboard_copies[0].text);
+    try app.update(.copy_popup, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    try std.testing.expectEqualStrings(detail_message, ctx.clipboardAt(0).?.text);
 
     const canaries = [_][]const u8{
         "https://alice:RAW-URL-CANARY@example.invalid/repo.git",
@@ -1386,7 +1405,7 @@ test "sensitive diagnostic typed push failure publishes only fixed status overla
     for (canaries) |canary| {
         try std.testing.expect(std.mem.indexOf(u8, app.pages.changes.status.text(), canary) == null);
         try std.testing.expect(std.mem.indexOf(u8, app.remote_workflow.remote_error_message.?, canary) == null);
-        try std.testing.expect(std.mem.indexOf(u8, ctx._pending_clipboard_copies[0].text, canary) == null);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.clipboardAt(0).?.text, canary) == null);
     }
 }
 
@@ -1402,14 +1421,16 @@ test "finishFetch does not reload a stale active repository" {
         },
     };
     const pending = beginAcceptedTestAction(&app, .fetch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .fetch = .{
         .pending = pending,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .result = .{ .outcome = .{ .ok = .completed } },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.load.pending == null);
@@ -1429,8 +1450,9 @@ test "finishFetch reloads matching active repo after failure" {
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .fetch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .fetch = .{
         .pending = pending,
@@ -1442,7 +1464,7 @@ test "finishFetch reloads matching active repo after failure" {
         .repo_root = try std.testing.allocator.dupe(u8, roots.a),
         .remote = try std.testing.allocator.dupe(u8, "origin"),
         .result = .{ .outcome = .{ .failed = .failed } },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.load.pending != null);
@@ -1462,11 +1484,11 @@ test "remote cancel defers quit until the exact unknown-outcome terminal" {
     defer app.repo_session.repo_state.deinit(std.testing.allocator);
     _ = activateChanges(&app);
     const pending = beginAcceptedTestAction(&app, .pull);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.quit, &ctx);
+    try app.update(.quit, &ctx.ctx);
     try std.testing.expect(!app.teardown_requested);
     try std.testing.expectEqualStrings("canceling...", app.pages.changes.status.text());
 
@@ -1486,7 +1508,7 @@ test "remote cancel defers quit until the exact unknown-outcome terminal" {
             .outcome = .{ .failed = .canceled_outcome_unknown },
             .warnings = .{ .git_plaintext_store = true },
         },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(app.teardown_requested);
     try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -1521,9 +1543,11 @@ test "repository supersession invalidates an in-flight push inspection" {
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
     });
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.run_interactive_push, &ctx);
+    try app.update(.run_interactive_push, &ctx.ctx);
     try std.testing.expectEqual(repo_session.CommitOutcome.changed, try commitDiscovery(
         &app,
         allocator,
@@ -1531,7 +1555,7 @@ test "repository supersession invalidates an in-flight push inspection" {
         0,
         .external_selection,
     ));
-    try runOnlyPushInspectionTaskForTest(&app, &ctx, std.testing.io);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx);
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
@@ -1556,14 +1580,16 @@ test "direct root quit remains allowed while push inspection is running" {
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
     });
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.run_interactive_push, &ctx);
-    try app.update(.quit, &ctx);
+    try app.update(.run_interactive_push, &ctx.ctx);
+    try app.update(.quit, &ctx.ctx);
 
     try std.testing.expect(ctx.shouldQuit());
     try std.testing.expect(app.remote_workflow.push_retry.state == .inspecting);
-    try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
+    try deinitOnlyPushInspectionTaskForTest(&ctx);
 }
 
 test "push inspection surface blocks page switching until canceled" {
@@ -1584,15 +1610,17 @@ test "push inspection surface blocks page switching until canceled" {
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, "abc123"),
     });
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.run_interactive_push, &ctx);
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.run_interactive_push, &ctx.ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expectEqualStrings("close remote error before switching pages", app.status.text());
     remoteWorkflow(&app).clearRemoteError(allocator);
-    try deinitOnlyPushInspectionTaskForTest(&ctx, std.testing.io);
+    try deinitOnlyPushInspectionTaskForTest(&ctx);
 
     app.status.clear();
     app.shell_effects_state.editor_foreground = .{
@@ -1603,7 +1631,7 @@ test "push inspection surface blocks page switching until canceled" {
             .activation_id = app.pages.changes.activation.next_activation_id,
         },
     };
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expectEqualStrings("finish foreground command before switching pages", app.status.text());
@@ -1636,7 +1664,7 @@ test "push inspection surface blocks page switching until canceled" {
         },
         .warnings = .{},
     } };
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expectEqualStrings("finish foreground command before switching pages", app.status.text());
@@ -1664,11 +1692,13 @@ test "expired remote inspection page cleans up without reopening a hidden overla
         .remote_branch = try allocator.dupe(u8, "main"),
         .oid = try allocator.dupe(u8, repo.oid),
     });
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, io);
+    defer ctx.deinit();
 
-    try app.update(.run_interactive_push, &ctx);
+    try app.update(.run_interactive_push, &ctx.ctx);
     app.active_page = .repository;
-    try runOnlyPushInspectionTaskForTest(&app, &ctx, io);
+    try runOnlyPushInspectionTaskForTest(&app, &ctx);
 
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
     try std.testing.expect(app.remote_workflow.owner == null);
@@ -1707,17 +1737,18 @@ test "finishPushForeground reloads matching active repo after failure" {
         },
         .warnings = .{},
     } };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .push_foreground = .{
         .request_id = .{ .id = 9 },
         .outcome = .{ .exited = 1 },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.remote_workflow.push_retry.state == .idle);
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
     try std.testing.expectEqualStrings("interactive push exited: 1", app.pages.changes.status.text());
 }
 
@@ -1752,17 +1783,19 @@ test "inactive Changes foreground completions retain diagnostics without effects
         },
         .warnings = .{},
     } };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .action_finished = .{ .push_foreground = .{
         .request_id = .{ .id = 7 },
         .outcome = .{ .exited = 1 },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     const expected_status = try std.fmt.allocPrint(allocator, "interactive push exited for {s}: 1", .{roots.a});
     defer allocator.free(expected_status);
     try std.testing.expectEqualStrings(expected_status, app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     app.redraw_plan = .{};
@@ -1777,10 +1810,10 @@ test "inactive Changes foreground completions retain diagnostics without effects
     try app.update(.{ .shell_effect_finished = .{ .editor = .{
         .request_id = .{ .id = 8 },
         .outcome = .{ .exited = 0 },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expectEqualStrings(expected_status, app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 
     // An exact completion from the active Changes instance is the only editor
@@ -1798,17 +1831,18 @@ test "inactive Changes foreground completions retain diagnostics without effects
             .activation_id = active_app.pages.changes.activation.next_activation_id,
         },
     };
-    var active_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &active_ctx);
+    var active_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    active_ctx.init(allocator, std.testing.io);
+    defer active_ctx.deinit();
 
     try active_app.update(.{ .shell_effect_finished = .{ .editor = .{
         .request_id = .{ .id = 9 },
         .outcome = .{ .exited = 0 },
-    } } }, &active_ctx);
+    } } }, &active_ctx.ctx);
 
     try std.testing.expect(active_app.shell_effects_state.editor_foreground == null);
     try std.testing.expectEqualStrings("", active_app.pages.changes.status.text());
-    try std.testing.expectEqual(@as(u8, 3), active_ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 3), active_ctx.pendingTaskCount());
 }
 
 test "Repository branch switch terminals reload only their caller without activating Changes" {
@@ -1841,9 +1875,9 @@ test "Repository branch switch terminals reload only their caller without activa
         setDiffSearchQuery(&app, "needle");
         app.pages.changes.search.query = app.pages.changes.search.input;
         const pending = beginAcceptedTestAction(&app, .switch_branch);
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-        defer ctx.runtimeClearPendingEffectCopies();
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
         try app.update(.{ .action_finished = .{ .switch_branch = .{
             .pending = .{ .generation = pending.generation + 1, .kind = .switch_branch },
@@ -1851,9 +1885,9 @@ test "Repository branch switch terminals reload only their caller without activa
             .old_branch = try allocator.dupe(u8, "main"),
             .new_branch = try allocator.dupe(u8, "feature"),
             .result = .{ .failed_static = "wrong token" },
-        } } }, &ctx);
+        } } }, &ctx.ctx);
         try std.testing.expect(app.action_runtime.view().isAccepted(pending));
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
         try app.update(.{ .action_finished = .{ .switch_branch = .{
             .pending = pending,
@@ -1861,7 +1895,7 @@ test "Repository branch switch terminals reload only their caller without activa
             .old_branch = try allocator.dupe(u8, "main"),
             .new_branch = try allocator.dupe(u8, "feature"),
             .result = if (success) .ok else .{ .failed_static = "checkout refused; local changes retained" },
-        } } }, &ctx);
+        } } }, &ctx.ctx);
         try std.testing.expect(!app.action_runtime.view().hasPending());
         try std.testing.expect(app.remote_workflow.branch_switch_pending == null);
         try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
@@ -1869,7 +1903,7 @@ test "Repository branch switch terminals reload only their caller without activa
         try std.testing.expectEqual(page.Id.repository, app.active_page);
         try std.testing.expectEqualStrings("Changes retained", app.pages.changes.status.text());
         try std.testing.expectEqualStrings("needle", app.pages.changes.search.query.slice());
-        try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskCount());
         try std.testing.expectEqual(@as(?u64, 9), app.pages.repository.pending_generation);
         try std.testing.expectEqual(@as(u64, 8), app.pages.repository.branch.pending.?.generation);
         try std.testing.expect(app.pages.repository.pending_document_generation == null);
@@ -1883,13 +1917,13 @@ test "Repository branch switch terminals reload only their caller without activa
             .root_identity = root_identity,
             .generation = 8,
             .result = .{ .failed_static = "old manifest failure" },
-        } } }, &ctx);
+        } } }, &ctx.ctx);
         try app.update(.{ .repository = .{ .branch_finished = .{
             .identity = identity,
             .root_identity = root_identity,
             .generation = 7,
             .result = .{ .failed = .load_failed },
-        } } }, &ctx);
+        } } }, &ctx.ctx);
         try std.testing.expectEqual(@as(?u64, 9), app.pages.repository.pending_generation);
         try std.testing.expectEqual(@as(u64, 8), app.pages.repository.branch.pending.?.generation);
         try std.testing.expect(app.pages.repository.branch.freshness == .validating);
@@ -1915,18 +1949,18 @@ test "branch switch filter routes text selection and cancellation through the sh
     defer app.pages.compare.deinit(allocator);
     defer app.remote_workflow.deinit(allocator);
     app.pages.repository.activate(0, app.repo_session.view().activeIdentity().?);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     const Key = struct {
         fn send(target: *App, context: *chasen.Ctx(App.Msg), codepoint: u21) !void {
             try target.update(target.handleEvent(.{ .key_press = .{ .codepoint = codepoint } }) orelse return error.ExpectedPickerInput, context);
         }
     };
-    try Key.send(&app, &ctx, 'b');
-    try Key.send(&app, &ctx, '/');
+    try Key.send(&app, &ctx.ctx, 'b');
+    try Key.send(&app, &ctx.ctx, '/');
     try std.testing.expect(!app.remote_workflow.branch_switch.query_mode);
-    chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    ctx.discardPendingTasks();
     const state = &app.remote_workflow.branch_switch;
     state.loading = false;
     app.remote_workflow.branch_switch_load_pending = null;
@@ -1943,53 +1977,54 @@ test "branch switch filter routes text selection and cancellation through the sh
     }
     state.branches[2].worktree_path = try allocator.dupe(u8, roots.b);
 
-    try Key.send(&app, &ctx, '/');
-    for ("qjk") |codepoint| try Key.send(&app, &ctx, codepoint);
+    try Key.send(&app, &ctx.ctx, '/');
+    for ("qjk") |codepoint| try Key.send(&app, &ctx.ctx, codepoint);
     try std.testing.expectEqualStrings("qjk", state.query.slice());
     try std.testing.expectEqual(@as(usize, 2), state.visibleCount());
-    try Key.send(&app, &ctx, chasen.Key.down);
+    try Key.send(&app, &ctx.ctx, chasen.Key.down);
     try std.testing.expectEqualStrings("feature/qjk-two", state.selectedItem().?.name);
-    try Key.send(&app, &ctx, '/');
+    try Key.send(&app, &ctx.ctx, '/');
     try std.testing.expectEqual(@as(usize, 0), state.visibleCount());
-    try Key.send(&app, &ctx, chasen.Key.enter);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try Key.send(&app, &ctx.ctx, chasen.Key.enter);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.overlay.isSwitchBranch());
-    try Key.send(&app, &ctx, chasen.Key.backspace);
+    try Key.send(&app, &ctx.ctx, chasen.Key.backspace);
     try std.testing.expectEqualStrings("qjk", state.query.slice());
-    try Key.send(&app, &ctx, chasen.Key.tab);
+    try Key.send(&app, &ctx.ctx, chasen.Key.tab);
     try std.testing.expect(!state.query_mode);
-    try Key.send(&app, &ctx, 'k');
+    try Key.send(&app, &ctx.ctx, 'k');
     try std.testing.expectEqualStrings("feature/qjk-two", state.selectedItem().?.name);
-    try Key.send(&app, &ctx, 'j');
+    try Key.send(&app, &ctx.ctx, 'j');
     try std.testing.expectEqualStrings("feature/qjk-one", state.selectedItem().?.name);
-    try Key.send(&app, &ctx, chasen.Key.escape);
+    try Key.send(&app, &ctx.ctx, chasen.Key.escape);
     try std.testing.expectEqual(@as(usize, 0), state.query.len);
     try std.testing.expectEqual(@as(usize, 3), state.visibleCount());
     try std.testing.expect(app.overlay.isSwitchBranch());
 
-    try Key.send(&app, &ctx, '/');
+    try Key.send(&app, &ctx.ctx, '/');
     const shifted_q = app.handleEvent(.{ .key_press = .{ .codepoint = 'q', .shifted_codepoint = 'Q', .mods = .{ .shift = true } } }).?;
-    try app.update(shifted_q, &ctx);
-    for ("jk") |codepoint| try Key.send(&app, &ctx, codepoint);
+    try app.update(shifted_q, &ctx.ctx);
+    for ("jk") |codepoint| try Key.send(&app, &ctx.ctx, codepoint);
     try std.testing.expectEqualStrings("Qjk", state.query.slice());
     try std.testing.expectEqual(@as(usize, 2), state.visibleCount());
     try std.testing.expect(app.handleEvent(.{ .paste = "q" }) == null);
-    try Key.send(&app, &ctx, chasen.Key.down);
-    try Key.send(&app, &ctx, chasen.Key.enter);
+    try Key.send(&app, &ctx.ctx, chasen.Key.down);
+    try Key.send(&app, &ctx.ctx, chasen.Key.enter);
     try std.testing.expect(state.worktree_pending);
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
     try std.testing.expectEqualStrings("feature/qjk-two", state.selectedItem().?.name);
     try std.testing.expectEqualStrings(roots.b, state.selectedItem().?.worktree_path.?);
     try std.testing.expect(app.handleEvent(.{ .key_press = .{ .codepoint = 'j' } }) == null);
-    try Key.send(&app, &ctx, chasen.Key.escape);
+    try Key.send(&app, &ctx.ctx, chasen.Key.escape);
     try std.testing.expect(!app.overlay.isSwitchBranch());
     try std.testing.expectEqual(@as(usize, 0), state.query.len);
-    entries[0].discard(allocator);
-    try Key.send(&app, &ctx, 'b');
+    entries.deinit();
+    try Key.send(&app, &ctx.ctx, 'b');
     try std.testing.expect(!state.query_mode);
     try std.testing.expectEqual(@as(usize, 0), state.query.len);
-    try Key.send(&app, &ctx, 'q');
+    try Key.send(&app, &ctx.ctx, 'q');
     try std.testing.expect(!app.overlay.isSwitchBranch());
 }
 
@@ -2035,11 +2070,11 @@ test "worktree completion uses repository replacement from every branch picker c
             .display_name = try allocator.dupe(u8, "old-base"),
             .kind = .local,
         };
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-        defer ctx.runtimeClearPendingEffectCopies();
-        try app.update(.request_branch_switch, &ctx);
-        chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
+        try app.update(.request_branch_switch, &ctx.ctx);
+        ctx.discardPendingTasks();
         const owner = app.remote_workflow.branch_switch.owner.?;
         try std.testing.expectEqual(caller, owner.origin.page_id);
         app.remote_workflow.branch_switch.loading = false;
@@ -2051,7 +2086,7 @@ test "worktree completion uses repository replacement from every branch picker c
                 .discovery = try testSingleRepoDiscovery(allocator, roots.b),
                 .root_identity = destination.identity,
             } },
-        } } } }, &ctx);
+        } } } }, &ctx.ctx);
         try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
         try std.testing.expectEqual(@as(u64, 5), app.repo_session.view().epoch());
         try std.testing.expectEqual(caller, app.active_page);
@@ -2062,8 +2097,12 @@ test "worktree completion uses repository replacement from every branch picker c
         try std.testing.expectEqualStrings(roots.b, app.repo_session.recent_repos.entries.items[0].path);
         try std.testing.expect(app.screen_transition == .waiting);
         // Read failure after commitment stays at the destination.
-        for (ctx.takePendingTasks()) |entry| {
-            try app.update(entry.failed(error.ConcurrencyUnavailable, allocator), &ctx);
+        const batch = try allocator.alloc(chasen.testing.TestTask(App.Msg), ctx.pendingTaskCount());
+        defer allocator.free(batch);
+        for (batch) |*task| task.* = ctx.takeTask(0).?;
+        defer for (batch) |*task| task.deinit();
+        for (batch) |*task| {
+            try app.update(try task.fail(error.ConcurrencyUnavailable), &ctx.ctx);
         }
         try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
         try std.testing.expectEqual(caller, app.active_page);
@@ -2108,11 +2147,11 @@ test "worktree precommit rejections keep caller page diagnostics out of shell st
             .selected_parent_count = 1,
         };
         history.current_view = .diff;
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-        defer ctx.runtimeClearPendingEffectCopies();
-        try app.update(.request_branch_switch, &ctx);
-        chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
+        try app.update(.request_branch_switch, &ctx.ctx);
+        ctx.discardPendingTasks();
         const owner = app.remote_workflow.branch_switch.owner.?;
         app.remote_workflow.branch_switch.loading = false;
         app.remote_workflow.branch_switch.worktree_pending = true;
@@ -2126,7 +2165,7 @@ test "worktree precommit rejections keep caller page diagnostics out of shell st
             .owner = owner,
             .generation = app.remote_workflow.branch_switch.generation,
             .result = .{ .ready = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.b), .root_identity = target.identity } },
-        } } } }, &ctx);
+        } } } }, &ctx.ctx);
         try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
         try std.testing.expect(source_identity.eql(app.repo_session.view().activeIdentity().?));
         try std.testing.expectEqual(@as(u64, 4), app.repo_session.view().epoch());
@@ -2199,15 +2238,15 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 defer loaded.deinit(allocator);
                 _ = try compare.applyLoadFinished(allocator, 4, roots.a, root_identity, &loaded);
             }
-            var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-            defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-            defer ctx.runtimeClearPendingEffectCopies();
+            var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+            ctx.init(allocator, std.testing.io);
+            defer ctx.deinit();
             // The real root request captures these pages without a Changes activation.
-            try app.update(.request_branch_switch, &ctx);
+            try app.update(.request_branch_switch, &ctx.ctx);
             try std.testing.expectEqual(owner, app.overlay.owner_page.?);
             try std.testing.expectEqual(owner, app.remote_workflow.branch_switch.owner.?.origin.page_id);
-            try app.update(.cancel_branch_switch, &ctx);
-            chasen.testing.discardPendingTasks(App.Msg, &ctx);
+            try app.update(.cancel_branch_switch, &ctx.ctx);
+            ctx.discardPendingTasks();
 
             const diff = if (owner == .history) &history.diff else &compare.diff;
             diff.viewer.selected_target = .{ .diff_file = 0 };
@@ -2234,7 +2273,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 .old_branch = try allocator.dupe(u8, "main"),
                 .new_branch = try allocator.dupe(u8, "feature"),
                 .result = if (success) .ok else .{ .failed_static = "checkout refused" },
-            } } }, &ctx);
+            } } }, &ctx.ctx);
             try std.testing.expectEqual(owner, app.active_page);
             try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
             try std.testing.expect(!app.action_runtime.view().hasPending());
@@ -2259,7 +2298,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                     .generation = 10,
                     .request = history.accepted.?.request,
                     .result = .{ .failed_static = "old diff" },
-                } } } }, &ctx);
+                } } } }, &ctx.ctx);
                 try std.testing.expectEqual(probe.generation, history.pending.?.catalog.generation);
                 try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
                 try app.update(.{ .load_finished = .{ .history = .{ .catalog = .{
@@ -2268,7 +2307,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                     .generation = probe.generation,
                     .request = probe.request,
                     .result = .{ .loaded = .{ .snapshot = .{ .object_format = .sha1, .head = new_head, .display = .{ .branch = try allocator.dupe(u8, "feature") } } } },
-                } } } }, &ctx);
+                } } } }, &ctx.ctx);
                 try std.testing.expect(history.currentHeadContext().?.head.?.eql(&new_head));
                 try std.testing.expect(history.accepted.?.request.basis.after.eql(&selected));
                 try std.testing.expectEqual(history_page.CurrentView.diff, history.current_view);
@@ -2280,7 +2319,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                     .generation = initial.generation,
                     .request = initial.request,
                     .result = .{ .loaded = .{ .snapshot = .{ .object_format = .sha1, .head = new_head, .display = .{ .branch = try allocator.dupe(u8, "feature") } } } },
-                } } } }, &ctx);
+                } } } }, &ctx.ctx);
                 try std.testing.expect(if (success) app.screen_transition == .running else app.screen_transition == .idle);
                 // A second successful checkout followed by a failed probe keeps
                 // the immutable diff but consumes its new animation wait.
@@ -2291,7 +2330,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                     .old_branch = try allocator.dupe(u8, "feature"),
                     .new_branch = try allocator.dupe(u8, "main"),
                     .result = .ok,
-                } } }, &ctx);
+                } } }, &ctx.ctx);
                 const failed_probe = history.pending.?.catalog;
                 try std.testing.expect(app.screen_transition == .waiting);
                 try app.update(.{ .load_finished = .{ .history = .{ .catalog = .{
@@ -2300,7 +2339,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                     .generation = failed_probe.generation,
                     .request = failed_probe.request,
                     .result = .{ .failure = .git_command_failed },
-                } } } }, &ctx);
+                } } } }, &ctx.ctx);
                 try std.testing.expect(history.current_view == .diff);
                 try std.testing.expect(history.load_state == .loaded or history.load_state == .empty);
                 try std.testing.expect(app.screen_transition == .idle);
@@ -2310,7 +2349,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 try std.testing.expect(compare.refresh_generation > 10);
                 try std.testing.expect(compare.diff.reload_anchor != null);
                 const generation = compare.refresh_generation;
-                try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, 10, before, selected, patch) } } }, &ctx);
+                try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, 10, before, selected, patch) } } }, &ctx.ctx);
                 try std.testing.expectEqual(generation, compare.refresh_generation);
                 try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
                 diff.selection_owner = .{ .diff = .{
@@ -2320,11 +2359,11 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                     .focus = .{ .hunk_index = 0, .line_index = 0 },
                     .moved = true,
                 } };
-                try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, generation, before, new_head, patch) } } }, &ctx);
+                try app.update(.{ .load_finished = .{ .compare = .{ .source = try branchCompareFinished(allocator, old_identity, generation, before, new_head, patch) } } }, &ctx.ctx);
                 try std.testing.expect(compare.deferred_load_apply != null);
                 try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
                 diff.selection_owner = .none;
-                try app.update(.git_action_spinner_tick, &ctx);
+                try app.update(.git_action_spinner_tick, &ctx.ctx);
                 try std.testing.expect(if (success) app.screen_transition == .running else app.screen_transition == .idle);
                 try std.testing.expect(compare.basis.?.target.head_oid.eql(&new_head));
                 try std.testing.expectEqualStrings("refs/heads/main", compare.base_target.?.full_ref);
@@ -2358,20 +2397,17 @@ fn branchCompareFinished(
     };
 }
 
-fn drainRepositoryRemoteTasks(app: *App, ctx: *chasen.Ctx(App.Msg)) !void {
+fn drainRepositoryRemoteTasks(app: *App, ctx: *chasen.testing.TestCtx(App.Msg)) !void {
     var rounds: usize = 0;
-    while (ctx._pending_tasks_len > 0) : (rounds += 1) {
+    while (ctx.pendingTaskCount() > 0) : (rounds += 1) {
         try std.testing.expect(rounds < 32);
-        const pending = ctx.takePendingTasks();
-        const batch = try ctx.allocator().dupe(@TypeOf(pending[0]), pending);
-        defer ctx.allocator().free(batch);
-        var index: usize = 0;
-        defer for (batch[index..]) |entry| entry.discard(ctx.allocator());
-        while (index < batch.len) {
-            const entry = batch[index];
-            index += 1;
-            const msg = try entry.run(ctx.allocator(), ctx.io());
-            try app.update(msg, ctx);
+        const batch = try ctx.ctx.allocator().alloc(chasen.testing.TestTask(App.Msg), ctx.pendingTaskCount());
+        defer ctx.ctx.allocator().free(batch);
+        for (batch) |*task| task.* = ctx.takeTask(0).?;
+        defer for (batch) |*task| task.deinit();
+        for (batch) |*task| {
+            const msg = try task.run();
+            try app.update(msg, &ctx.ctx);
         }
     }
 }
@@ -2411,11 +2447,11 @@ test "Repository remote product route pushes then pulls actual Git without loadi
     };
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(fixture.repo_root);
     defer app.deinit(.{ .allocator = allocator, .io = io });
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = io };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, io);
+    defer ctx.deinit();
     app.pages.repository.activate(0, app.repo_session.view().activeIdentity().?);
-    try app.update(.reload, &ctx);
+    try app.update(.reload, &ctx.ctx);
     try drainRepositoryRemoteTasks(&app, &ctx);
     try std.testing.expect(app.pages.changes.activation.currentIdentity() == null);
     try std.testing.expect(app.pages.repository.branch.freshness == .fresh);
@@ -2429,14 +2465,14 @@ test "Repository remote product route pushes then pulls actual Git without loadi
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "P: push") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "U: pull") == null);
     }
-    try sendRepositoryRemoteKey(&app, &ctx, 'P');
+    try sendRepositoryRemoteKey(&app, &ctx.ctx, 'P');
     try std.testing.expect(app.overlay.isPushBranch());
     try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
     try std.testing.expectEqualStrings("main", app.remote_workflow.push_confirmation.?.branch);
-    try expectRemotePageSwitchBlocked(&app, &ctx);
-    try sendRepositoryRemoteKey(&app, &ctx, chasen.Key.enter);
+    try expectRemotePageSwitchBlocked(&app, &ctx.ctx);
+    try sendRepositoryRemoteKey(&app, &ctx.ctx, chasen.Key.enter);
     try std.testing.expect(actionLifecycle(&app).view().hasPending());
-    try expectRemotePageSwitchBlocked(&app, &ctx);
+    try expectRemotePageSwitchBlocked(&app, &ctx.ctx);
     try drainRepositoryRemoteTasks(&app, &ctx);
     try std.testing.expect(!actionLifecycle(&app).view().hasPending());
     try std.testing.expectEqual(page.Id.repository, app.active_page);
@@ -2463,10 +2499,10 @@ test "Repository remote product route pushes then pulls actual Git without loadi
     try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "remote update" }, peer);
     try runAppTestGit(allocator, io, &.{ "git", "push", "origin", "main" }, peer);
     try work.writeFile(io, .{ .sub_path = "local.txt", .data = "preserved local change\n" });
-    try sendRepositoryRemoteKey(&app, &ctx, 'U');
+    try sendRepositoryRemoteKey(&app, &ctx.ctx, 'U');
     try std.testing.expect(app.overlay.isPullBranch());
     try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
-    try sendRepositoryRemoteKey(&app, &ctx, chasen.Key.enter);
+    try sendRepositoryRemoteKey(&app, &ctx.ctx, chasen.Key.enter);
     try drainRepositoryRemoteTasks(&app, &ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(!app.overlay.isRemoteError());
@@ -2484,25 +2520,26 @@ test "Repository remote product route pushes then pulls actual Git without loadi
     try runAppTestGit(allocator, io, &.{ "git", "add", "README.md" }, work);
     try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "retry" }, work);
     try runAppTestGit(allocator, io, &.{ "git", "config", "remote.origin.pushurl", "../missing.git" }, work);
-    try app.update(.reload, &ctx);
+    try app.update(.reload, &ctx.ctx);
     try drainRepositoryRemoteTasks(&app, &ctx);
-    try sendRepositoryRemoteKey(&app, &ctx, 'P');
-    try sendRepositoryRemoteKey(&app, &ctx, chasen.Key.enter);
+    try sendRepositoryRemoteKey(&app, &ctx.ctx, 'P');
+    try sendRepositoryRemoteKey(&app, &ctx.ctx, chasen.Key.enter);
     try drainRepositoryRemoteTasks(&app, &ctx);
     try std.testing.expect(app.overlay.isRemoteError());
     try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try expectRemotePageSwitchBlocked(&app, &ctx);
-    try app.update(.run_interactive_push, &ctx);
+    try expectRemotePageSwitchBlocked(&app, &ctx.ctx);
+    try app.update(.run_interactive_push, &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.remote_workflow.push_retry.state.inspecting.origin.page_id);
-    const inspection = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), inspection.len);
-    try app.update(inspection[0].failed(error.ConcurrencyUnavailable, allocator), &ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var inspection = ctx.takeTask(0).?;
+    defer inspection.deinit();
+    try app.update(try inspection.fail(error.ConcurrencyUnavailable), &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.overlay.owner_page.?);
     try std.testing.expect(app.remote_workflow.push_retry.state.availableTarget() != null);
-    try app.update(.close_remote_error, &ctx);
+    try app.update(.close_remote_error, &ctx.ctx);
     try std.testing.expect(app.remote_workflow.owner == null);
-    try sendRepositoryRemoteKey(&app, &ctx, '1');
+    try sendRepositoryRemoteKey(&app, &ctx.ctx, '1');
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try drainRepositoryRemoteTasks(&app, &ctx);
     try std.testing.expect(app.pages.changes.activation.currentIdentity() != null);
@@ -2513,25 +2550,25 @@ test "remote confirmation execution cancellation and errors block both page dire
     for ([_]page.Id{ .changes, .repository }) |caller| {
         var app: App = .{ .allocator = allocator, .active_page = caller, .terminal_size = .{ .width = 120, .height = 32 } };
         defer app.deinit(.{ .allocator = allocator, .io = std.testing.io });
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-        defer ctx.runtimeClearPendingEffectCopies();
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
         app.overlay.openPushBranch(caller);
-        try expectRemotePageSwitchBlocked(&app, &ctx);
+        try expectRemotePageSwitchBlocked(&app, &ctx.ctx);
         app.overlay.close();
         const pending = beginAcceptedTestAction(&app, .pull);
-        try expectRemotePageSwitchBlocked(&app, &ctx);
-        try app.update(.cancel_remote_action, &ctx);
+        try expectRemotePageSwitchBlocked(&app, &ctx.ctx);
+        try app.update(.cancel_remote_action, &ctx.ctx);
         try std.testing.expect(actionLifecycle(&app).view().hasPending());
-        try expectRemotePageSwitchBlocked(&app, &ctx);
+        try expectRemotePageSwitchBlocked(&app, &ctx.ctx);
         _ = actionLifecycle(&app).finishExact(allocator, pending, "/repo", null);
         _ = app.remote_workflow.action_control.finish(pending.generation);
         app.remote_workflow.remote_error_operation = .pull;
         app.overlay.openRemoteError(caller);
-        try expectRemotePageSwitchBlocked(&app, &ctx);
-        try app.update(.close_remote_error, &ctx);
+        try expectRemotePageSwitchBlocked(&app, &ctx.ctx);
+        try app.update(.close_remote_error, &ctx.ctx);
         try std.testing.expect(app.remote_workflow.owner == null);
-        try sendRepositoryRemoteKey(&app, &ctx, if (caller == .changes) '2' else '1');
+        try sendRepositoryRemoteKey(&app, &ctx.ctx, if (caller == .changes) '2' else '1');
         try std.testing.expectEqual(if (caller == .changes) page.Id.repository else page.Id.changes, app.active_page);
     }
 }

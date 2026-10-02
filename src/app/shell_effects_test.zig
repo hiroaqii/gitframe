@@ -202,8 +202,10 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
     }
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var failing_ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = failing.allocator() };
-    app.shellEffects().queueClipboard(&failing_ctx, .{
+    var failing_ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+    failing_ctx.init(failing.allocator(), std.testing.io);
+    defer failing_ctx.deinit();
+    app.shellEffects().queueClipboard(&failing_ctx.ctx, .{
         .origin = origin,
         .label = "diff selection",
         .text = "selected compare",
@@ -212,17 +214,18 @@ test "Compare clipboard terminals and queue failure preserve retained selection 
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 
-    var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     for (0..4) |_| {
-        _ = try ctx.terminal().copyToClipboard(.{
+        _ = try ctx.ctx.terminal().copyToClipboard(.{
             .text = "occupied",
             .finished = ShellHarness.Msg.clipboardFinished,
         });
     }
     const clipboard_text = try app.pages.compare.diff.completed_selection.?.clipboardText(allocator);
     defer allocator.free(clipboard_text);
-    app.shellEffects().queueClipboard(&ctx, .{
+    app.shellEffects().queueClipboard(&ctx.ctx, .{
         .origin = origin,
         .label = "diff selection",
         .text = clipboard_text,
@@ -259,12 +262,13 @@ test "repository selection late clipboard completion cannot target a new page in
         } },
     };
     defer app.shell_state.clipboard_copies.deinit(std.testing.allocator);
-    var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
-    app.copySourceSelection(&ctx, "selected source");
-    app.copySourceSelection(&ctx, "selected source");
-    const inactive_request_id = ctx._pending_clipboard_copies[0].request_id;
-    const stale_request_id = ctx._pending_clipboard_copies[1].request_id;
+    var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    app.copySourceSelection(&ctx.ctx, "selected source");
+    app.copySourceSelection(&ctx.ctx, "selected source");
+    const inactive_request_id = ctx.clipboardAt(0).?.request_id;
+    const stale_request_id = ctx.clipboardAt(1).?.request_id;
     app.pages.repository.deactivate();
     app.active_page = .changes;
 
@@ -287,17 +291,18 @@ test "repository selection late clipboard completion cannot target a new page in
     app.active_page = .repository;
     app.pages.repository.active = true;
     for ([_]app_message.ClipboardCopyOutcome{ .sent, .unsupported_runtime, .{ .write_failed = "BrokenPipe" } }) |outcome| {
-        var context_ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
-        defer context_ctx.runtimeClearPendingEffectCopies();
-        app.shellEffects().queueClipboard(&context_ctx, .{
+        var context_ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        context_ctx.init(std.testing.allocator, std.testing.io);
+        defer context_ctx.deinit();
+        app.shellEffects().queueClipboard(&context_ctx.ctx, .{
             .origin = .{ .page = app.shellEffects().repositoryOrigin() },
             .label = "selection context",
             .text = "Repository: /repo\nSurface: Repository\n",
             .selection_generation = 12,
         });
-        try std.testing.expectEqual(@as(u8, 1), context_ctx._pending_clipboard_copies_len);
+        try std.testing.expectEqual(@as(usize, 1), context_ctx.pendingClipboardCopyCount());
         const completion = app.shellEffects().finishClipboard(.{
-            .request_id = context_ctx._pending_clipboard_copies[0].request_id,
+            .request_id = context_ctx.clipboardAt(0).?.request_id,
             .outcome = outcome,
         });
         if (outcome == .sent) {
@@ -395,20 +400,22 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     // Action exclusivity and target diagnostics reject before allocation.
     {
         var app: ShellHarness = .{ .env_map = &env };
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
 
         try app.shellEffects().requestEditor(
-            &ctx,
+            &ctx.ctx,
             .no_repo,
             true,
             app.shellEffects().changesOrigin(),
         );
 
         try std.testing.expectEqualStrings("finish current git action before opening editor", app.pages.changes.status.text());
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+        try std.testing.expect(!ctx.hasPendingForegroundCommands());
 
         try app.shellEffects().requestEditor(
-            &ctx,
+            &ctx.ctx,
             .no_repo,
             false,
             app.shellEffects().changesOrigin(),
@@ -419,54 +426,59 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     // Invalid and empty configured commands retain the existing diagnostics.
     {
         var app: ShellHarness = .{ .env_map = &env };
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
         app.user_config.editor.argv[0] = "nvim";
         app.user_config.editor.argv[1] = "{unknown}";
         app.user_config.editor.argv_len = 2;
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, false, app.shellEffects().changesOrigin());
         try std.testing.expectEqualStrings("editor config invalid: UnknownPlaceholder", app.pages.changes.status.text());
         try std.testing.expect(app.shell_state.editor_foreground == null);
 
         app.user_config.editor.argv[0] = "";
         app.user_config.editor.argv[1] = "{path}";
         app.user_config.editor.argv_len = 2;
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, false, app.shellEffects().changesOrigin());
         try std.testing.expectEqualStrings("editor command is empty", app.pages.changes.status.text());
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+        try std.testing.expect(!ctx.hasPendingForegroundCommands());
     }
 
     // Missing automatic candidates leave the TUI active with no queued command.
     {
         var app: ShellHarness = .{ .active_page = .repository };
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator, ._io = std.testing.io };
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().repositoryOrigin());
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, false, app.shellEffects().repositoryOrigin());
         try std.testing.expectEqualStrings(
             "no editor found in PATH (nvim, vim, vi); set VISUAL or EDITOR",
             app.pages.repository.status.text(),
         );
         try std.testing.expectEqualStrings("", app.pages.changes.status.text());
         try std.testing.expect(app.shell_state.editor_foreground == null);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+        try std.testing.expect(!ctx.hasPendingForegroundCommands());
     }
 
     // Repository uses the same queue but owns diagnostics and completion reloads.
     {
         var app: ShellHarness = .{ .active_page = .repository, .env_map = &env };
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
-        defer ctx.runtimeClearPendingEffectCopies();
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
         const origin = app.shellEffects().repositoryOrigin();
-        try app.shellEffects().requestEditor(&ctx, .directory_unsupported, false, origin);
+        try app.shellEffects().requestEditor(&ctx.ctx, .directory_unsupported, false, origin);
         try std.testing.expectEqualStrings("directories cannot be opened in editor", app.pages.repository.status.text());
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
-        try app.shellEffects().requestEditor(&ctx, ready, true, origin);
+        try std.testing.expect(!ctx.hasPendingForegroundCommands());
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, true, origin);
         try std.testing.expectEqualStrings("finish current git action before opening editor", app.pages.repository.status.text());
         app.user_config.editor.argv[0] = "nvim";
         app.user_config.editor.argv[1] = "+{line}";
         app.user_config.editor.argv[2] = "{path}";
         app.user_config.editor.argv_len = 3;
         app.pages.repository.status.clear();
-        try app.shellEffects().requestEditor(&ctx, ready, false, origin);
-        const entry = ctx._pending_foreground_commands[0];
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, false, origin);
+        const entry = ctx.foregroundAt(0).?;
         try std.testing.expectEqualStrings("+42", entry.argv[1]);
         try std.testing.expectEqualStrings("src/main.zig", entry.argv[2]);
         try std.testing.expectEqualStrings("", app.pages.repository.status.text());
@@ -482,65 +494,71 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     // Queue saturation is diagnosed without committing editor correlation.
     {
         var app: ShellHarness = .{ .env_map = &env };
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
-        defer ctx.runtimeClearPendingEffectCopies();
-        _ = try ctx.terminal().runForegroundCommand(.{
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
+        _ = try ctx.ctx.terminal().runForegroundCommand(.{
             .argv = &.{"true"},
             .cwd = .inherit,
             .environment = .inherit,
             .finished = app_message.Msg.editorFinished,
         });
 
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, false, app.shellEffects().changesOrigin());
 
         try std.testing.expectEqualStrings("editor command already queued", app.pages.changes.status.text());
         try std.testing.expect(app.shell_state.editor_foreground == null);
-        try std.testing.expectEqual(@as(u8, 1), ctx._pending_foreground_commands_len);
+        try std.testing.expect(ctx.hasPendingForegroundCommands());
     }
 
     // Allocation failure leaves both runtime queue and owner correlation empty.
     {
         var app: ShellHarness = .{ .env_map = &env };
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = failing.allocator() };
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(failing.allocator(), std.testing.io);
+        defer ctx.deinit();
 
         try std.testing.expectError(
             error.OutOfMemory,
-            app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin()),
+            app.shellEffects().requestEditor(&ctx.ctx, ready, false, app.shellEffects().changesOrigin()),
         );
         try std.testing.expect(app.shell_state.editor_foreground == null);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+        try std.testing.expect(!ctx.hasPendingForegroundCommands());
     }
     {
         var app: ShellHarness = .{ .env_map = &env };
         // The two editor.build allocations succeed; the runtime queue's first
         // argv-copy allocation fails before correlation is committed.
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = failing.allocator() };
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(failing.allocator(), std.testing.io);
+        defer ctx.deinit();
 
         try std.testing.expectError(
             error.OutOfMemory,
-            app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin()),
+            app.shellEffects().requestEditor(&ctx.ctx, ready, false, app.shellEffects().changesOrigin()),
         );
         try std.testing.expect(app.shell_state.editor_foreground == null);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+        try std.testing.expect(!ctx.hasPendingForegroundCommands());
     }
 
     // Queue success commits the exact id. A mismatch is state-preserving; the
     // exact active completion clears first and requests one Changes reload.
     {
         var app: ShellHarness = .{ .env_map = &env };
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
-        defer ctx.runtimeClearPendingEffectCopies();
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
         const origin = app.shellEffects().changesOrigin();
-        try app.shellEffects().requestEditor(&ctx, ready, false, origin);
-        const entry = ctx._pending_foreground_commands[0];
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, false, origin);
+        const entry = ctx.foregroundAt(0).?;
         const request_id = entry.request_id;
-        switch (entry.runtimeChildCwd()) {
+        switch (entry.cwd) {
             .path => |path| try std.testing.expectEqualStrings("/repo", path),
             else => return error.ExpectedEditorPathCwd,
         }
-        try std.testing.expect(entry.runtimeChildEnvironment() == null);
+        try std.testing.expect(entry.environment == .inherit);
 
         try std.testing.expectEqualStrings("", app.pages.changes.status.text());
         try std.testing.expectEqual(request_id.id, app.shell_state.editor_foreground.?.request_id.id);
@@ -638,13 +656,15 @@ test "openSelectedFileInEditor blocks while git action is pending" {
     }
     {
         var app: ShellHarness = .{ .env_map = &env };
-        var ctx: chasen.Ctx(ShellHarness.Msg) = .{ ._allocator = std.testing.allocator };
-        ctx.quit();
+        var ctx: chasen.testing.TestCtx(ShellHarness.Msg) = undefined;
+        ctx.init(std.testing.allocator, std.testing.io);
+        defer ctx.deinit();
+        ctx.ctx.quit();
         app.pages.changes.status.set("closing", .{});
-        try app.shellEffects().requestEditor(&ctx, ready, false, app.shellEffects().changesOrigin());
+        try app.shellEffects().requestEditor(&ctx.ctx, ready, false, app.shellEffects().changesOrigin());
         try std.testing.expectEqualStrings("closing", app.pages.changes.status.text());
         try std.testing.expect(app.shell_state.editor_foreground == null);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_foreground_commands_len);
+        try std.testing.expect(!ctx.hasPendingForegroundCommands());
     }
 
     // Owner teardown releases the clipboard map and clears editor identity.

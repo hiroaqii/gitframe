@@ -257,7 +257,9 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
 
     const body = shellLayout(&app).bodySize();
     const last_row = body.height - 1;
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
 
     try app.update(.{ .mouse_selection_drag = .{
@@ -266,7 +268,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
     try std.testing.expect(app.pages.changes.selection_owner.activeDiff().?.moved);
-    const first_generation = switch (tc.ctx._pending_everys[0].msg) {
+    const first_generation = switch (tc.everyAt(0).?.msg) {
         .drag_auto_scroll_tick => |generation| generation,
         else => return error.ExpectedDragAutoScrollTimer,
     };
@@ -290,7 +292,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
-    const second_generation = switch (tc.ctx._pending_everys[0].msg) {
+    const second_generation = switch (tc.everyAt(0).?.msg) {
         .drag_auto_scroll_tick => |generation| generation,
         else => return error.ExpectedDragAutoScrollTimer,
     };
@@ -325,7 +327,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
-    const third_generation = switch (tc.ctx._pending_everys[0].msg) {
+    const third_generation = switch (tc.everyAt(0).?.msg) {
         .drag_auto_scroll_tick => |generation| generation,
         else => return error.ExpectedDragAutoScrollTimer,
     };
@@ -362,8 +364,8 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     try std.testing.expect(app.pages.changes.completed_selection != null);
     app.pages.changes.viewer.diff_cursor = .{ .hunk_header = 1 };
     try app.update(.{ .changes = .{ .selection_action = .copy } }, &tc.ctx);
-    try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n four\n late one\n", tc.ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingClipboardCopyCount());
+    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n four\n late one\n", tc.clipboardAt(0).?.text);
 
     const retained_token = app.pages.changes.completed_selection.?.token;
     const retained_generation = app.pages.changes.selection_generation;
@@ -375,9 +377,9 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
         return error.ExpectedChangesKeyboardHunkCopy;
     try std.testing.expectEqual(App.Msg{ .changes = .copy_current_hunk }, keyboard_hunk);
     try app.update(keyboard_hunk, &tc.ctx);
-    try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingClipboardCopyCount());
     try std.testing.expectEqual(copies_before_keyboard_hunk + 1, app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings(hunk_text, tc.ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqualStrings(hunk_text, tc.clipboardAt(0).?.text);
     try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
     try std.testing.expectEqual(retained_generation, app.pages.changes.selection_generation);
 
@@ -393,9 +395,9 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
         else => return error.ExpectedChangesMouseHunkCopy,
     }
     try app.update(mouse_hunk, &tc.ctx);
-    try std.testing.expectEqual(@as(u8, 1), tc.ctx._pending_clipboard_copies_len);
+    try std.testing.expectEqual(@as(usize, 1), tc.pendingClipboardCopyCount());
     try std.testing.expectEqual(copies_before_mouse_hunk + 1, app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings(hunk_text, tc.ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqualStrings(hunk_text, tc.clipboardAt(0).?.text);
     try std.testing.expect(app.pages.changes.completed_selection.?.token.eql(retained_token));
     try std.testing.expectEqual(retained_generation, app.pages.changes.selection_generation);
 
@@ -438,7 +440,9 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
         } },
     };
     defer changesReload(&app).clearLoadedDiff(allocator);
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
     const ids = [_][]const u8{ "full-0", "full-1", "full-2", "full-3", "full-4", "full-5", "full-6", "full-7" };
     for (ids) |id| try tc.ctx.timer().every(id, 1, .git_action_spinner_tick);
@@ -562,7 +566,9 @@ test "terminal resize clears diff selections before an effective-mode geometry c
         .intent = .{ .direction = .down, .endpoint = .{ .col = 20, .row = 10 } },
     };
     app.drag_auto_scroll.scheduled_generation = 9;
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
 
     const changes_token = app.pages.changes.completed_selection.?.token;
@@ -633,7 +639,9 @@ test "terminal resize preserves semantic keyboard line selection while focus los
     selection.updateKeyboardLine(.{ .hunk_index = 0, .line_index = 1 }, 2);
     app.pages.changes.selection_owner = .{ .diff = selection };
     app.pages.compare.diff.selection_owner = .{ .diff = selection };
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
 
     const content = app_shell_layout.contentRect(app.terminal_size);
@@ -717,8 +725,9 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     defer app.pages.compare.deinit(allocator);
     defer app.shell_effects_state.deinit(allocator);
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     app.pages.compare.diff.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "a" } },
@@ -731,7 +740,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try app.update(.{ .mouse_selection_drag = .{
         .pointer = .{ .col = 20, .row = last_row },
         .target = .{ .compare = .{ .col = 20, .row = last_row } },
-    } }, &ctx);
+    } }, &ctx.ctx);
     const auto_scroll_generation = app.drag_auto_scroll.active.?.generation;
     try std.testing.expectEqual(auto_scroll_generation, app.drag_auto_scroll.scheduled_generation.?);
 
@@ -739,7 +748,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     var crossed_presentation_only_row = false;
     while (app.pages.compare.diff.selection_owner.activeDiff().?.focus.hunk_index == 0 and repeated_ticks < 8) {
         const focus_before = app.pages.compare.diff.selection_owner.activeDiff().?.focus;
-        try app.update(.{ .drag_auto_scroll_tick = auto_scroll_generation }, &ctx);
+        try app.update(.{ .drag_auto_scroll_tick = auto_scroll_generation }, &ctx.ctx);
         const focus_after = app.pages.compare.diff.selection_owner.activeDiff().?.focus;
         crossed_presentation_only_row = crossed_presentation_only_row or std.meta.eql(focus_before, focus_after);
         repeated_ticks += 1;
@@ -754,14 +763,14 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try app.update(.{ .mouse_selection_release = .{
         .pointer = .{ .col = 20, .row = last_row },
         .target = .{ .compare = .{ .col = 20, .row = last_row } },
-    } }, &ctx);
+    } }, &ctx.ctx);
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.pages.compare.diff.completed_selection != null);
-    try app.update(.{ .compare = .{ .common = .{ .shared = .{ .selection_action = .copy } } } }, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try app.update(.{ .compare = .{ .common = .{ .shared = .{ .selection_action = .copy } } } }, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
     try std.testing.expectEqualStrings(
         "one\ntwo\nold\nfour\nlate one\n",
-        ctx._pending_clipboard_copies[0].text,
+        ctx.clipboardAt(0).?.text,
     );
     const context_key = app.handleEvent(.{ .key_press = .{ .codepoint = 'Y' } }) orelse
         return error.ExpectedCompareContextKey;
@@ -774,7 +783,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try std.testing.expect(context_click == .compare and context_click.compare == .common and
         context_click.compare.common == .shared and context_click.compare.common.shared == .mouse_diff_press);
 
-    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx.ctx);
     app.pages.compare.diff.viewer.display_mode = .unified;
     try installRootCompareSelection(&app, allocator);
     const retained_token = app.pages.compare.diff.completed_selection.?.token;
@@ -786,13 +795,13 @@ test "Compare retained actions route keyboard and mouse through App after narrow
         App.Msg{ .compare = .{ .common = .{ .shared = .{ .selection_action = .copy } } } },
         keyboard_copy,
     );
-    try app.update(keyboard_copy, &ctx);
+    try app.update(keyboard_copy, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 2), app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", ctx._pending_clipboard_copies[1].text);
+    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", ctx.clipboardAt(1).?.text);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 
-    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx.ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
     try std.testing.expect(app.pages.compare.diff.retainedSelectionAdmitted(app.pages.compare.currentTarget()));
@@ -806,9 +815,9 @@ test "Compare retained actions route keyboard and mouse through App after narrow
         } } } } },
         mouse_copy,
     );
-    try app.update(mouse_copy, &ctx);
+    try app.update(mouse_copy, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 3), app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", ctx._pending_clipboard_copies[2].text);
+    try std.testing.expectEqualStrings(" one\n two\n-old\n+new\n", ctx.clipboardAt(2).?.text);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 
@@ -817,18 +826,18 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     const keyboard_hunk = app.handleEvent(.{ .key_press = .{ .codepoint = 'Y' } }) orelse
         return error.ExpectedCompareKeyboardHunkCopy;
     try std.testing.expectEqual(App.Msg{ .compare = .{ .common = .copy_current_hunk } }, keyboard_hunk);
-    try app.update(keyboard_hunk, &ctx);
+    try app.update(keyboard_hunk, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 4), app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqualStrings(hunk_text, ctx._pending_clipboard_copies[3].text);
+    try std.testing.expectEqualStrings(hunk_text, ctx.clipboardAt(3).?.text);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
     try std.testing.expectEqual(retained_generation, app.pages.compare.diff.selection_generation);
 
-    const older_request_id = ctx._pending_clipboard_copies[0].request_id;
-    const replacement_failure_request_id = ctx._pending_clipboard_copies[1].request_id;
-    const current_selection_request_id = ctx._pending_clipboard_copies[2].request_id;
-    const keyboard_hunk_request_id = ctx._pending_clipboard_copies[3].request_id;
-    ctx.runtimeClearPendingEffectCopies();
+    const older_request_id = ctx.clipboardAt(0).?.request_id;
+    const replacement_failure_request_id = ctx.clipboardAt(1).?.request_id;
+    const current_selection_request_id = ctx.clipboardAt(2).?.request_id;
+    const keyboard_hunk_request_id = ctx.clipboardAt(3).?.request_id;
+    ctx.discardPendingEffects();
 
     const mouse_hunk = app.handleEvent(try compareActionMouseEvent(&app, .copy_hunk)) orelse
         return error.ExpectedCompareMouseHunkCopy;
@@ -845,19 +854,19 @@ test "Compare retained actions route keyboard and mouse through App after narrow
         },
         else => return error.ExpectedCompareMouseHunkCopy,
     }
-    try app.update(mouse_hunk, &ctx);
+    try app.update(mouse_hunk, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 5), app.shell_effects_state.clipboard_copies.count());
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-    try std.testing.expectEqualStrings(hunk_text, ctx._pending_clipboard_copies[0].text);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+    try std.testing.expectEqualStrings(hunk_text, ctx.clipboardAt(0).?.text);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
     try std.testing.expectEqual(retained_generation, app.pages.compare.diff.selection_generation);
-    const mouse_hunk_request_id = ctx._pending_clipboard_copies[0].request_id;
+    const mouse_hunk_request_id = ctx.clipboardAt(0).?.request_id;
     inline for (.{ keyboard_hunk_request_id, mouse_hunk_request_id }) |request_id| {
         try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
             .request_id = request_id,
             .outcome = .sent,
-        } } }, &ctx);
+        } } }, &ctx.ctx);
     }
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
@@ -866,7 +875,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
         .request_id = older_request_id,
         .outcome = .sent,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(retained_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis.?.eql(retained_pin));
 
@@ -876,7 +885,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
         .request_id = current_selection_request_id,
         .outcome = .sent,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection == null);
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis == null);
     try installRootCompareSelection(&app, allocator);
@@ -884,7 +893,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
         .request_id = replacement_failure_request_id,
         .outcome = .unsupported_runtime,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection.?.token.eql(replacement_token));
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis != null);
 
@@ -899,7 +908,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
         App.Msg{ .compare = .{ .common = .{ .shared = .{ .selection_action = .clear } } } },
         keyboard_clear,
     );
-    try app.update(keyboard_clear, &ctx);
+    try app.update(keyboard_clear, &ctx.ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection == null);
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis == null);
     var after_keyboard_view = compareNavigation(&app).view();
@@ -917,7 +926,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
         return error.ExpectedMouseClearAnchor;
     const mouse_clear = app.handleEvent(try compareActionMouseEvent(&app, .clear)) orelse
         return error.ExpectedCompareMouseClear;
-    try app.update(mouse_clear, &ctx);
+    try app.update(mouse_clear, &ctx.ctx);
     try std.testing.expect(app.pages.compare.diff.completed_selection == null);
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis == null);
     var after_mouse_view = compareNavigation(&app).view();
@@ -1006,8 +1015,9 @@ test "History accepted diff runs one root interaction and transition sequence" {
     defer app.pages.history.deinit(allocator);
     defer app.shell_effects_state.deinit(allocator);
     _ = app.pages.history.activation.activate(0, .immutable, .unavailable, .unavailable);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     // Diff text input retains priority over root page shortcuts.
     app.pages.history.diff.search.mode = true;
@@ -1017,14 +1027,14 @@ test "History accepted diff runs one root interaction and transition sequence" {
         App.Msg{ .history = .{ .common = .{ .shared = .{ .search_insert = '4' } } } },
         search_key,
     );
-    try app.update(search_key, &ctx);
+    try app.update(search_key, &ctx.ctx);
     const search_paste = app.handleEvent(.{ .paste = "needle" }) orelse
         return error.ExpectedHistorySearchPaste;
-    try app.update(search_paste, &ctx);
+    try app.update(search_paste, &ctx.ctx);
     try std.testing.expectEqualStrings("4needle", app.pages.history.diff.search.input.slice());
     const cancel_search = app.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.escape } }) orelse
         return error.ExpectedHistorySearchCancel;
-    try app.update(cancel_search, &ctx);
+    try app.update(cancel_search, &ctx.ctx);
     try std.testing.expect(!app.pages.history.diff.search.mode);
 
     // History owns and suppresses reviewed actions at its adapter boundary for
@@ -1032,7 +1042,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     for ([_]chasen.Key{ .{ .codepoint = 'v' }, .{ .codepoint = 'H' } }) |key| {
         const msg = app.handleEvent(.{ .key_press = key }) orelse return error.ExpectedHistoryOwnedNoop;
         try std.testing.expectEqual(App.Msg{ .history = .owned_noop }, msg);
-        try app.update(msg, &ctx);
+        try app.update(msg, &ctx.ctx);
     }
     var configured: keymap.Config = .{};
     configured.set(.mark_reviewed, .{ .plain_codepoint = 'x' });
@@ -1041,7 +1051,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     for ([_]chasen.Key{ .{ .codepoint = 'x' }, .{ .codepoint = 'z' } }) |key| {
         const msg = app.handleEvent(.{ .key_press = key }) orelse return error.ExpectedHistoryOwnedNoop;
         try std.testing.expectEqual(App.Msg{ .history = .owned_noop }, msg);
-        try app.update(msg, &ctx);
+        try app.update(msg, &ctx.ctx);
     }
     app.keymap = .{};
     const accepted_loaded = switch (app.pages.history.diff.load.state) {
@@ -1064,7 +1074,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
         App.Msg{ .history = .{ .common = .{ .shared = .{ .sidebar_click_node = 0 } } } },
         sidebar_click,
     );
-    try app.update(sidebar_click, &ctx);
+    try app.update(sidebar_click, &ctx.ctx);
 
     accepted_loaded.toggleHunkFold(0, 0);
     app.pages.history.diff.viewer.display_mode = .side_by_side;
@@ -1075,7 +1085,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     try std.testing.expect(file_tree.isCollapsed(&accepted_loaded.collapsed_dirs, "src"));
     try std.testing.expect(accepted_loaded.isHunkFolded(0, 0));
 
-    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 24 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 24 } }, &ctx.ctx);
     try std.testing.expectEqual(chasen.Size{ .width = 80, .height = 24 }, app.terminal_size);
     try std.testing.expectEqual(retained_target, app.pages.history.diff.viewer.selected_target);
     try std.testing.expectEqual(retained_node, app.pages.history.diff.viewer.selected_node);
@@ -1088,7 +1098,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.scroll);
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll);
 
-    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx.ctx);
     try std.testing.expectEqual(chasen.Size{ .width = 120, .height = 32 }, app.terminal_size);
     try std.testing.expectEqual(retained_target, app.pages.history.diff.viewer.selected_target);
     try std.testing.expectEqual(retained_node, app.pages.history.diff.viewer.selected_node);
@@ -1101,7 +1111,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.scroll);
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll);
     accepted_loaded.toggleHunkFold(0, 0);
-    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 12 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 12 } }, &ctx.ctx);
     layout = shellLayout(&app);
 
     const sidebar_width = sidebarWidth(layout.content.width, null);
@@ -1141,12 +1151,12 @@ test "History accepted diff runs one root interaction and transition sequence" {
         },
         else => return error.ExpectedHistoryDrag,
     }
-    try app.update(drag, &ctx);
+    try app.update(drag, &ctx.ctx);
     const auto_scroll_generation = app.drag_auto_scroll.active.?.generation;
     try std.testing.expectEqual(auto_scroll_generation, app.drag_auto_scroll.scheduled_generation.?);
     var ticks: usize = 0;
     while (app.pages.history.diff.selection_owner.activeDiff().?.focus.hunk_index == 0 and ticks < 32) : (ticks += 1) {
-        try app.update(.{ .drag_auto_scroll_tick = auto_scroll_generation }, &ctx);
+        try app.update(.{ .drag_auto_scroll_tick = auto_scroll_generation }, &ctx.ctx);
     }
     try std.testing.expect(ticks >= 1);
     try std.testing.expectEqual(
@@ -1156,7 +1166,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
 
     // The transition snapshot comes from the live History owner, not a hand-
     // written policy value.
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.history, app.active_page);
     try std.testing.expectEqualStrings(
         "finish History mouse selection before switching pages",
@@ -1176,7 +1186,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
         },
         else => return error.ExpectedHistoryRelease,
     }
-    try app.update(release, &ctx);
+    try app.update(release, &ctx.ctx);
     try std.testing.expect(app.pages.history.diff.completed_selection != null);
     try std.testing.expect(app.pages.history.diff.pinned_selection_basis != null);
 
@@ -1186,22 +1196,22 @@ test "History accepted diff runs one root interaction and transition sequence" {
         App.Msg{ .history = .{ .common = .{ .shared = .{ .selection_action = .copy } } } },
         copy,
     );
-    try app.update(copy, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try app.update(copy, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
-        .request_id = ctx._pending_clipboard_copies[0].request_id,
+        .request_id = ctx.clipboardAt(0).?.request_id,
         .outcome = .sent,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expect(app.pages.history.diff.completed_selection == null);
     try std.testing.expect(app.pages.history.diff.pinned_selection_basis == null);
 
     app.pages.history.diff.search.mode = true;
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.history, app.active_page);
     try std.testing.expectEqualStrings("finish History search before switching pages", app.status.text());
     app.pages.history.diff.search.mode = false;
     app.pages.history.diff.file_search.mode = true;
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.history, app.active_page);
     try std.testing.expectEqualStrings("finish History file search before switching pages", app.status.text());
     app.pages.history.diff.file_search.mode = false;
@@ -1218,7 +1228,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
         .generation = 9,
         .request = .{ .initial = .reset },
     } };
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
 
     app.active_page = .history;
@@ -1231,7 +1241,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
         .generation = 10,
         .request = request,
     } };
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
 }
 
@@ -1282,8 +1292,9 @@ test "History picker replaces preview immediately and fences detail clipboard co
     app.pages.history.preview_state.payload_allocator = allocator;
     app.pages.history.preview_state.phase = .resolved;
 
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     const layout = shellLayout(&app);
     const picker = @import("../pages/history/view.zig").pickerLayout(layout.bodySize(), app.pages.history.interaction_state);
     const detail_wheel = app.handleEvent(app_test_support.mouseEvent(
@@ -1292,7 +1303,7 @@ test "History picker replaces preview immediately and fences detail clipboard co
         .wheel_down,
     )).?;
     try std.testing.expectEqual(App.Msg{ .history = .{ .move_detail = .row_next } }, detail_wheel);
-    try app.update(detail_wheel, &ctx);
+    try app.update(detail_wheel, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.cursor);
     try std.testing.expect(app.pages.history.preview_state.phase == .resolved);
     try std.testing.expect(app.pages.history.preview_state.accepted != null);
@@ -1304,47 +1315,46 @@ test "History picker replaces preview immediately and fences detail clipboard co
         .wheel_down,
     )).?;
     try std.testing.expectEqual(App.Msg{ .history = .move_next }, history_wheel);
-    try app.update(history_wheel, &ctx);
+    try app.update(history_wheel, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 1), app.pages.history.catalog.cursor);
     try std.testing.expectEqual(@import("../pages/history/interaction.zig").Focus.commit_detail, app.pages.history.interaction_state.focus);
     try std.testing.expect(app.pages.history.preview_state.phase == .loading);
     try std.testing.expect(app.pages.history.preview_state.accepted == null);
     try std.testing.expect(app.pages.history.preview_state.current_key.?.identity.selection == .single);
-    const tasks = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), tasks.len);
-    tasks[0].discard(allocator);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    ctx.discardPendingTasks();
 
-    try app.update(.{ .history = .copy_detail }, &ctx);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_clipboard_copies_len);
+    try app.update(.{ .history = .copy_detail }, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingClipboardCopyCount());
     try std.testing.expectEqualStrings("History commit detail is not ready", app.pages.history.status.text());
 
-    try app.update(.{ .history = .move_previous }, &ctx);
+    try app.update(.{ .history = .move_previous }, &ctx.ctx);
     try std.testing.expect(app.pages.history.preview_state.phase == .loading);
     try std.testing.expect(app.pages.history.preview_state.current_key.?.identity.selection == .range);
-    try app.update(.{ .history = .copy_detail }, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
+    try app.update(.{ .history = .copy_detail }, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
     try std.testing.expect(std.mem.indexOf(
         u8,
-        ctx._pending_clipboard_copies[0].text,
+        ctx.clipboardAt(0).?.text,
         "Count: 2",
     ) != null);
-    const stale_request_id = ctx._pending_clipboard_copies[0].request_id;
+    const stale_request_id = ctx.clipboardAt(0).?.request_id;
 
-    try app.update(.{ .history = .move_next }, &ctx);
+    try app.update(.{ .history = .move_next }, &ctx.ctx);
     app.pages.history.status.set("selection moved", .{});
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
         .request_id = stale_request_id,
         .outcome = .sent,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expectEqualStrings("selection moved", app.pages.history.status.text());
 
-    try app.update(.{ .history = .move_previous }, &ctx);
-    try app.update(.{ .history = .copy_detail }, &ctx);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_clipboard_copies_len);
+    try app.update(.{ .history = .move_previous }, &ctx.ctx);
+    try app.update(.{ .history = .copy_detail }, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingClipboardCopyCount());
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
-        .request_id = ctx._pending_clipboard_copies[1].request_id,
+        .request_id = ctx.clipboardAt(1).?.request_id,
         .outcome = .sent,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expectEqualStrings(
         "clipboard copy sent: History range summary",
         app.pages.history.status.text(),
@@ -1557,31 +1567,32 @@ test "wheel redraw reaches root for meaningful sidebar transition complete noop 
         } },
         .terminal_size = .{ .width = 100, .height = 20 },
     };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqual(changes_page.Focus.sidebar, app.pages.changes.viewer.focus);
     try std.testing.expectEqual(diff_selection.Owner.none, app.pages.changes.selection_owner);
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
     app.pages.changes.status.set("prior diagnostic", .{});
-    ctx.resetRedrawSuppressed();
-    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqualStrings("", app.pages.changes.status.text());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_up }, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.{ .changes = .mouse_sidebar_wheel_down }, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.{ .changes = .mouse_sidebar_wheel_down }, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
 }
 
@@ -1603,16 +1614,17 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
         } },
         .terminal_size = .{ .width = 80, .height = 12 },
     };
-    var vertical_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer vertical_ctx.runtimeClearPendingEffectCopies();
+    var vertical_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    vertical_ctx.init(std.testing.allocator, std.testing.io);
+    defer vertical_ctx.deinit();
     vertical.pages.changes.viewer.diff_cursor = changesNavigation(&vertical).view().selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCursorOffset;
     const vertical_owner = vertical.pages.changes.selection_owner;
     const vertical_scroll_before = vertical.pages.changes.viewer.diff_scroll;
     const vertical_cursor_before = changesNavigation(&vertical).view().selectedDiffCursorOffset();
-    vertical_ctx.resetRedrawSuppressed();
-    try vertical.update(.{ .changes = .mouse_diff_wheel_down }, &vertical_ctx);
-    try std.testing.expect(!vertical_ctx.redrawWasSuppressed());
+    vertical_ctx.resetTransient();
+    try vertical.update(.{ .changes = .mouse_diff_wheel_down }, &vertical_ctx.ctx);
+    try std.testing.expect(!vertical_ctx.redrawSuppressed());
     try std.testing.expect(
         vertical.pages.changes.viewer.diff_scroll != vertical_scroll_before or
             changesNavigation(&vertical).view().selectedDiffCursorOffset() != vertical_cursor_before,
@@ -1623,9 +1635,9 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
 
     var reached_vertical_noop = false;
     for (0..128) |_| {
-        vertical_ctx.resetRedrawSuppressed();
-        try vertical.update(.{ .changes = .mouse_diff_wheel_down }, &vertical_ctx);
-        if (vertical_ctx.redrawWasSuppressed()) {
+        vertical_ctx.resetTransient();
+        try vertical.update(.{ .changes = .mouse_diff_wheel_down }, &vertical_ctx.ctx);
+        if (vertical_ctx.redrawSuppressed()) {
             reached_vertical_noop = true;
             break;
         }
@@ -1636,9 +1648,9 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
     const vertical_edge_scroll = vertical.pages.changes.viewer.diff_scroll;
     try std.testing.expect(vertical_edge > 1);
     try std.testing.expectEqualDeep(vertical_owner, vertical.pages.changes.selection_owner);
-    vertical_ctx.resetRedrawSuppressed();
-    try vertical.update(.{ .changes = .mouse_diff_wheel_up }, &vertical_ctx);
-    try std.testing.expect(!vertical_ctx.redrawWasSuppressed());
+    vertical_ctx.resetTransient();
+    try vertical.update(.{ .changes = .mouse_diff_wheel_up }, &vertical_ctx.ctx);
+    try std.testing.expect(!vertical_ctx.redrawSuppressed());
     try std.testing.expect(
         vertical.pages.changes.viewer.diff_scroll != vertical_edge_scroll or
             changesNavigation(&vertical).view().selectedDiffCursorOffset().? != vertical_edge,
@@ -1654,14 +1666,15 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
         } },
         .terminal_size = .{ .width = 40, .height = 12 },
     };
-    var horizontal_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer horizontal_ctx.runtimeClearPendingEffectCopies();
+    var horizontal_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    horizontal_ctx.init(std.testing.allocator, std.testing.io);
+    defer horizontal_ctx.deinit();
     var meaningful_horizontal = false;
     var reached_horizontal_noop = false;
     for (0..256) |_| {
-        horizontal_ctx.resetRedrawSuppressed();
-        try horizontal.update(.{ .changes = .mouse_diff_wheel_right }, &horizontal_ctx);
-        if (horizontal_ctx.redrawWasSuppressed()) {
+        horizontal_ctx.resetTransient();
+        try horizontal.update(.{ .changes = .mouse_diff_wheel_right }, &horizontal_ctx.ctx);
+        if (horizontal_ctx.redrawSuppressed()) {
             reached_horizontal_noop = true;
             break;
         }
@@ -1669,9 +1682,9 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
     }
     try std.testing.expect(meaningful_horizontal);
     try std.testing.expect(reached_horizontal_noop);
-    horizontal_ctx.resetRedrawSuppressed();
-    try horizontal.update(.{ .changes = .mouse_diff_wheel_left }, &horizontal_ctx);
-    try std.testing.expect(!horizontal_ctx.redrawWasSuppressed());
+    horizontal_ctx.resetTransient();
+    try horizontal.update(.{ .changes = .mouse_diff_wheel_left }, &horizontal_ctx.ctx);
+    try std.testing.expect(!horizontal_ctx.redrawSuppressed());
 }
 
 test "Compare wheel redraw reaches root for meaningful complete noop and reverse" {
@@ -1687,8 +1700,9 @@ test "Compare wheel redraw reaches root for meaningful complete noop and reverse
     };
     defer app.pages.compare.deinit(allocator);
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const view = compareNavigation(&app).view();
     var resolver = view.resolver();
@@ -1696,15 +1710,15 @@ test "Compare wheel redraw reaches root for meaningful complete noop and reverse
     app.pages.compare.diff.viewer.diff_cursor = body.selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCursorOffset;
     const first_cursor = body.selectedDiffCursorOffset();
-    try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_down } } }, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_down } } }, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(body.selectedDiffCursorOffset() != first_cursor);
 
     var reached_noop = false;
     for (0..128) |_| {
-        ctx.resetRedrawSuppressed();
-        try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_down } } }, &ctx);
-        if (ctx.redrawWasSuppressed()) {
+        ctx.resetTransient();
+        try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_down } } }, &ctx.ctx);
+        if (ctx.redrawSuppressed()) {
             reached_noop = true;
             break;
         }
@@ -1713,9 +1727,9 @@ test "Compare wheel redraw reaches root for meaningful complete noop and reverse
     const edge_cursor = body.selectedDiffCursorOffset();
     const edge_scroll = app.pages.compare.diff.viewer.diff_scroll;
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_up } } }, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_up } } }, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(
         app.pages.compare.diff.viewer.diff_scroll != edge_scroll or
             body.selectedDiffCursorOffset() != edge_cursor,
@@ -1749,25 +1763,27 @@ test "help overlay wheel redraw changes once skips at edge and reverses" {
         .overlay = .{ .kind = .help },
     };
 
-    var ctx: chasen.Ctx(App.Msg) = .{};
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
     const max_scroll = app_view.helpMaxScroll(layoutSize(&app), .{ .page = app.active_page, .keymap = app.keymap });
     try std.testing.expect(max_scroll > 0);
     app.overlay.help_scroll = max_scroll - 1;
     const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedHelpWheelMessage;
     try std.testing.expectEqual(App.Msg.help_scroll_down, msg);
-    try app.update(msg, &ctx);
+    try app.update(msg, &ctx.ctx);
     try std.testing.expectEqual(max_scroll, app.overlay.help_scroll);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(!ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(msg, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(msg, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.help_scroll_up, &ctx);
+    ctx.resetTransient();
+    try app.update(.help_scroll_up, &ctx.ctx);
     try std.testing.expectEqual(max_scroll - 1, app.overlay.help_scroll);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(!ctx.redrawSuppressed());
 
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
@@ -1789,25 +1805,27 @@ test "remote error overlay wheel redraw changes once skips at edge and reverses"
     defer app.remote_workflow.deinit(std.testing.allocator);
     app.overlay.openRemoteError(.changes);
 
-    var ctx: chasen.Ctx(App.Msg) = .{};
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
     const max_scroll = app_view.remoteErrorMaxScroll(layoutSize(&app), app.remote_workflow.remote_error_message, app.remote_workflow.remote_error_operation);
     try std.testing.expect(max_scroll > 0);
     app.overlay.remote_error_scroll = max_scroll - 1;
     const content = app_shell_layout.contentRect(app.terminal_size);
     const msg = app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .wheel_down)) orelse return error.ExpectedRemoteErrorWheelMessage;
     try std.testing.expectEqual(App.Msg.remote_error_scroll_down, msg);
-    try app.update(msg, &ctx);
+    try app.update(msg, &ctx.ctx);
     try std.testing.expectEqual(max_scroll, app.overlay.remote_error_scroll);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(!ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(msg, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(msg, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.remote_error_scroll_up, &ctx);
+    ctx.resetTransient();
+    try app.update(.remote_error_scroll_up, &ctx.ctx);
     try std.testing.expectEqual(max_scroll - 1, app.overlay.remote_error_scroll);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(!ctx.redrawSuppressed());
 
     try std.testing.expect(app.handleEvent(app_test_support.mouseEvent(content.col + 1, content.row + 2, .left)) == null);
 }
@@ -1896,17 +1914,18 @@ test "footer status click copies full page diagnostic across shared screens" {
         };
         page_status.set("{s}", .{status_text});
 
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer ctx.runtimeClearPendingEffectCopies();
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
         const msg = footerStatusPress(&app) orelse return error.ExpectedFooterStatusCopy;
         switch (msg) {
             .copy_footer_status => {},
             else => return error.ExpectedFooterStatusCopy,
         }
-        try app.update(msg, &ctx);
+        try app.update(msg, &ctx.ctx);
 
-        try std.testing.expectEqual(@as(u8, 1), ctx._pending_clipboard_copies_len);
-        const entry = ctx._pending_clipboard_copies[0];
+        try std.testing.expectEqual(@as(usize, 1), ctx.pendingClipboardCopyCount());
+        const entry = ctx.clipboardAt(0).?;
         try std.testing.expectEqualStrings(status_text, entry.text);
         try std.testing.expectEqualStrings("", page_status.text());
         try std.testing.expectEqual(@as(usize, 1), app.shell_effects_state.clipboard_copies.count());
@@ -1917,7 +1936,7 @@ test "footer status click copies full page diagnostic across shared screens" {
         try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
             .request_id = entry.request_id,
             .outcome = .sent,
-        } } }, &ctx);
+        } } }, &ctx.ctx);
         try std.testing.expectEqualStrings("clipboard copy sent: status message", page_status.text());
         try std.testing.expectEqual(@as(usize, 0), app.shell_effects_state.clipboard_copies.count());
     }
@@ -1931,13 +1950,14 @@ test "footer status click copies shell priority before revealing page completion
     defer app.shell_effects_state.deinit(allocator);
     app.pages.changes.status.set("page diagnostic", .{});
     app.status.set("shell notification", .{});
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const msg = footerStatusPress(&app) orelse return error.ExpectedFooterStatusCopy;
-    try app.update(msg, &ctx);
+    try app.update(msg, &ctx.ctx);
 
-    const entry = ctx._pending_clipboard_copies[0];
+    const entry = ctx.clipboardAt(0).?;
     try std.testing.expectEqualStrings("shell notification", entry.text);
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expectEqualStrings("page diagnostic", app.pages.changes.status.text());
@@ -1945,7 +1965,7 @@ test "footer status click copies shell priority before revealing page completion
     try app.update(.{ .shell_effect_finished = .{ .clipboard = .{
         .request_id = entry.request_id,
         .outcome = .unsupported_runtime,
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expectEqualStrings(
         "clipboard copy unavailable: status message",
         app.pages.changes.status.text(),
@@ -2044,16 +2064,18 @@ test "repo picker filter overflow reports status for insert and paste" {
             },
         },
     };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
     @memset(&app.repo_session.repo_picker.list.input.buffer, 'x');
     app.repo_session.repo_picker.list.input.len = app.repo_session.repo_picker.list.input.buffer.len;
     app.repo_session.repo_picker.list.input.cursor = app.repo_session.repo_picker.list.input.buffer.len;
 
-    try app.update(.{ .repo_picker_insert = 'y' }, &ctx);
+    try app.update(.{ .repo_picker_insert = 'y' }, &ctx.ctx);
     try std.testing.expectEqualStrings("repository filter is too long", app.status.text());
 
     app.status.clear();
-    try app.update(.{ .repo_picker_paste = "y" }, &ctx);
+    try app.update(.{ .repo_picker_paste = "y" }, &ctx.ctx);
     try std.testing.expectEqualStrings("repository filter is too long", app.status.text());
 }
 
@@ -2093,13 +2115,17 @@ test "page bar rule is dead chrome in normal and compact layouts" {
 test "direct nested Changes message uses the same update owner as keyboard input" {
     var direct: App = .{ .allocator = std.testing.allocator };
     var keyboard: App = .{ .allocator = std.testing.allocator };
-    var direct_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    var keyboard_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var direct_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    direct_ctx.init(std.testing.allocator, std.testing.io);
+    defer direct_ctx.deinit();
+    var keyboard_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    keyboard_ctx.init(std.testing.allocator, std.testing.io);
+    defer keyboard_ctx.deinit();
 
-    try direct.update(.{ .changes = .toggle_focus }, &direct_ctx);
+    try direct.update(.{ .changes = .toggle_focus }, &direct_ctx.ctx);
     const keyboard_msg = keyboard.handleEvent(.{ .key_press = .{ .codepoint = chasen.Key.tab } }) orelse return error.ExpectedChangesMessage;
     try std.testing.expectEqual(App.Msg{ .changes = .toggle_focus }, keyboard_msg);
-    try keyboard.update(keyboard_msg, &keyboard_ctx);
+    try keyboard.update(keyboard_msg, &keyboard_ctx.ctx);
 
     try std.testing.expectEqual(changes_page.Focus.diff, direct.pages.changes.viewer.focus);
     try std.testing.expectEqual(direct.pages.changes.viewer.focus, keyboard.pages.changes.viewer.focus);
@@ -2127,7 +2153,9 @@ test "normal and help commit keys open the panel only on Changes" {
                     app.keymap = .fromConfig(config);
                 }
                 if (help_open) app.overlay.openHelpForPage(active_page);
-                var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+                var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+                ctx.init(std.testing.allocator, std.testing.io);
+                defer ctx.deinit();
                 const key: chasen.Key = if (remapped)
                     .{ .codepoint = 's', .mods = .{ .ctrl = true } }
                 else
@@ -2135,13 +2163,13 @@ test "normal and help commit keys open the panel only on Changes" {
                 const msg = app.handleEvent(.{ .key_press = key });
                 if (active_page == .changes) {
                     try std.testing.expectEqual(App.Msg{ .changes = .enter_commit_panel }, msg.?);
-                    try app.update(msg.?, &ctx);
+                    try app.update(msg.?, &ctx.ctx);
                     try std.testing.expect(app.local_workflow.commit_panel.is_open);
                     try std.testing.expect(!app.overlay.isHelp());
                 } else {
                     if (active_page == .repository and !help_open) {
                         try std.testing.expectEqual(App.Msg{ .command_line = .owned_noop }, msg.?);
-                        try app.update(msg.?, &ctx);
+                        try app.update(msg.?, &ctx.ctx);
                     } else try std.testing.expect(msg == null);
                     try std.testing.expect(!app.local_workflow.commit_panel.is_open);
                     try std.testing.expectEqual(help_open, app.overlay.isHelp());
@@ -2160,8 +2188,9 @@ test "focus loss terminates selection without a deferred result" {
     };
     _ = activateChanges(&app);
     app.pages.changes.auto_reload = .init(.inherit, .{});
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
     app.drag_auto_scroll.active = .{
         .generation = 3,
         .target = .changes,
@@ -2170,17 +2199,18 @@ test "focus loss terminates selection without a deferred result" {
     app.drag_auto_scroll.scheduled_generation = 3;
 
     try std.testing.expectEqual(App.Msg.focus_lost, app.handleEvent(.focus_out).?);
-    try app.update(.focus_lost, &ctx);
+    try app.update(.focus_lost, &ctx.ctx);
     try std.testing.expect(!app.pages.changes.selection_owner.activeMouseSelection());
     try std.testing.expect(app.pages.changes.deferred_source_apply == null);
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingCancelCount());
 
-    try app.update(.auto_reload_tick, &ctx);
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
-    var task_message = entries[0].failed(error.ConcurrencyUnavailable, std.testing.allocator);
+    try app.update(.auto_reload_tick, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    var task_message = try entries.fail(error.ConcurrencyUnavailable);
     defer task_message.deinitUndelivered(std.testing.allocator);
     const task = task_message.load_finished.changes.source;
     const cycle_id = task.background_cycle_id.?;

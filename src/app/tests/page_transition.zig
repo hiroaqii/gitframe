@@ -77,14 +77,16 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     _ = activateChanges(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .switch_page = .compare }, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
-    const pending_0 = ctx.takePendingTasks();
-    var entry_task_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer entry_task_message.deinitUndelivered(ctx.allocator());
+    try app.update(.{ .switch_page = .compare }, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending_0 = ctx.takeTask(0).?;
+    defer pending_0.deinit();
+    var entry_task_message = try pending_0.fail(error.ConcurrencyUnavailable);
+    defer entry_task_message.deinitUndelivered(ctx.ctx.allocator());
     const entry_task = entry_task_message.load_finished.compare.source;
     try std.testing.expect(app.pages.compare.base_target == null);
     const entry_identity = entry_task.identity;
@@ -96,7 +98,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
         entry_generation,
         'a',
         'b',
-    ) } } }, &ctx);
+    ) } } }, &ctx.ctx);
     try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
     try std.testing.expect(app.pages.compare.diff.load.state == .loaded);
     try std.testing.expectEqual(@as(usize, 17), app.pages.changes.viewer.diff_scroll);
@@ -104,17 +106,18 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     // The production shared-input route must consume the same-owner bound
     // UpdateAdapter rather than reintroducing a raw controller/resolver pair.
     try std.testing.expectEqual(diff_surface.Focus.sidebar, app.pages.compare.diff.viewer.focus);
-    try app.update(.{ .compare = .{ .common = .{ .shared = .toggle_focus } } }, &ctx);
+    try app.update(.{ .compare = .{ .common = .{ .shared = .toggle_focus } } }, &ctx.ctx);
     try std.testing.expectEqual(diff_surface.Focus.diff, app.pages.compare.diff.viewer.focus);
 
     const picker_message = app.handleEvent(.{ .key_press = .{ .codepoint = 'm' } }) orelse
         return error.ExpectedCompareBasePicker;
     try std.testing.expectEqual(App.Msg{ .compare = .open_base_picker }, picker_message);
-    try app.update(picker_message, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
-    const pending_1 = ctx.takePendingTasks();
-    var picker_task_message = pending_1[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer picker_task_message.deinitUndelivered(ctx.allocator());
+    try app.update(picker_message, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending_1 = ctx.takeTask(0).?;
+    defer pending_1.deinit();
+    var picker_task_message = try pending_1.fail(error.ConcurrencyUnavailable);
+    defer picker_task_message.deinitUndelivered(ctx.ctx.allocator());
     const picker_task = picker_task_message.load_finished.compare.branch_list;
     const picker_identity = picker_task.identity;
     const picker_generation = picker_task.generation;
@@ -126,24 +129,25 @@ test "Compare entry resolves default and picker selection queues its full ref" {
             .name = "topic",
             .oid = "1111111111111111111111111111111111111111",
         }}),
-    } } } }, &ctx);
+    } } } }, &ctx.ctx);
     const enter_query = app.handleEvent(.{ .key_press = .{ .codepoint = '/' } }) orelse
         return error.ExpectedCompareBaseQuery;
     try std.testing.expectEqual(App.Msg{ .compare = .base_picker_enter_query }, enter_query);
-    try app.update(enter_query, &ctx);
+    try app.update(enter_query, &ctx.ctx);
     for ("topic") |byte| {
         const insert = app.handleEvent(.{ .key_press = .{ .codepoint = byte } }) orelse
             return error.ExpectedCompareBaseQueryInsert;
-        try app.update(insert, &ctx);
+        try app.update(insert, &ctx.ctx);
     }
     try std.testing.expectEqualStrings("topic", app.pages.compare.base_picker.query.slice());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
-    try app.update(.{ .compare = .choose_base }, &ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
+    try app.update(.{ .compare = .choose_base }, &ctx.ctx);
     try std.testing.expect(!app.pages.compare.base_picker.open);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
-    const pending_2 = ctx.takePendingTasks();
-    var selected_task_message = pending_2[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer selected_task_message.deinitUndelivered(ctx.allocator());
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending_2 = ctx.takeTask(0).?;
+    defer pending_2.deinit();
+    var selected_task_message = try pending_2.fail(error.ConcurrencyUnavailable);
+    defer selected_task_message.deinitUndelivered(ctx.ctx.allocator());
     const selected_task = selected_task_message.load_finished.compare.source;
     try std.testing.expectEqualStrings("refs/heads/topic", app.pages.compare.base_target.?.full_ref);
     try std.testing.expectEqual(app.pages.compare.activation.currentIdentity().?, selected_task.identity);
@@ -220,8 +224,10 @@ test "Repository active pointer owner blocks wheel redraw until release" {
         },
         else => return error.ExpectedRepositoryRelease,
     }
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    try app.update(release, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    try app.update(release, &ctx.ctx);
     try std.testing.expect(!app.pages.repository.activeMouseSourceRange());
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 
@@ -243,7 +249,7 @@ test "Repository active pointer owner blocks wheel redraw until release" {
 
     const header_release = app.handleEvent(app_test_support.mouseEventTyped(0, 0, .left, .release)) orelse
         return error.ExpectedRepositoryRelease;
-    try app.update(header_release, &ctx);
+    try app.update(header_release, &ctx.ctx);
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 }
 
@@ -256,20 +262,21 @@ test "keyboard and page bar mouse share the page switch transition" {
     };
     defer app.pages.changes.deinit(std.testing.allocator);
     _ = activateChanges(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }) orelse return error.ExpectedPageSwitch;
     try std.testing.expectEqual(App.Msg{ .switch_page = .repository }, keyboard);
-    try app.update(keyboard, &ctx);
+    try app.update(keyboard, &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.initialized);
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
 
-    try app.update(.reload, &ctx);
+    try app.update(.reload, &ctx.ctx);
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expectEqualStrings("Repository required", app.pages.repository.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
     const layout = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
     const changes_tab = page.tab(.changes);
@@ -280,10 +287,10 @@ test "keyboard and page bar mouse share the page switch transition" {
         .left,
     )) orelse return error.ExpectedPageSwitch;
     try std.testing.expectEqual(App.Msg{ .switch_page = .changes }, mouse);
-    try app.update(mouse, &ctx);
+    try app.update(mouse, &ctx.ctx);
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(!app.pages.changes.activation.state.satisfiesAction(.read_diff));
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
 }
 
 test "page key 4 activates Compare without replacing retained Changes state" {
@@ -295,12 +302,14 @@ test "page key 4 activates Compare without replacing retained Changes state" {
         } },
     };
     _ = activateChanges(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     const message = app.handleEvent(.{ .key_press = .{ .codepoint = '4' } }) orelse
         return error.ExpectedComparePageSwitch;
     try std.testing.expectEqual(App.Msg{ .switch_page = .compare }, message);
-    try app.update(message, &ctx);
+    try app.update(message, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.compare, app.active_page);
     try std.testing.expect(app.pages.compare.activation.state == .active);
@@ -312,7 +321,7 @@ test "page key 4 activates Compare without replacing retained Changes state" {
     try std.testing.expectEqual(@as(usize, 11), app.pages.changes.viewer.diff_scroll);
     try std.testing.expect(app.pages.changes.load.state == .empty);
     try std.testing.expect(!app.redraw_plan.resolvesToSkip());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 
 test "repository selection shell blocks transition and cancels on focus or resize" {
@@ -321,8 +330,9 @@ test "repository selection shell blocks transition and cancels on focus or resiz
         .terminal_size = .{ .width = 100, .height = 20 },
     };
     app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
     app.drag_auto_scroll.active = .{
         .generation = 4,
         .target = .repository,
@@ -333,13 +343,13 @@ test "repository selection shell blocks transition and cancels on focus or resiz
     try std.testing.expect(app.pages.repository.activeMouseOwner());
     try std.testing.expect(app.pages.repository.activeMouseSourceRange());
 
-    try app.update(.{ .switch_page = .compare }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.activeMouseSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingCancelCount());
 
     app.status.clear();
     const shell = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
@@ -347,17 +357,17 @@ test "repository selection shell blocks transition and cancels on focus or resiz
     const changes_tab = page.tab(.changes);
     const mouse_switch = app.handleEvent(app_test_support.mouseEvent(bar.col + changes_tab.col, bar.row, .left)) orelse
         return error.ExpectedPageSwitch;
-    try app.update(mouse_switch, &ctx);
+    try app.update(mouse_switch, &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.activeMouseSourceRange());
     try std.testing.expectEqualStrings("finish Repository mouse selection before switching pages", app.status.text());
 
-    try app.update(.focus_lost, &ctx);
+    try app.update(.focus_lost, &ctx.ctx);
     try std.testing.expect(!app.pages.repository.activeMouseSourceRange());
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 
     app.pages.repository.selection_owner = .{ .source = repositoryLiveSelectionForTest() };
-    try app.update(.{ .terminal_resized = .{ .width = 70, .height = 12 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 70, .height = 12 } }, &ctx.ctx);
     try std.testing.expect(!app.pages.repository.activeMouseSourceRange());
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
     try std.testing.expectEqual(chasen.Size{ .width = 70, .height = 12 }, app.terminal_size);
@@ -397,26 +407,28 @@ test "changes repository transition common switch commits exact path before reva
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     app.pages.repository.root_identity = app.repo_session.view().activeIdentity();
     app.status.set("old navigation status", .{});
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .switch_page = .changes }, &ctx);
+    try app.update(.{ .switch_page = .changes }, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expectEqual(@as(usize, 0), app.status.text().len);
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
     const active = app.pages.changes.activation.state.active;
-    const entries = ctx.takePendingTasks();
-    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    var entries = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&entries) |*task| task.deinit();
+    var status_task_message = try entries[0].fail(error.ConcurrencyUnavailable);
     defer status_task_message.deinitUndelivered(allocator);
     const status_task = status_task_message.load_finished.changes.status;
-    var branch_task_message = entries[1].failed(error.ConcurrencyUnavailable, allocator);
+    var branch_task_message = try entries[1].fail(error.ConcurrencyUnavailable);
     defer branch_task_message.deinitUndelivered(allocator);
     const branch_task = branch_task_message.load_finished.changes.branch_status;
-    var diff_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    var diff_task_message = try entries[2].fail(error.ConcurrencyUnavailable);
     defer diff_task_message.deinitUndelivered(allocator);
     const diff_task = diff_task_message.load_finished.changes.source;
     try std.testing.expectEqual(active.activation_id, status_task.identity.activation_id);
@@ -464,9 +476,11 @@ test "changes repository transition blocker retains page owner and Changes state
         .{ .location = .{ .path = "pending.zig" } },
     );
     app.pages.repository.acceptIncoming(allocator, &incoming);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .switch_page = .changes }, &ctx);
+    try app.update(.{ .switch_page = .changes }, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.repository.active);
@@ -476,7 +490,7 @@ test "changes repository transition blocker retains page owner and Changes state
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqualStrings("finish file search before switching pages", app.status.text());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 
 test "changes repository transition keyboard and page bar open the same exact Changes path" {
@@ -515,8 +529,9 @@ test "changes repository transition keyboard and page bar open the same exact Ch
         defer app.repo_session.repo_state.deinit(allocator);
         app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
         app.pages.repository.root_identity = app.repo_session.view().activeIdentity();
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
         const message = switch (input) {
             .keyboard => app.handleEvent(.{ .key_press = .{ .codepoint = '1' } }),
@@ -533,13 +548,13 @@ test "changes repository transition keyboard and page bar open the same exact Ch
         } orelse return error.ExpectedPageSwitch;
         try std.testing.expectEqual(App.Msg{ .switch_page = .changes }, message);
 
-        try app.update(message, &ctx);
+        try app.update(message, &ctx.ctx);
 
         try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
         try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
         try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
-        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
     }
 }
 
@@ -571,7 +586,9 @@ test "changes repository transition active Repository controls remain same-page 
             .{ .location = .{ .path = "pending.zig" } },
         );
         app.pages.repository.acceptIncoming(allocator, &incoming);
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
         const message = switch (input) {
             .keyboard => app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }),
@@ -588,7 +605,7 @@ test "changes repository transition active Repository controls remain same-page 
         } orelse return error.ExpectedPageSwitch;
         try std.testing.expectEqual(App.Msg{ .switch_page = .repository }, message);
 
-        try app.update(message, &ctx);
+        try app.update(message, &ctx.ctx);
 
         try std.testing.expectEqual(page.Id.repository, app.active_page);
         try std.testing.expect(app.pages.repository.active);
@@ -596,7 +613,7 @@ test "changes repository transition active Repository controls remain same-page 
         try std.testing.expectEqualStrings("pending.zig", app.pages.repository.incoming.manifestIntent().?.path);
         try std.testing.expectEqualStrings("retained.zig", app.pages.repository.selected_path.?);
         try std.testing.expect(app.pages.changes.activation.state == .inactive);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     }
 }
 
@@ -657,10 +674,11 @@ test "changes repository transition common switch maps retained-location outcome
             .{ .device = identity.device, .inode = identity.inode +% 1 }
         else
             identity;
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
-        try app.update(.{ .switch_page = .changes }, &ctx);
+        try app.update(.{ .switch_page = .changes }, &ctx.ctx);
 
         try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
@@ -676,7 +694,7 @@ test "changes repository transition common switch maps retained-location outcome
         try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
         try std.testing.expectEqual(case.hide_reviewed, app.pages.changes.review_display.hide_reviewed_files);
         try std.testing.expectEqualStrings(case.status, app.status.text());
-        try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
     }
 }
 
@@ -725,10 +743,11 @@ test "changes repository transition common switch consumes pending and unavailab
             },
         );
         app.pages.repository.acceptIncoming(allocator, &incoming);
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
-        try app.update(.{ .switch_page = .changes }, &ctx);
+        try app.update(.{ .switch_page = .changes }, &ctx.ctx);
 
         try std.testing.expectEqual(page.Id.changes, app.active_page);
         try std.testing.expect(!app.pages.repository.active);
@@ -736,7 +755,7 @@ test "changes repository transition common switch consumes pending and unavailab
         try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
         try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
         try std.testing.expectEqualStrings("Repository has no resolved file to open in Changes", app.status.text());
-        try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
     }
 }
 
@@ -772,18 +791,19 @@ test "changes repository transition inactive Repository retains contextual selec
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     app.pages.repository.root_identity = app.repo_session.view().activeIdentity().?;
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .switch_page = .compare }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx.ctx);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
 
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
     try std.testing.expect(app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
 
-    try app.update(.{ .switch_page = .changes }, &ctx);
+    try app.update(.{ .switch_page = .changes }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqualStrings("b", app.pages.repository.selected_path.?);
@@ -791,7 +811,7 @@ test "changes repository transition inactive Repository retains contextual selec
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     // Public App updates also run the common tail: the two Repository members
     // join Changes's three reads and Review's retained snapshot task.
-    try std.testing.expectEqual(@as(u8, 6), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 6), ctx.pendingTaskCount());
 }
 
 test "changes repository transition keyboard opens exact retained path with line owner" {
@@ -837,12 +857,13 @@ test "changes repository transition keyboard opens exact retained path with line
     app.pages.repository.root_identity = app.repo_session.view().activeIdentity();
     app.pages.repository.selected_path = app.pages.repository.bundle.?.tree.filePath("other.zig", .all).?;
     acceptTestSource(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const keyboard = app.handleEvent(.{ .key_press = .{ .codepoint = '2' } }) orelse
         return error.ExpectedPageSwitch;
-    try app.update(keyboard, &ctx);
+    try app.update(keyboard, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
@@ -856,7 +877,7 @@ test "changes repository transition keyboard opens exact retained path with line
         diff_view_model.BodyCoordinate{ .hunk_line = .{ .hunk_index = 0, .line_index = 3 } },
         app.pages.changes.viewer.diff_cursor,
     ));
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskCount());
 }
 
 test "changes repository transition page bar exposes deleted target as unavailable" {
@@ -884,8 +905,9 @@ test "changes repository transition page bar exposes deleted target as unavailab
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     acceptTestSource(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const layout = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true });
     const repository_tab = page.tab(.repository);
@@ -895,7 +917,7 @@ test "changes repository transition page bar exposes deleted target as unavailab
         bar.row,
         .left,
     )) orelse return error.ExpectedPageSwitch;
-    try app.update(mouse, &ctx);
+    try app.update(mouse, &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
@@ -903,7 +925,7 @@ test "changes repository transition page bar exposes deleted target as unavailab
     try std.testing.expectEqual(page_link.RepositoryUnavailableReason.no_current_path, unavailable.reason);
     try std.testing.expectEqualStrings("src/deleted.zig", unavailable.path);
     try std.testing.expect(app.pages.repository.selected_path == null);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskCount());
 }
 
 const review_app_test_diff =
@@ -1249,16 +1271,13 @@ fn branchListForTest(allocator: std.mem.Allocator, specs: []const BranchListItem
     return .{ .loaded = .{ .branches = items } };
 }
 
-fn discardSingleQueuedTask(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) !void {
-    const queued = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), queued.len);
-    queued[0].discard(allocator);
+fn discardSingleQueuedTask(ctx: *chasen.testing.TestCtx(App.Msg)) !void {
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    ctx.discardPendingTasks();
 }
 
-fn discardQueuedTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) usize {
-    const queued = ctx.takePendingTasks();
-    for (queued) |task| {
-        task.discard(allocator);
-    }
-    return queued.len;
+fn discardQueuedTasks(ctx: *chasen.testing.TestCtx(App.Msg)) usize {
+    const count = ctx.pendingTaskCount();
+    ctx.discardPendingTasks();
+    return count;
 }

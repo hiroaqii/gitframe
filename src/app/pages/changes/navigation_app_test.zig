@@ -434,12 +434,14 @@ test "Changes document navigation updates pending restore only on display change
         .captured_input_revision = 0,
     };
 
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    try app.update(.{ .changes = .scroll_diff_up }, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
+    try app.update(.{ .changes = .scroll_diff_up }, &ctx.ctx);
     try std.testing.expectEqual(@as(u64, 0), app.pages.changes.display_navigation_input_revision);
     try std.testing.expect(app.pages.changes.pending_display_navigation_restore.?.override == null);
 
-    try app.update(.{ .changes = .scroll_diff_down }, &ctx);
+    try app.update(.{ .changes = .scroll_diff_down }, &ctx.ctx);
 
     try std.testing.expectEqual(@as(u64, 1), app.pages.changes.display_navigation_input_revision);
     var restore = app.pages.changes.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
@@ -447,14 +449,14 @@ test "Changes document navigation updates pending restore only on display change
     try std.testing.expectEqual(app.pages.changes.viewer.diff_cursor, override.diff_cursor);
     try std.testing.expectEqual(changesNavigationView(&app).selectedDiffCursorOffset(), override.diff_cursor_offset);
 
-    try app.update(.{ .changes = .scroll_diff_down }, &ctx);
+    try app.update(.{ .changes = .scroll_diff_down }, &ctx.ctx);
     try std.testing.expectEqual(@as(u64, 2), app.pages.changes.display_navigation_input_revision);
     restore = app.pages.changes.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     override = restore.override orelse return error.ExpectedNavigationOverride;
     try std.testing.expectEqual(app.pages.changes.viewer.diff_cursor, override.diff_cursor);
     try std.testing.expectEqual(changesNavigationView(&app).selectedDiffCursorOffset(), override.diff_cursor_offset);
 
-    try app.update(.{ .changes = .document_last }, &ctx);
+    try app.update(.{ .changes = .document_last }, &ctx.ctx);
     try std.testing.expectEqual(@as(u64, 3), app.pages.changes.display_navigation_input_revision);
     restore = app.pages.changes.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     override = restore.override orelse return error.ExpectedNavigationOverride;
@@ -475,12 +477,12 @@ test "Changes document navigation updates pending restore only on display change
     try std.testing.expectEqual(latest_scroll, app.pages.changes.viewer.diff_scroll);
 
     const revision_before_edge = app.pages.changes.display_navigation_input_revision;
-    try app.update(.{ .changes = .document_last }, &ctx);
+    try app.update(.{ .changes = .document_last }, &ctx.ctx);
     try std.testing.expectEqual(revision_before_edge, app.pages.changes.display_navigation_input_revision);
     restore = app.pages.changes.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     try std.testing.expectEqual(latest_cursor, restore.override.?.diff_cursor);
 
-    try app.update(.{ .changes = .half_page_up }, &ctx);
+    try app.update(.{ .changes = .half_page_up }, &ctx.ctx);
     try std.testing.expectEqual(revision_before_edge + 1, app.pages.changes.display_navigation_input_revision);
     restore = app.pages.changes.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     override = restore.override orelse return error.ExpectedNavigationOverride;
@@ -542,12 +544,14 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
         },
         .captured_input_revision = 0,
     };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(.{ .changes = .{ .mouse_diff_auto_scroll_step = .{
         .direction = .up,
         .endpoint = .{ .col = 20, .row = diff_render.body_start_row },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqual(@as(u64, 1), app.pages.changes.display_navigation_input_revision);
@@ -562,7 +566,7 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
     try app.update(.{ .changes = .{ .mouse_diff_auto_scroll_step = .{
         .direction = .up,
         .endpoint = .{ .col = 20, .row = diff_render.body_start_row },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
     try std.testing.expectEqualDeep(edge_cursor, app.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqualDeep(edge_owner, app.pages.changes.selection_owner);

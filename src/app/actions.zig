@@ -1339,10 +1339,13 @@ test "StageFileTask run frees borrowed command path and moves label" {
     const task = try makeStageFileTaskForTest(allocator, .{ .generation = 11, .kind = .stage_file });
     const root_observer = task.root;
 
-    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
-    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
-    const entries = ctx.takePendingTasks();
-    var finished = expectStageFileFinished(try entries[0].run(allocator, std.testing.io));
+    var ctx: chasen.testing.TestCtx(FileTaskTestMsg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    _ = try ctx.ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    var finished = expectStageFileFinished(try entries.run());
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 11), finished.pending.generation);
@@ -1359,10 +1362,13 @@ test "StageFileTask failed frees borrowed command path and moves label" {
     const task = try makeStageFileTaskForTest(allocator, .{ .generation = 12, .kind = .stage_file });
     const root_observer = task.root;
 
-    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
-    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
-    const entries = ctx.takePendingTasks();
-    var finished = expectStageFileFinished(entries[0].failed(error.ConcurrencyUnavailable, allocator));
+    var ctx: chasen.testing.TestCtx(FileTaskTestMsg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    _ = try ctx.ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    var finished = expectStageFileFinished(try entries.fail(error.ConcurrencyUnavailable));
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 12), finished.pending.generation);
@@ -1382,10 +1388,13 @@ test "UnstageFileTask run frees borrowed command path and moves label" {
     const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 13, .kind = .unstage_file });
     const root_observer = task.root;
 
-    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
-    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
-    const entries = ctx.takePendingTasks();
-    var finished = expectUnstageFileFinished(try entries[0].run(allocator, std.testing.io));
+    var ctx: chasen.testing.TestCtx(FileTaskTestMsg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    _ = try ctx.ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    var finished = expectUnstageFileFinished(try entries.run());
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 13), finished.pending.generation);
@@ -1402,10 +1411,13 @@ test "UnstageFileTask failed frees borrowed command path and moves label" {
     const task = try makeUnstageFileTaskForTest(allocator, .{ .generation = 14, .kind = .unstage_file });
     const root_observer = task.root;
 
-    var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
-    _ = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
-    const entries = ctx.takePendingTasks();
-    var finished = expectUnstageFileFinished(entries[0].failed(error.OutOfMemory, allocator));
+    var ctx: chasen.testing.TestCtx(FileTaskTestMsg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    _ = try ctx.ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    var finished = expectUnstageFileFinished(try entries.fail(error.OutOfMemory));
     defer finished.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 14), finished.pending.generation);
@@ -1527,16 +1539,19 @@ test "owned StageFileTask discard and queued cancellation release without a mess
     for ([_]bool{ false, true }) |cancel| {
         const task = try makeStageFileTaskForTest(allocator, .{ .generation = 15, .kind = .stage_file });
         const root_observer = task.root;
-        var ctx: chasen.Ctx(FileTaskTestMsg) = .{ ._allocator = allocator };
-        const id = try ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
+        var ctx: chasen.testing.TestCtx(FileTaskTestMsg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
+        const id = try ctx.ctx.task().spawnOwned(task, .{ .run = Task.run, .failed = Task.failed, .cleanup = Task.destroy });
         if (cancel) {
-            ctx.task().requestCancel(id);
-            const entries = ctx.takePendingTasks();
-            try std.testing.expectError(error.Canceled, entries[0].run(allocator, std.testing.io));
+            ctx.ctx.task().requestCancel(id);
+            var entries = ctx.takeTask(0).?;
+            defer entries.deinit();
+            try std.testing.expectError(error.Canceled, entries.run());
         } else {
-            chasen.testing.discardPendingTasks(FileTaskTestMsg, &ctx);
+            ctx.discardPendingTasks();
         }
         try expectRootCapabilityClosedForTest(root_observer);
-        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     }
 }

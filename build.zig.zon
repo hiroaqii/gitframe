@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .chasen = .{
-            .url = "git+https://github.com/hiroaqii/chasen.git#86ef5de75b1c48bdf46c1862542fdc4039cf74ae",
-            .hash = "chasen-0.1.0-lvlHSU9HBwBed2osSsNICrnIOGkmtCh_-9Ulym5m51ur",
+            .url = "git+https://github.com/hiroaqii/chasen.git#c08b87eaf151e5706a9c95e8cd64da9895dc3e59",
+            .hash = "chasen-0.1.0-lvlHSaecCAAAYdMbBeAJ5UDxB4ZYwMrUi4LRakf2z4Ey",
         },
         .chasen_ui = .{
-            .url = "git+https://github.com/hiroaqii/chasen-ui.git#68f9ed68723141719b0f4d41810b76db75f08185",
-            .hash = "chasen_ui-0.1.0-ATsSa_1OCgBI689wPX1lrBZQuvWu54-A7_kemVkDE5OM",
+            .url = "git+https://github.com/hiroaqii/chasen-ui.git#c9a3f1579ce0f89ee45bb3ba26afecf476065470",
+            .hash = "chasen_ui-0.1.0-ATsSa7JTCgBi79H6H7Z2gIrbTWS26ajjrQ6hC41N8u2r",
         },
         .flow_syntax = .{
             .url = "git+https://github.com/neurocyte/flow-syntax?ref=zig-0.16#4a44180376ec28e7bb4ed56c5b6fe24292c74930",

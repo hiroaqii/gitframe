@@ -25,7 +25,9 @@ test "screen transition consumes accepted failed and replaced publication once" 
 test "screen transition starts only after an accepted Changes source publication" {
     var app: App = .{ .allocator = std.testing.allocator, .config = .{ .source = .{ .patch_file = "fixture.patch" } } };
     defer app.pages.changes.deinit(std.testing.allocator);
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
     const activation = app.pages.changes.activation.activate(0, .pending, .unavailable, .unavailable);
     const generation = app.pages.changes.load.beginDiffLoad();
@@ -67,7 +69,9 @@ test "screen transition starts only after an accepted Changes source publication
 
 test "screen transition key and mouse cancel while preserving the original action" {
     var app: App = .{ .terminal_size = .{ .width = 80, .height = 24 } };
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
     app.screen_transition = .{ .running = 12 };
     const key = app.handleEvent(.{ .key_press = .{ .codepoint = '?' } }).?;
@@ -97,7 +101,9 @@ test "screen transition unmapped input resize and focus loss cancel cleanly" {
     };
     for (events) |event| {
         var app: App = .{ .terminal_size = .{ .width = 80, .height = 24 } };
-        var tc: chasen.testing.TestCtx(App.Msg) = .{};
+        var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+        tc.init(std.testing.allocator, std.testing.io);
+        defer tc.deinit();
         defer tc.resetTransient();
         app.screen_transition = .{ .running = 20 };
         try app.update(app.handleEvent(event).?, &tc.ctx);
@@ -108,7 +114,9 @@ test "screen transition unmapped input resize and focus loss cancel cleanly" {
 
 test "screen transition redraw requirement wins over background skip" {
     var app: App = .{ .screen_transition = .{ .running = 3 } };
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
     try app.update(.git_action_spinner_tick, &tc.ctx);
     try std.testing.expect(app.screen_transition == .running);
@@ -152,7 +160,9 @@ test "screen transition rendering masks glyphs and styled blanks then restores e
 
 test "screen transition release and movement keep the effect and disabled ignores frames" {
     var app: App = .{ .terminal_size = .{ .width = 80, .height = 24 }, .screen_transition = .{ .running = 12 } };
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
     for ([_]chasen.Event{
         support.mouseEventTyped(0, 0, .left, .release),

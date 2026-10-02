@@ -59,27 +59,29 @@ test "body file navigation advances past a pending request and rejects its late 
     activateChanges(&app);
     var status = try git_status.StatusBundle.parseOwned(allocator, "?? b\x00?? c\x00");
     try app.pages.changes.git_status.replace(roots.a, &status);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
-    defer ctx.runtimeClearPendingEffectCopies();
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx);
+    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx.ctx);
     try std.testing.expectEqualStrings("b", app.pages.changes.changes_projection.pending.?.path_key);
-    const first = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), first.len);
-    var late_b = first[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var first = ctx.takeTask(0).?;
+    defer first.deinit();
+    var late_b = try first.fail(error.ConcurrencyUnavailable);
     errdefer late_b.deinitUndelivered(allocator);
     late_b.load_finished.changes.projection.result = .{ .ready = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(allocator, "b", "late B\n") } };
 
-    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx);
+    try app.update(app.handleEvent(.{ .key_press = .{ .codepoint = ']' } }).?, &ctx.ctx);
     try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.pending.?.path_key);
-    const second = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), second.len);
-    var ready_c = second[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var second = ctx.takeTask(0).?;
+    defer second.deinit();
+    var ready_c = try second.fail(error.ConcurrencyUnavailable);
     ready_c.load_finished.changes.projection.result = .{ .ready = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(allocator, "c", "current C\n") } };
-    try app.update(ready_c, &ctx);
+    try app.update(ready_c, &ctx.ctx);
     try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.displayed.request().?.path_key);
-    try app.update(late_b, &ctx);
+    try app.update(late_b, &ctx.ctx);
     late_b = .quit;
     try std.testing.expectEqualStrings("c", app.pages.changes.changes_projection.displayed.request().?.path_key);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_target.?.status_only);
@@ -309,24 +311,26 @@ test "successful file action binds the exact source and status generations start
 
     const pending = beginAcceptedTestAction(&app, .stage_file);
     try installTestActionCursor(&app, allocator, .directory, "src", pending.generation);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    try finishStageFileForTest(&app, &ctx, .{
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    try finishStageFileForTest(&app, &ctx.ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "src"),
         .result = .ok,
     });
 
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 3), entries.len);
-    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
+    var entries = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&entries) |*task| task.deinit();
+    var status_task_message = try entries[0].fail(error.ConcurrencyUnavailable);
     defer status_task_message.deinitUndelivered(allocator);
     const status_task = status_task_message.load_finished.changes.status;
-    var source_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    var source_task_message = try entries[2].fail(error.ConcurrencyUnavailable);
     defer source_task_message.deinitUndelivered(allocator);
     const source_task = source_task_message.load_finished.changes.source;
-    entries[1].discard(allocator);
+    entries[1].deinit();
     const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
     try std.testing.expectEqual(pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
     try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
@@ -354,9 +358,10 @@ test "successful hunk action binds an exact status-only refresh" {
 
     const pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    try finishStageHunkForTest(&app, &ctx, .{
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    try finishStageHunkForTest(&app, &ctx.ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
@@ -365,9 +370,10 @@ test "successful hunk action binds an exact status-only refresh" {
         .result = .ok,
     });
 
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
-    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    var status_task_message = try entries.fail(error.ConcurrencyUnavailable);
     defer status_task_message.deinitUndelivered(allocator);
     const status_task = status_task_message.load_finished.changes.status;
     const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
@@ -387,9 +393,10 @@ test "cached hunk unstage binds exact source and status refresh members" {
 
     const pending = beginAcceptedTestAction(&app, .unstage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    try finishUnstageHunkForTest(&app, &ctx, .{
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    try finishUnstageHunkForTest(&app, &ctx.ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
@@ -399,15 +406,16 @@ test "cached hunk unstage binds exact source and status refresh members" {
         .result = .ok,
     });
 
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 3), entries.len);
-    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
+    var entries = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&entries) |*task| task.deinit();
+    var status_task_message = try entries[0].fail(error.ConcurrencyUnavailable);
     defer status_task_message.deinitUndelivered(allocator);
     const status_task = status_task_message.load_finished.changes.status;
-    var source_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    var source_task_message = try entries[2].fail(error.ConcurrencyUnavailable);
     defer source_task_message.deinitUndelivered(allocator);
     const source_task = source_task_message.load_finished.changes.source;
-    entries[1].discard(allocator);
+    entries[1].deinit();
     const basis = app.pages.changes.action_cursor.owner.?.phase.awaiting_action_refresh;
     try std.testing.expectEqual(changes_page.action_cursor.RefreshRequirement.source_and_status, std.meta.activeTag(basis));
     try std.testing.expectEqual(status_task.generation, basis.memberState(.status).?.generation.?);
@@ -424,8 +432,11 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
 
     const pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", pending.generation);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._pending_tasks_len = 16 };
-    try finishStageHunkForTest(&app, &ctx, .{
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    try ctx.fillTaskSlots(16);
+    try finishStageHunkForTest(&app, &ctx.ctx, .{
         .pending = pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
@@ -433,7 +444,7 @@ test "status-only hunk refresh spawn rejection closes its exact owner" {
         .session_mark_mutation = .none,
         .result = .ok,
     });
-    ctx._pending_tasks_len = 0;
+    ctx.discardPendingTasks();
 
     try std.testing.expect(!app.action_runtime.view().hasPending());
     try std.testing.expect(app.pages.changes.status_load.pending == null);
@@ -452,9 +463,11 @@ test "inert diff hunk command reports bounded encoding diagnostic" {
         .allocator = std.testing.allocator,
     };
     defer changesReload(&app).clearLoadedDiff(std.testing.allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .changes = .toggle_selected_hunk }, &ctx);
+    try app.update(.{ .changes = .toggle_selected_hunk }, &ctx.ctx);
 
     try std.testing.expectEqualStrings(git_ops.inert_hunk_action_message, app.pages.changes.status.text());
     try std.testing.expect(std.mem.indexOfScalar(u8, app.pages.changes.status.text(), 0xff) == null);
@@ -476,7 +489,9 @@ test "opening amend confirmation cancels active discard confirmation" {
         if (app.local_workflow.amend_confirmation) |*confirmation| confirmation.deinit(allocator);
         if (app.local_workflow.discard_confirmation) |*confirmation| confirmation.deinit(allocator);
     }
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     app.local_workflow.discard_confirmation = .{
         .repo_root = try allocator.dupe(u8, "/repo"),
@@ -486,7 +501,7 @@ test "opening amend confirmation cancels active discard confirmation" {
     app.local_workflow.commit_panel.open(.amend);
     app.local_workflow.commit_panel.insert('x');
 
-    try app.update(.submit_commit_panel, &ctx);
+    try app.update(.submit_commit_panel, &ctx.ctx);
 
     try std.testing.expect(app.local_workflow.discard_confirmation == null);
     try std.testing.expect(app.local_workflow.amend_confirmation != null);
@@ -506,13 +521,15 @@ test "canceling amend confirmation keeps commit panel draft" {
     };
     defer app.local_workflow.commit_panel.deinit();
     defer if (app.local_workflow.amend_confirmation) |*confirmation| confirmation.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     app.local_workflow.commit_panel.open(.amend);
     app.local_workflow.commit_panel.insert('x');
-    try app.update(.submit_commit_panel, &ctx);
+    try app.update(.submit_commit_panel, &ctx.ctx);
 
-    try app.update(.cancel_amend, &ctx);
+    try app.update(.cancel_amend, &ctx.ctx);
 
     try std.testing.expect(app.local_workflow.amend_confirmation == null);
     try std.testing.expectEqual(app_state.OverlayKind.none, app.overlay.kind);

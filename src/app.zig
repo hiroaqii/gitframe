@@ -2187,7 +2187,9 @@ test "command line keeps input across resize and cancels on focus or page transi
     var app: App = .{};
     try installCommandSourceForTest(&app, "one\ntwo\nthree\n");
     defer app.pages.repository.deinit(allocator);
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
 
     app.updateCommandLine(.open);

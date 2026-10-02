@@ -1269,10 +1269,12 @@ test "worktree commitment rechecks physical destination and action admission bef
     const source_identity = app.repoSessionView().activeIdentity().?;
     var target = try root_capability.RootCapability.openCanonical(roots.b);
     defer target.deinit();
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     var busy = app.repoSession();
     busy.action_pending = true;
-    try std.testing.expectEqual(CommitOutcome.rejected, try busy.commitWorktree(&ctx, .{
+    try std.testing.expectEqual(CommitOutcome.rejected, try busy.commitWorktree(&ctx.ctx, .{
         .discovery = try testRepoSessionSingleDiscovery(allocator, roots.b),
         .root_identity = target.identity,
     }, &app.pages.repository.status));
@@ -1280,7 +1282,7 @@ test "worktree commitment rechecks physical destination and action admission bef
     try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
     try roots.tmp.dir.rename("b", roots.tmp.dir, "old-b", std.testing.io);
     try roots.tmp.dir.createDir(std.testing.io, "b", .default_dir);
-    try std.testing.expectEqual(CommitOutcome.rejected, try app.repoSession().commitWorktree(&ctx, .{
+    try std.testing.expectEqual(CommitOutcome.rejected, try app.repoSession().commitWorktree(&ctx.ctx, .{
         .discovery = try testRepoSessionSingleDiscovery(allocator, roots.b),
         .root_identity = target.identity,
     }, &app.pages.repository.status));
@@ -1367,16 +1369,18 @@ test "repo picker removes selected recent entry only" {
     };
     defer app.repo_session.deinit(allocator);
     try app.repo_session.recent_repos.rememberRepo(allocator, "/work/recent");
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.repoSession().enterPicker(allocator);
     try std.testing.expectEqual(@as(usize, 2), app.repo_session.repo_picker.list.filter.labels.len);
 
-    try app.repoSession().removeSelectedRecent(&ctx);
+    try app.repoSession().removeSelectedRecent(&ctx.ctx);
     try std.testing.expectEqual(@as(usize, 1), app.repo_session.recent_repos.entries.items.len);
 
     app.repo_session.repo_picker.list.filter.update(.move_next);
-    try app.repoSession().removeSelectedRecent(&ctx);
+    try app.repoSession().removeSelectedRecent(&ctx.ctx);
     try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.repo_session.repo_picker.list.filter.labels.len);
     try std.testing.expectEqualStrings("active", app.repo_session.repo_picker.list.filter.labels[0]);
@@ -1397,7 +1401,9 @@ test "repo picker removes stale recent entry after path discovery error" {
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.repo_session.recent_repos.rememberRepo(allocator, "/gone/repo");
     try app.repoSession().enterPicker(allocator);
@@ -1405,13 +1411,15 @@ test "repo picker removes stale recent entry after path discovery error" {
     app.repo_session.pending_repo_path_recent_source = .{ .kind = .repo, .index = 0 };
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var failing_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = failing.allocator() };
+    var failing_ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    failing_ctx.init(failing.allocator(), std.testing.io);
+    defer failing_ctx.deinit();
     var failed_refresh = RepoPathDiscoveryFinished{
         .generation = failed_generation,
         .submitted_path = try allocator.dupe(u8, "/gone/repo"),
         .result = .{ .input_error = error.PathDoesNotExist },
     };
-    try std.testing.expectError(error.OutOfMemory, app.repoSession().finishPathDiscovery(&failing_ctx, failed_refresh));
+    try std.testing.expectError(error.OutOfMemory, app.repoSession().finishPathDiscovery(&failing_ctx.ctx, failed_refresh));
     failed_refresh = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
     try std.testing.expectEqual(@as(usize, 1), app.repo_session.recent_repos.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), app.repo_session.repo_picker.list.filter.labels.len);
@@ -1425,7 +1433,7 @@ test "repo picker removes stale recent entry after path discovery error" {
         .submitted_path = try allocator.dupe(u8, "/gone/repo"),
         .result = .{ .input_error = error.PathDoesNotExist },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, finished);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, finished);
     finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
 
     try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
@@ -1449,7 +1457,9 @@ test "repo picker keeps recent entry for non-stale path discovery error" {
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.repo_session.recent_repos.rememberRepo(allocator, "/mounted/repo");
     try app.repoSession().enterPicker(allocator);
@@ -1461,7 +1471,7 @@ test "repo picker keeps recent entry for non-stale path discovery error" {
         .submitted_path = try allocator.dupe(u8, "/mounted/repo"),
         .result = .{ .input_error = error.CannotAccessPath },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, finished);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, finished);
     finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
 
     try std.testing.expectEqual(@as(usize, 1), app.repo_session.recent_repos.entries.items.len);
@@ -1483,7 +1493,9 @@ test "repo picker removes stale recent workspace after no repos remain" {
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.repo_session.recent_repos.rememberWorkspace(allocator, "/gone/workspace");
     try app.repoSession().enterPicker(allocator);
@@ -1495,7 +1507,7 @@ test "repo picker removes stale recent workspace after no repos remain" {
         .submitted_path = try allocator.dupe(u8, "/gone/workspace"),
         .result = .{ .input_error = error.NoGitRepositoriesFound },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, finished);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, finished);
     finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
 
     try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
@@ -1522,14 +1534,17 @@ test "repo picker path input errors do not remove recent history" {
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.repo_session.recent_repos.rememberRepo(allocator, "/kept/repo");
     try app.repoSession().enterPicker(allocator);
-    try app.repoSession().startPathDiscovery(&ctx, "/typed/missing", null);
-    const pending_tasks = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), pending_tasks.len);
-    var terminal = pending_tasks[0].failed(error.ConcurrencyUnavailable, allocator);
+    try app.repoSession().startPathDiscovery(&ctx.ctx, "/typed/missing", null);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending_tasks = ctx.takeTask(0).?;
+    defer pending_tasks.deinit();
+    var terminal = try pending_tasks.fail(error.ConcurrencyUnavailable);
     defer terminal.deinitUndelivered(allocator);
     const generation = terminal.load_finished.shell.repo_path_discovery.generation;
     try std.testing.expectEqualStrings("/typed/missing", terminal.load_finished.shell.repo_path_discovery.submitted_path);
@@ -1539,7 +1554,7 @@ test "repo picker path input errors do not remove recent history" {
         .submitted_path = try allocator.dupe(u8, "/typed/missing"),
         .result = .{ .input_error = error.PathDoesNotExist },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, finished);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, finished);
     finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
 
     try std.testing.expectEqual(@as(usize, 1), app.repo_session.recent_repos.entries.items.len);
@@ -1562,7 +1577,9 @@ test "repo picker stale recent removal falls back to matching path after index s
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.repo_session.recent_repos.rememberRepo(allocator, "/old/first");
     try app.repo_session.recent_repos.rememberRepo(allocator, "/old/second");
@@ -1576,7 +1593,7 @@ test "repo picker stale recent removal falls back to matching path after index s
         .submitted_path = try allocator.dupe(u8, "/old/first"),
         .result = .{ .input_error = error.PathDoesNotExist },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, finished);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, finished);
     finished = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
 
     try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
@@ -1611,9 +1628,11 @@ test "workspace path discovery keeps picker open for explicit repo selection" {
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    _ = try app.repoSession().acceptPathDiscovery(&ctx, .{ .workspace = .{
+    _ = try app.repoSession().acceptPathDiscovery(&ctx.ctx, .{ .workspace = .{
         .current_root = try allocator.dupe(u8, "/work"),
         .repos = repos,
     } });
@@ -1626,8 +1645,10 @@ test "workspace path discovery keeps picker open for explicit repo selection" {
     try std.testing.expectEqualStrings("gitframe", app.repo_session.repo_picker.list.filter.labels[1]);
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var failing_ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = failing.allocator() };
-    try std.testing.expectError(error.OutOfMemory, app.repoSession().acceptPendingWorkspace(&failing_ctx, 0));
+    var failing_ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    failing_ctx.init(failing.allocator(), std.testing.io);
+    defer failing_ctx.deinit();
+    try std.testing.expectError(error.OutOfMemory, app.repoSession().acceptPendingWorkspace(&failing_ctx.ctx, 0));
     try std.testing.expect(app.repo_session.repo_picker_discovery != null);
     try std.testing.expect(app.repo_session.repo_picker.mode);
     try std.testing.expectEqual(@as(usize, 2), app.repo_session.repo_picker_items.items.len);
@@ -1649,7 +1670,9 @@ test "closed repo picker rejects stale path discovery result after reopen" {
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const old_generation = app.repo_session.repo_picker.beginPathDiscovery();
     try app.repoSession().cancelPicker(allocator);
@@ -1665,7 +1688,7 @@ test "closed repo picker rejects stale path discovery result after reopen" {
             .canonical_root = try allocator.dupe(u8, "/old/repo"),
         } } },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, stale);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, stale);
     stale = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
 
     try std.testing.expect(new_generation != old_generation);
@@ -1687,7 +1710,9 @@ test "repo picker path cancel rejects stale discovery result" {
         },
     };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(app_message.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(app_message.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const edit_stale_generation = app.repo_session.repo_picker.beginPathDiscovery();
     app.repo_session.pending_repo_path_recent_source = .{ .kind = .repo, .index = 0 };
@@ -1704,7 +1729,7 @@ test "repo picker path cancel rejects stale discovery result" {
             .canonical_root = try allocator.dupe(u8, "/edited/old/repo"),
         } } },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, edit_stale);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, edit_stale);
     edit_stale = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
     try std.testing.expectEqualStrings("/current/repo", app.repo_session.repo_state.activeRoot().?);
 
@@ -1720,7 +1745,7 @@ test "repo picker path cancel rejects stale discovery result" {
             .canonical_root = try allocator.dupe(u8, "/old/repo"),
         } } },
     };
-    _ = try app.repoSession().finishPathDiscovery(&ctx, stale);
+    _ = try app.repoSession().finishPathDiscovery(&ctx.ctx, stale);
     stale = .{ .generation = 0, .submitted_path = &.{}, .result = .empty };
 
     try std.testing.expectEqual(prompt.RepoPickerInputMode.list, app.repo_session.repo_picker.input_mode);

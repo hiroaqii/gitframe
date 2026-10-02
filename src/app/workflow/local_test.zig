@@ -501,37 +501,39 @@ fn testCombinedHunkBundle(
 
 fn abandonSingleQueuedAction(
     app: *LocalHarness,
-    ctx: *chasen.Ctx(LocalHarness.Msg),
+    ctx: *chasen.testing.TestCtx(LocalHarness.Msg),
 ) !void {
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const message = entries[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    const message = try entries.fail(error.ConcurrencyUnavailable);
     switch (message) {
         .action_finished => |finished| switch (finished) {
-            .stage_file => |result| try finishStageFileForTest(app, ctx, result),
-            .stage_hunk => |result| try finishStageHunkForTest(app, ctx, result),
-            .unstage_file => |result| try finishUnstageFileForTest(app, ctx, result),
-            .unstage_hunk => |result| try finishUnstageHunkForTest(app, ctx, result),
+            .stage_file => |result| try finishStageFileForTest(app, &ctx.ctx, result),
+            .stage_hunk => |result| try finishStageHunkForTest(app, &ctx.ctx, result),
+            .unstage_file => |result| try finishUnstageFileForTest(app, &ctx.ctx, result),
+            .unstage_hunk => |result| try finishUnstageHunkForTest(app, &ctx.ctx, result),
             .discard_file => |result| try app.applyLocalActionIntent(
-                ctx,
-                app.localWorkflow().finishDiscardFile(ctx.allocator(), result),
+                &ctx.ctx,
+                app.localWorkflow().finishDiscardFile(ctx.ctx.allocator(), result),
             ),
             else => return error.ExpectedLocalActionTerminal,
         },
         else => return error.ExpectedLocalActionTerminal,
     }
 
-    _ = try app.changesRead().maybeStartQueuedRevalidation(ctx);
-    const revalidation = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 3), revalidation.len);
-    var status_task_message = revalidation[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer status_task_message.deinitUndelivered(ctx.allocator());
+    _ = try app.changesRead().maybeStartQueuedRevalidation(&ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
+    var revalidation = [_]chasen.testing.TestTask(LocalHarness.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&revalidation) |*task| task.deinit();
+    var status_task_message = try revalidation[0].fail(error.ConcurrencyUnavailable);
+    defer status_task_message.deinitUndelivered(ctx.ctx.allocator());
     const status_task = status_task_message.load_finished.changes.status;
-    var branch_task_message = revalidation[1].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer branch_task_message.deinitUndelivered(ctx.allocator());
+    var branch_task_message = try revalidation[1].fail(error.ConcurrencyUnavailable);
+    defer branch_task_message.deinitUndelivered(ctx.ctx.allocator());
     const branch_task = branch_task_message.load_finished.changes.branch_status;
-    var source_task_message = revalidation[2].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer source_task_message.deinitUndelivered(ctx.allocator());
+    var source_task_message = try revalidation[2].fail(error.ConcurrencyUnavailable);
+    defer source_task_message.deinitUndelivered(ctx.ctx.allocator());
     const source_task = source_task_message.load_finished.changes.source;
     const status_terminal: app_auto_reload.AuxiliaryTerminal = .{
         .generation = status_task.generation,
@@ -545,7 +547,7 @@ fn abandonSingleQueuedAction(
     };
     const source_generation = source_task.generation;
 
-    _ = app.changesReload().rejectSourceSpawn(ctx.allocator(), source_generation);
+    _ = app.changesReload().rejectSourceSpawn(ctx.ctx.allocator(), source_generation);
     _ = app.pages.changes.status_load.finishTerminal(status_terminal);
     _ = app.pages.changes.branch_status_load.finishTerminal(branch_terminal);
     app.pages.changes.status_load.markSuccess();
@@ -563,12 +565,12 @@ test "Changes mutation read fence ignores rejected hunk task launch" {
     defer app.pages.changes.deinit(allocator);
     const epoch_before_rejection = app.pages.changes.repository_read_authority.epoch;
 
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{
-        ._allocator = allocator,
-        ._pending_tasks_len = 16,
-    };
-    try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedHunk(&ctx));
-    ctx._pending_tasks_len = 0;
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    try ctx.fillTaskSlots(16);
+    try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedHunk(&ctx.ctx));
+    ctx.discardPendingTasks();
 
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
@@ -597,11 +599,13 @@ test "file and hunk action repository mismatch clear only their matching cursor 
         },
     };
     defer app.changesNavigation().clearActionCursor(allocator);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const stage_pending = beginAcceptedTestAction(&app, .stage_file);
     try installTestActionCursor(&app, allocator, .file, "src/stage.zig", stage_pending.generation);
-    try finishStageFileForTest(&app, &ctx, .{
+    try finishStageFileForTest(&app, &ctx.ctx, .{
         .pending = stage_pending,
         .repo_root = try allocator.dupe(u8, "/other"),
         .path = try allocator.dupe(u8, "src/stage.zig"),
@@ -609,11 +613,11 @@ test "file and hunk action repository mismatch clear only their matching cursor 
     });
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_file);
     try installTestActionCursor(&app, allocator, .file, "src/unstage.zig", unstage_pending.generation);
-    try finishUnstageFileForTest(&app, &ctx, .{
+    try finishUnstageFileForTest(&app, &ctx.ctx, .{
         .pending = unstage_pending,
         .repo_root = try allocator.dupe(u8, "/other"),
         .path = try allocator.dupe(u8, "src/unstage.zig"),
@@ -621,11 +625,11 @@ test "file and hunk action repository mismatch clear only their matching cursor 
     });
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
     const hunk_pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "src/hunk.zig", hunk_pending.generation);
-    try finishStageHunkForTest(&app, &ctx, .{
+    try finishStageHunkForTest(&app, &ctx.ctx, .{
         .pending = hunk_pending,
         .repo_root = try allocator.dupe(u8, "/other"),
         .path = try allocator.dupe(u8, "src/hunk.zig"),
@@ -635,7 +639,7 @@ test "file and hunk action repository mismatch clear only their matching cursor 
     });
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 
 test "hunk tasks launch exact typed file owners for stage and unstage" {
@@ -645,9 +649,11 @@ test "hunk tasks launch exact typed file owners for stage and unstage" {
     var app = try initStageHunkLaunchLocalHarness(allocator, roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.pages.changes.deinit(allocator);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.localWorkflow().stageSelectedHunk(&ctx);
+    try app.localWorkflow().stageSelectedHunk(&ctx.ctx);
     const pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingHunkAction;
     try std.testing.expectEqual(app_actions.ActionKind.stage_hunk, pending.kind);
     try std.testing.expectEqual(pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
@@ -659,7 +665,7 @@ test "hunk tasks launch exact typed file owners for stage and unstage" {
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 
     try addCurrentTestSessionHunkMark(&app, allocator, roots.a, "a", 0);
-    try app.localWorkflow().unstageSelectedHunk(&ctx);
+    try app.localWorkflow().unstageSelectedHunk(&ctx.ctx);
     const unstage_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedPendingHunkAction;
     try std.testing.expectEqual(app_actions.ActionKind.unstage_hunk, unstage_pending.kind);
     try std.testing.expectEqual(unstage_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
@@ -677,10 +683,13 @@ test "hunk task spawn rejection leaves no action or cursor owner" {
     var app = try initStageHunkLaunchLocalHarness(allocator, roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.pages.changes.deinit(allocator);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._pending_tasks_len = 16 };
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    try ctx.fillTaskSlots(16);
 
-    try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedHunk(&ctx));
-    ctx._pending_tasks_len = 0;
+    try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedHunk(&ctx.ctx));
+    ctx.discardPendingTasks();
     try std.testing.expect(!app.actionLifecycleView().hasPending());
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
 }
@@ -704,9 +713,11 @@ test "accepted hunk stage local mark allocation failure bounds its refresh owner
         const owned_root = try allocator.dupe(u8, roots.a);
         const owned_path = try allocator.dupe(u8, "a");
         failing.fail_index = failing.alloc_index + fail_offset;
-        var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
+        var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
-        try finishStageHunkForTest(&app, &ctx, .{
+        try finishStageHunkForTest(&app, &ctx.ctx, .{
             .pending = pending,
             .repo_root = owned_root,
             .path = owned_path,
@@ -720,7 +731,7 @@ test "accepted hunk stage local mark allocation failure bounds its refresh owner
         try std.testing.expect(app.pages.changes.status_load.pending == null);
         try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
         try std.testing.expectEqual(@as(usize, 0), app.pages.changes.staged_hunks.items.items.len);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     }
 }
 
@@ -1017,12 +1028,13 @@ test "hunk action results mutate session staged marks" {
     };
     defer app.pages.changes.staged_hunks.deinit(allocator);
     acceptTestSource(&app);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(LocalHarness.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
 
     const stage_pending = beginAcceptedTestAction(&app, .stage_hunk);
-    try finishStageHunkForTest(&app, &ctx, .{
+    try finishStageHunkForTest(&app, &ctx.ctx, .{
         .pending = stage_pending,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path = try allocator.dupe(u8, "a"),
@@ -1035,7 +1047,7 @@ test "hunk action results mutate session staged marks" {
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.staged_hunks.items.items.len);
 
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
-    try finishUnstageHunkForTest(&app, &ctx, .{
+    try finishUnstageHunkForTest(&app, &ctx.ctx, .{
         .pending = unstage_pending,
         .repo_root = try allocator.dupe(u8, "/repo"),
         .path = try allocator.dupe(u8, "a"),
@@ -1066,11 +1078,12 @@ test "hunk action none effect reloads status without adding a session mark" {
     defer app.repo_session.repo_state.deinit(allocator);
     activateTestChanges(&app);
     defer app.pages.changes.staged_hunks.deinit(allocator);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(LocalHarness.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const stage_pending = beginAcceptedTestAction(&app, .stage_hunk);
-    try finishStageHunkForTest(&app, &ctx, .{
+    try finishStageHunkForTest(&app, &ctx.ctx, .{
         .pending = stage_pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
@@ -1101,13 +1114,14 @@ test "hunk action none effect reloads status without removing a session mark" {
     defer app.repo_session.repo_state.deinit(allocator);
     activateTestChanges(&app);
     defer app.pages.changes.staged_hunks.deinit(allocator);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(LocalHarness.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
     try app.pages.changes.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
-    try finishUnstageHunkForTest(&app, &ctx, .{
+    try finishUnstageHunkForTest(&app, &ctx.ctx, .{
         .pending = unstage_pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
@@ -1139,13 +1153,14 @@ test "cached projection hunk unstage reload decision travels with task result" {
     defer app.repo_session.repo_state.deinit(allocator);
     activateTestChanges(&app);
     defer app.pages.changes.deinit(allocator);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(LocalHarness.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const mark_key = try currentTestSessionHunkMarkKey(&app, 1);
     try app.pages.changes.staged_hunks.addExact(allocator, roots.a, "a", mark_key);
     const unstage_pending = beginAcceptedTestAction(&app, .unstage_hunk);
-    try finishUnstageHunkForTest(&app, &ctx, .{
+    try finishUnstageHunkForTest(&app, &ctx.ctx, .{
         .pending = unstage_pending,
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
@@ -1160,7 +1175,7 @@ test "cached projection hunk unstage reload decision travels with task result" {
         .diff_load => {},
         .repo_discovery => return error.ExpectedReloadAfterCachedHunkUnstage,
     }
-    try std.testing.expectEqual(@as(usize, 3), ctx._pending_tasks[0..ctx._pending_tasks_len].len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
 }
 
 test "directory stage target uses sidebar cursor and status subtree" {
@@ -1293,11 +1308,13 @@ test "stage unstage and discard launch typed action cursor owners with task gene
     defer app.pages.changes.git_status.deinit();
     defer app.changesNavigation().clearActionCursor(allocator);
     acceptTestSource(&app);
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator };
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     var stageable = try git_status.StatusBundle.parseOwned(allocator, " M src/a\x00?? src/b\x00");
     try app.pages.changes.git_status.replace(roots.a, &stageable);
-    try app.localWorkflow().stageSelectedFile(&ctx);
+    try app.localWorkflow().stageSelectedFile(&ctx.ctx);
     const stage_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedStageAction;
     try std.testing.expectEqual(app_actions.ActionKind.stage_file, stage_pending.kind);
     try std.testing.expectEqual(stage_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
@@ -1308,7 +1325,7 @@ test "stage unstage and discard launch typed action cursor owners with task gene
 
     var staged = try git_status.StatusBundle.parseOwned(allocator, "R  src/a\x00outside/old\x00M  src/b\x00");
     try app.pages.changes.git_status.replace(roots.a, &staged);
-    try app.localWorkflow().unstageSelectedFile(&ctx);
+    try app.localWorkflow().unstageSelectedFile(&ctx.ctx);
     const unstage_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedUnstageAction;
     try std.testing.expectEqual(app_actions.ActionKind.unstage_file, unstage_pending.kind);
     try std.testing.expectEqual(unstage_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
@@ -1322,7 +1339,7 @@ test "stage unstage and discard launch typed action cursor owners with task gene
         .path = try allocator.dupe(u8, "src/a"),
     };
     app.overlay.openDiscardFile();
-    try app.localWorkflow().confirmDiscardFile(&ctx);
+    try app.localWorkflow().confirmDiscardFile(&ctx.ctx);
     const discard_pending = app.actionLifecycleView().acceptedPending() orelse return error.ExpectedDiscardAction;
     try std.testing.expectEqual(app_actions.ActionKind.discard_file, discard_pending.kind);
     try std.testing.expectEqual(discard_pending.generation, app.pages.changes.action_cursor.actionGeneration().?);
@@ -1468,16 +1485,18 @@ test "Changes unstage keeps rename units and unrelated index worktree bytes" {
         app.pages.changes.status_load.markSuccess();
         app.pages.changes.branch_status_load.markSuccess();
         acceptTestSource(&app);
-        var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._io = io };
-        defer chasen.testing.discardPendingTasks(LocalHarness.Msg, &ctx);
-        try app.localWorkflow().unstageSelectedFile(&ctx);
-        const queued = ctx.takePendingTasks();
-        try std.testing.expectEqual(@as(usize, 1), queued.len);
+        var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+        ctx.init(allocator, io);
+        defer ctx.deinit();
+        try app.localWorkflow().unstageSelectedFile(&ctx.ctx);
+        try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+        var queued = ctx.takeTask(0).?;
+        defer queued.deinit();
         // Both the owned proposal and borrowed status may disappear before execution.
         app.changesReload().clearLoadedDiff(allocator);
         app.pages.changes.git_status.deinit();
         if (case == .locked) try tmp.dir.writeFile(io, .{ .sub_path = ".git/index.lock", .data = "locked\n" });
-        const message = try queued[0].run(allocator, io);
+        const message = try queued.run();
         const finished = message.action_finished.unstage_file;
         try std.testing.expect(if (case == .locked) finished.result == .failed else finished.result == .ok);
         const intent = app.localWorkflow().finishUnstageFile(allocator, finished);
@@ -1582,28 +1601,29 @@ test "queued local Git mutation retains the accepted root across path replacemen
     var first_probe = try app.repoSessionView().activeCapability().?.duplicate();
     const reusable_handle = first_probe.handle;
     first_probe.deinit();
-    var rejected_ctx: chasen.Ctx(LocalHarness.Msg) = .{
-        ._allocator = allocator,
-        ._io = io,
-        ._pending_tasks_len = 16,
-    };
-    try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedFile(&rejected_ctx));
-    rejected_ctx._pending_tasks_len = 0;
+    var rejected_ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    rejected_ctx.init(allocator, io);
+    defer rejected_ctx.deinit();
+    try rejected_ctx.fillTaskSlots(16);
+    try std.testing.expectError(error.TaskLimitExceeded, app.localWorkflow().stageSelectedFile(&rejected_ctx.ctx));
+    rejected_ctx.discardPendingTasks();
     var second_probe = try app.repoSessionView().activeCapability().?.duplicate();
     try std.testing.expectEqual(reusable_handle, second_probe.handle);
     second_probe.deinit();
 
-    var ctx: chasen.Ctx(LocalHarness.Msg) = .{ ._allocator = allocator, ._io = io };
-    defer chasen.testing.discardPendingTasks(LocalHarness.Msg, &ctx);
-    try app.localWorkflow().stageSelectedFile(&ctx);
-    const queued = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    var ctx: chasen.testing.TestCtx(LocalHarness.Msg) = undefined;
+    ctx.init(allocator, io);
+    defer ctx.deinit();
+    try app.localWorkflow().stageSelectedFile(&ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var queued = ctx.takeTask(0).?;
+    defer queued.deinit();
     try tmp.dir.rename("slot", tmp.dir, "physical-a", io);
     try tmp.dir.rename("replacement", tmp.dir, "slot", io);
-    const message = try queued[0].run(allocator, io);
+    const message = try queued.run();
     switch (message) {
         .action_finished => |finished| switch (finished) {
-            .stage_file => |result| try finishStageFileForTest(&app, &ctx, result),
+            .stage_file => |result| try finishStageFileForTest(&app, &ctx.ctx, result),
             else => return error.ExpectedStageFileTerminal,
         },
         else => return error.ExpectedStageFileTerminal,

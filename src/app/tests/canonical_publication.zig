@@ -154,8 +154,10 @@ fn commitDiscovery(
     active_index: usize,
     origin: repo_session.CommitOrigin,
 ) !repo_session.CommitOutcome {
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    return repoSession(app).commitDiscovered(&ctx.ctx, result, active_index, origin);
 }
 
 fn beginAcceptedTestAction(app: *App, kind: app_actions.ActionKind) app_actions.PendingAction {
@@ -446,15 +448,16 @@ test "Changes mutation read fence follows accepted action launch and exact termi
     var app = try publicStageFileTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const epoch_before_launch = app.pages.changes.repository_read_authority.epoch;
-    try app.update(.{ .changes = .toggle_selected_file }, &ctx);
+    try app.update(.{ .changes = .toggle_selected_file }, &ctx.ctx);
     const pending = app.action_runtime.view().acceptedPending() orelse return error.ExpectedPendingAction;
-    const action_tasks = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), action_tasks.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var action_tasks = ctx.takeTask(0).?;
+    defer action_tasks.deinit();
 
     try std.testing.expect(!app.pages.changes.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(app.pages.changes.repository_read_authority.epoch.eql(epoch_before_launch.next()));
@@ -469,20 +472,17 @@ test "Changes mutation read fence follows accepted action launch and exact termi
         .repo_root = try allocator.dupe(u8, roots.a),
         .path = try allocator.dupe(u8, "a"),
         .result = .{ .failed_static = "stale fixture" },
-    } }), &ctx);
+    } }), &ctx.ctx);
     try std.testing.expect(app.action_runtime.view().isAccepted(pending));
     try std.testing.expect(app.pages.changes.repository_read_authority.ownsMutation(pending));
 
-    const exact = action_tasks[0].failed(
-        error.ConcurrencyUnavailable,
-        allocator,
-    );
-    try app.update(exact, &ctx);
+    const exact = try action_tasks.fail(error.ConcurrencyUnavailable);
+    try app.update(exact, &ctx.ctx);
 
     try std.testing.expect(!app.action_runtime.view().isCurrent(pending));
     try std.testing.expect(app.pages.changes.repository_read_authority.mayStartRepositoryRead());
     try std.testing.expect(app.pages.changes.repository_read_authority.epoch.eql(epoch_before_launch.next()));
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
 }
 test "Changes mutation read fence drains old production reads without publication" {
     const allocator = std.testing.allocator;
@@ -521,12 +521,14 @@ test "Changes mutation read fence drains old production reads without publicatio
 
     const cycle_id = app.pages.changes.auto_reload.beginCycle() orelse
         return error.ExpectedBackgroundCycle;
-    var task_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer task_ctx.runtimeClearPendingEffectCopies();
+    var task_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    task_ctx.init(allocator, std.testing.io);
+    defer task_ctx.deinit();
     app.pages.changes.auto_reload.discardEmptyCycle(cycle_id);
-    try app.update(.auto_reload_tick, &task_ctx);
-    const queued = task_ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 3), queued.len);
+    try app.update(.auto_reload_tick, &task_ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 3), task_ctx.pendingTaskCount());
+    var queued = [_]chasen.testing.TestTask(App.Msg){ task_ctx.takeTask(0).?, task_ctx.takeTask(0).?, task_ctx.takeTask(0).? };
+    defer for (&queued) |*task| task.deinit();
 
     const root_identity = app.repo_session.view().activeIdentity() orelse
         return error.ExpectedRootIdentity;
@@ -596,11 +598,11 @@ test "Changes mutation read fence drains old production reads without publicatio
         },
     );
 
-    var status_message = queued[0].failed(error.ConcurrencyUnavailable, allocator);
+    var status_message = try queued[0].fail(error.ConcurrencyUnavailable);
     status_message.load_finished.changes.status.result = .{ .loaded = try git_status.StatusBundle.parseOwned(allocator, " M new.zig\x00") };
-    var branch_message = queued[1].failed(error.ConcurrencyUnavailable, allocator);
+    var branch_message = try queued[1].fail(error.ConcurrencyUnavailable);
     branch_message.load_finished.changes.branch_status.result = .{ .loaded = try branchStatusBundleForTest(allocator, .{ .oid = "new-oid", .branch = "new-branch" }) };
-    var source_message = queued[2].failed(error.ConcurrencyUnavailable, allocator);
+    var source_message = try queued[2].fail(error.ConcurrencyUnavailable);
     source_message.load_finished.changes.source.result = .{ .loaded = try app_load.buildLoadedBundle(allocator, app_test_support.diff_unstaged_projection) };
 
     const pending = beginAcceptedTestAction(&app, .push);
@@ -642,13 +644,13 @@ test "Changes mutation read fence drains old production reads without publicatio
         app.pages.changes.auto_reload.background_cycle.?.acceptance ==
             .superseded_by_mutation;
 
-    var delivery_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
+    var delivery_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    delivery_ctx.init(allocator, std.testing.io);
+    defer delivery_ctx.deinit();
 
-    defer delivery_ctx.runtimeClearPendingEffectCopies();
-    defer chasen.testing.discardPendingTasks(App.Msg, &delivery_ctx);
-    try app.update(status_message, &delivery_ctx);
-    try app.update(branch_message, &delivery_ctx);
-    try app.update(source_message, &delivery_ctx);
+    try app.update(status_message, &delivery_ctx.ctx);
+    try app.update(branch_message, &delivery_ctx.ctx);
+    try app.update(source_message, &delivery_ctx.ctx);
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = old_projection_result_request,
         .result = .{ .ready = .{ .generated_added_file = try app_changes_projection.generatedFileFromContent(
@@ -656,12 +658,12 @@ test "Changes mutation read fence drains old production reads without publicatio
             "new-generated.zig",
             "const replacement = true;\n",
         ) } },
-    } } }), &delivery_ctx);
+    } } }), &delivery_ctx.ctx);
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection_syntax = .{
         .request = old_syntax_result_request,
         .snapshot_fingerprint = displayed_fingerprint,
         .result = .{ .terminal_plain = .provider_unavailable },
-    } } }), &delivery_ctx);
+    } } }), &delivery_ctx.ctx);
 
     const displayed_retained_after_terminals = switch (app.pages.changes.changes_projection.displayed) {
         .ready => |ready| switch (ready.value) {
@@ -687,13 +689,13 @@ test "Changes mutation read fence drains old production reads without publicatio
             app.pages.changes.branch_status.status.branchName().?,
             "old-branch",
         );
-    const stale_completions_started_no_reads = delivery_ctx._pending_tasks_len == 0;
+    const stale_completions_started_no_reads = delivery_ctx.pendingTaskCount() == 0;
     const old_read_owners_retired =
         app.pages.changes.load.pending == null and
         app.pages.changes.status_load.pending == null and
         app.pages.changes.branch_status_load.pending == null and
         app.pages.changes.auto_reload.background_cycle == null;
-    try app.update(action_terminal, &delivery_ctx);
+    try app.update(action_terminal, &delivery_ctx.ctx);
     const exact_terminal = !app.action_runtime.view().isCurrent(pending);
     const fence_reopened =
         app.pages.changes.repository_read_authority.mayStartRepositoryRead();
@@ -713,7 +715,7 @@ test "Changes mutation read fence drains old production reads without publicatio
     try std.testing.expect(old_read_owners_retired);
     try std.testing.expect(exact_terminal);
     try std.testing.expect(fence_reopened);
-    try std.testing.expectEqual(@as(u8, 3), delivery_ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 3), delivery_ctx.pendingTaskCount());
 }
 test "background branch completion during repository action is discarded and releases cycle" {
     var app: App = .{ .allocator = std.testing.allocator };
@@ -734,8 +736,9 @@ test "background branch completion during repository action is discarded and rel
         .oid = "new-oid",
         .branch = "new-branch",
     });
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .branch_status = .{
         .identity = page.RequestIdentity.changes(0, 1),
@@ -743,7 +746,7 @@ test "background branch completion during repository action is discarded and rel
         .background_cycle_id = cycle_id,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = changed },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expectEqualStrings("old-branch", app.pages.changes.branch_status.status.branchName().?);
     try std.testing.expect(!app.pages.changes.branch_status_load.isPending());
@@ -758,12 +761,13 @@ test "inactive page timer starts no Changes work" {
             .interval_ns = 3 * std.time.ns_per_s,
         } } },
     };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.auto_reload_tick, &ctx);
+    try app.update(.auto_reload_tick, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
 test "mutation read start gate retains manual and queued revalidation until reopen" {
@@ -778,32 +782,32 @@ test "mutation read start gate retains manual and queued revalidation until reop
         .kind = .stage_hunk,
     };
     try std.testing.expect(app.pages.changes.repository_read_authority.closeForMutation(owner));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.reload, &ctx);
+    try app.update(.reload, &ctx.ctx);
     try std.testing.expectEqual(
         activation_id,
         app.pages.changes.activation.revalidation_requested orelse return error.ExpectedRevalidationIntent,
     );
-    try app.update(.git_action_spinner_tick, &ctx);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expectEqual(
         activation_id,
         app.pages.changes.activation.revalidation_requested orelse return error.ExpectedRetainedRevalidationIntent,
     );
 
-    try app.update(.reload, &ctx);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try app.update(.reload, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expectEqual(
         activation_id,
         app.pages.changes.activation.revalidation_requested orelse return error.ExpectedCoalescedRevalidationIntent,
     );
 
     try std.testing.expect(app.pages.changes.repository_read_authority.reopenForMutation(owner));
-    try app.update(.git_action_spinner_tick, &ctx);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.activation.revalidation_requested == null);
     try std.testing.expect(app.pages.changes.load.pending != null);
 }
@@ -823,12 +827,13 @@ test "mutation read start gate blocks forced auto reload before cycle ownership"
         .kind = .unstage_hunk,
     };
     try std.testing.expect(app.pages.changes.repository_read_authority.closeForMutation(owner));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.auto_reload_tick, &ctx);
+    try app.update(.auto_reload_tick, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.auto_reload.background_cycle == null);
     try std.testing.expect(app.pages.changes.load.pending == null);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
@@ -845,16 +850,17 @@ test "closed read authority queues action-terminal revalidation instead of dropp
         .kind = .stage_file,
     };
     try std.testing.expect(app.pages.changes.repository_read_authority.closeForMutation(owner));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     // Model the exact terminal's activation-scoped fallback, then let the
     // public update tail encounter the still-closed read fence.
     app.pages.changes.activation.queueActionTerminalRevalidation();
-    try app.update(.git_action_spinner_tick, &ctx);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.activation.hasQueuedFullRevalidation());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.load.pending == null);
     try std.testing.expect(app.pages.changes.pending_reload == null);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
@@ -871,15 +877,16 @@ test "closed read authority consequence is a typed route policy" {
         .kind = .unstage_file,
     };
     try std.testing.expect(app.pages.changes.repository_read_authority.closeForMutation(owner));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.auto_reload_tick, &ctx);
+    try app.update(.auto_reload_tick, &ctx.ctx);
     try std.testing.expect(!app.pages.changes.activation.hasQueuedFullRevalidation());
 
-    try app.update(.reload, &ctx);
+    try app.update(.reload, &ctx.ctx);
     try std.testing.expect(app.pages.changes.activation.hasQueuedFullRevalidation());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "closed read authority keeps watch tick drop semantics without queueing" {
     const allocator = std.testing.allocator;
@@ -897,15 +904,16 @@ test "closed read authority keeps watch tick drop semantics without queueing" {
         .kind = .stage_hunk,
     };
     try std.testing.expect(app.pages.changes.repository_read_authority.closeForMutation(owner));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.auto_reload_tick, &ctx);
+    try app.update(.auto_reload_tick, &ctx.ctx);
 
     // Copy 5 keeps its drop-and-next-tick semantics: no queued revalidation
     // fires when the authority reopens.
     try std.testing.expect(!app.pages.changes.activation.hasQueuedFullRevalidation());
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.auto_reload.background_cycle == null);
     try std.testing.expect(app.redraw_plan.resolvesToSkip());
 }
@@ -921,13 +929,14 @@ test "mutation read start gate makes direct App read starters inert" {
         .kind = .stage_file,
     };
     try std.testing.expect(app.pages.changes.repository_read_authority.closeForMutation(owner));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.reload, &ctx);
-    try app.update(.auto_reload_tick, &ctx);
+    try app.update(.reload, &ctx.ctx);
+    try app.update(.auto_reload_tick, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.load.pending == null);
     try std.testing.expect(app.pages.changes.pending_reload == null);
     try std.testing.expect(app.pages.changes.status_load.pending == null);
@@ -959,12 +968,13 @@ test "mutation read promotion gate makes App projection scheduling inert" {
         .kind = .unstage_file,
     };
     try std.testing.expect(app.pages.changes.repository_read_authority.closeForMutation(owner));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.git_action_spinner_tick, &ctx);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.changes_projection.pending == null);
 }
 test "Changes re-entry queues one revalidation behind an older read and leaving cancels it" {
@@ -974,17 +984,18 @@ test "Changes re-entry queues one revalidation behind an older read and leaving 
         } },
     };
     const first_activation = activateChanges(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try requestPageSwitchForTest(&app, &ctx, .repository);
-    try requestPageSwitchForTest(&app, &ctx, .changes);
+    try requestPageSwitchForTest(&app, &ctx.ctx, .repository);
+    try requestPageSwitchForTest(&app, &ctx.ctx, .changes);
     const second_activation = app.pages.changes.activation.state.active.activation_id;
     try std.testing.expect(first_activation != second_activation);
     try std.testing.expectEqual(@as(?u64, second_activation), app.pages.changes.activation.revalidation_requested);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
-    try requestPageSwitchForTest(&app, &ctx, .repository);
+    try requestPageSwitchForTest(&app, &ctx.ctx, .repository);
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
     try std.testing.expect(app.pages.changes.activation.revalidation_requested == null);
 }
@@ -1009,22 +1020,23 @@ test "Changes re-entry starts immediate fingerprint revalidation even when polli
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     defer app.repo_session.repo_state.deinit(allocator);
     app.pages.changes.auto_reload.acceptSource(content_fingerprint.Fingerprint.init("retained"));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try requestPageSwitchForTest(&app, &ctx, .changes);
+    try requestPageSwitchForTest(&app, &ctx.ctx, .changes);
     try env.put("ISSUE54_BRANCH_ENV_CANARY", "parent-after-queue");
 
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
-    const entries = ctx.takePendingTasks();
-    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
+    var entries = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&entries) |*task| task.deinit();
+    var status_task_message = try entries[0].fail(error.ConcurrencyUnavailable);
     defer status_task_message.deinitUndelivered(allocator);
     const status_task = status_task_message.load_finished.changes.status;
-    var branch_task_message = entries[1].failed(error.ConcurrencyUnavailable, allocator);
+    var branch_task_message = try entries[1].fail(error.ConcurrencyUnavailable);
     defer branch_task_message.deinitUndelivered(allocator);
     const branch_task = branch_task_message.load_finished.changes.branch_status;
-    var diff_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    var diff_task_message = try entries[2].fail(error.ConcurrencyUnavailable);
     defer diff_task_message.deinitUndelivered(allocator);
     const diff_task = diff_task_message.load_finished.changes.source;
     const active = app.pages.changes.activation.state.active;
@@ -1080,17 +1092,18 @@ test "repo picker capability rejection preserves Changes navigation and does not
     };
     app.remote_workflow.branch_switch_load_pending = 12;
     app.overlay.openSwitchBranch(.changes);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     const generation = app.repo_session.repo_picker.beginPathDiscovery();
 
     try app.update(App.Msg.loadFinished(.{ .shell = .{ .repo_path_discovery = .{
         .generation = generation,
         .submitted_path = try allocator.dupe(u8, linked),
         .result = .{ .discovered = try testSingleRepoDiscovery(allocator, linked) },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expectEqual(prior_epoch, app.repo_session.view().epoch());
     try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
     try std.testing.expect(prior_identity.eql(app.repo_session.view().activeIdentity().?));
@@ -1113,12 +1126,13 @@ test "committed repository replacement resets Changes before source spawn failur
     var app: App = .{ .allocator = allocator, .active_page = .repository };
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try publishPathDiscovery(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         try testSingleRepoDiscovery(allocator, roots.a),
@@ -1130,15 +1144,15 @@ test "committed repository replacement resets Changes before source spawn failur
     app.pages.changes.search.mode = true;
     setDiffSearchQuery(&app, "needle");
 
-    ctx._pending_tasks_len = 16;
+    try ctx.fillTaskSlots(16);
     try std.testing.expectError(error.TaskLimitExceeded, publishPathDiscovery(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.b,
         try testSingleRepoDiscovery(allocator, roots.b),
     ));
-    ctx._pending_tasks_len = 0;
+    ctx.discardPendingTasks();
 
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
@@ -1162,14 +1176,15 @@ test "repo discovery remains owned when recent-store update fails" {
     const allocator = failing.allocator();
     defer app.repo_session.repo_state.deinit(allocator);
     defer app.repo_session.recent_repos.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try std.testing.expectError(error.OutOfMemory, app.update(App.Msg.loadFinished(.{ .coordinator = .{ .repo_discovery = .{
         .identity = page.RequestIdentity.changes(0, activation_id),
         .generation = generation,
         .result = .{ .discovered = discovery },
-    } } }), &ctx));
+    } } }), &ctx.ctx));
 
     try std.testing.expect(app.repo_session.repo_state.discovery == null);
     try std.testing.expectEqual(@as(usize, 0), app.repo_session.recent_repos.entries.items.len);
@@ -1183,8 +1198,9 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
     defer roots.deinit();
     var app: App = .{ .active_page = .repository };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const first_activation = app.pages.changes.activation.activate(0, .pending, .unavailable, .unavailable);
     const first_generation = app.pages.changes.load.beginRepoDiscovery();
@@ -1192,13 +1208,13 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
         .identity = page.RequestIdentity.changes(0, first_activation),
         .generation = first_generation,
         .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.a) },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     try std.testing.expectEqualStrings(roots.a, app.repo_session.view().activeRoot().?);
     try std.testing.expectEqual(@as(u64, 1), app.repo_session.repo_epoch);
 
-    try app.update(.enter_repo_picker, &ctx);
-    try app.update(.repo_picker_enter_filter_input, &ctx);
-    try app.update(.{ .repo_picker_insert = 'a' }, &ctx);
+    try app.update(.enter_repo_picker, &ctx.ctx);
+    try app.update(.repo_picker_enter_filter_input, &ctx.ctx);
+    try app.update(.{ .repo_picker_insert = 'a' }, &ctx.ctx);
     const picker_focus = app.repo_session.repo_picker.list.filter.list.focusedIndex();
 
     const same_activation = app.pages.changes.activation.activate(app.repo_session.repo_epoch, .pending, .pending, .pending);
@@ -1207,7 +1223,7 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
         .identity = page.RequestIdentity.changes(1, same_activation),
         .generation = same_generation,
         .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.a) },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     try std.testing.expectEqual(@as(u64, 1), app.repo_session.repo_epoch);
     try std.testing.expect(app.repo_session.repo_picker.mode);
     try std.testing.expect(app.repo_session.repo_picker.input_mode == .filter);
@@ -1218,7 +1234,7 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
     const same_epoch_stale_generation = app.pages.changes.load.beginRepoDiscovery();
     try publishPathDiscovery(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         try testNamedSingleRepoDiscovery(allocator, "fresh selection", roots.a),
@@ -1228,7 +1244,7 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
         .identity = page.RequestIdentity.changes(1, same_epoch_stale_activation),
         .generation = same_epoch_stale_generation,
         .result = .{ .discovered = try testNamedSingleRepoDiscovery(allocator, "stale completion", roots.a) },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     const committed = app.repo_session.repo_state.discovery orelse return error.ExpectedSingleRepository;
     switch (committed) {
         .single_repo => |entry| try std.testing.expectEqualStrings("fresh selection", entry.label),
@@ -1240,7 +1256,7 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
     const stale_generation = app.pages.changes.load.beginRepoDiscovery();
     try publishPathDiscovery(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.b,
         try testSingleRepoDiscovery(allocator, roots.b),
@@ -1252,13 +1268,13 @@ test "repo discovery completion cannot overwrite a newer repository commitment" 
         .identity = page.RequestIdentity.changes(1, stale_activation),
         .generation = stale_generation,
         .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.a) },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
     try std.testing.expectEqual(@as(u64, 2), app.repo_session.repo_epoch);
 
     try publishPathDiscovery(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         try testSingleRepoDiscovery(allocator, roots.a),
@@ -1272,13 +1288,13 @@ test "inactive repository change invalidates retained source before equal-finger
     defer roots.deinit();
     var app: App = .{ .active_page = .repository, .allocator = allocator };
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     try publishPathDiscovery(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         try testSingleRepoDiscovery(allocator, roots.a),
@@ -1343,7 +1359,7 @@ test "inactive repository change invalidates retained source before equal-finger
 
     try publishPathDiscovery(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.b,
         try testSingleRepoDiscovery(allocator, roots.b),
@@ -1365,14 +1381,15 @@ test "inactive repository change invalidates retained source before equal-finger
         status_revision,
     ));
 
-    try requestPageSwitchForTest(&app, &ctx, .changes);
+    try requestPageSwitchForTest(&app, &ctx.ctx, .changes);
 
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.changes_projection.cacheLen());
-    const pending = ctx.takePendingTasks();
-    pending[0].discard(allocator);
-    pending[1].discard(allocator);
-    var diff_message = pending[2].failed(error.ConcurrencyUnavailable, allocator);
+    var pending = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&pending) |*task| task.deinit();
+    pending[0].deinit();
+    pending[1].deinit();
+    var diff_message = try pending[2].fail(error.ConcurrencyUnavailable);
     defer diff_message.deinitUndelivered(allocator);
     const diff_task = diff_message.load_finished.changes.source;
     try std.testing.expect(app.pages.changes.auto_reload.accepted_source == null);
@@ -1389,15 +1406,16 @@ test "inactive Changes failure stays page scoped and skips redraw" {
             .pending = .{ .generation = 1 },
         } } },
     };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .status = .{
         .identity = page.RequestIdentity.changes(5, 1),
         .generation = 1,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .failed_static = "offline" },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     try std.testing.expectEqualStrings("", app.status.text());
@@ -1411,13 +1429,14 @@ test "manual reload queues revalidation without superseding an action cursor pai
     };
     _ = activateChanges(&app);
     defer changesNavigation(&app).clearActionCursor(std.testing.allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try installTestActionCursor(&app, std.testing.allocator, .file, "src/main.zig", 9);
     try promoteTestActionCursor(&app, 9);
 
-    try app.update(.reload, &ctx);
+    try app.update(.reload, &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.action_cursor.hasOwner());
     try std.testing.expectEqual(
@@ -1444,8 +1463,9 @@ test "Changes canonical publication page transition drains source-first results 
         defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer ctx.runtimeClearPendingEffectCopies();
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
 
         const prior = changesNavigationView(&app).activeCombinedProjection() orelse
             return error.ExpectedCombinedProjection;
@@ -1455,14 +1475,14 @@ test "Changes canonical publication page transition drains source-first results 
         const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
         try finishCanonicalPageTransitionSource(
             &app,
-            &ctx,
+            &ctx.ctx,
             allocator,
             reads,
             case.source,
         );
         try std.testing.expect(app.pages.changes.deferred_source_apply != null);
         try std.testing.expect(!app.pages.changes.deferredSourceBlocksPageTransition());
-        for (0..6) |_| try applyCanonicalPageTransitionFilterToggle(&app, &ctx);
+        for (0..6) |_| try applyCanonicalPageTransitionFilterToggle(&app, &ctx.ctx);
 
         try requestCanonicalPageTransition(
             &app,
@@ -1481,7 +1501,7 @@ test "Changes canonical publication page transition drains source-first results 
             source_revision,
             status_revision,
         );
-        for (0..2) |_| try applyCanonicalPageTransitionFilterToggle(&app, &ctx);
+        for (0..2) |_| try applyCanonicalPageTransitionFilterToggle(&app, &ctx.ctx);
 
         try requestCanonicalPageTransition(
             &app,
@@ -1492,11 +1512,11 @@ test "Changes canonical publication page transition drains source-first results 
         const new_activation = app.pages.changes.activation.currentIdentity() orelse
             return error.ExpectedChangesActivation;
         try std.testing.expect(new_activation.activation_id != reads.source_identity.activation_id);
-        try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
         try finishCanonicalPublicationStatus(
             &app,
-            &ctx,
+            &ctx.ctx,
             allocator,
             roots.a,
             reads,
@@ -1505,7 +1525,7 @@ test "Changes canonical publication page transition drains source-first results 
         try std.testing.expect(app.pages.changes.canonical_status_drain == null);
         try finishCanonicalPageTransitionBranch(
             &app,
-            &ctx,
+            &ctx.ctx,
             allocator,
             roots.a,
             reads,
@@ -1532,8 +1552,9 @@ test "Changes canonical publication page transition drains status-first source w
     defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
@@ -1543,7 +1564,7 @@ test "Changes canonical publication page transition drains status-first source w
     const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
     try finishCanonicalPublicationStatus(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         reads,
@@ -1555,18 +1576,18 @@ test "Changes canonical publication page transition drains status-first source w
     try std.testing.expect(app.pages.changes.canonical_publication == null);
     try std.testing.expect(app.pages.changes.canonical_status_drain == null);
     try requestCanonicalPageTransition(&app, &ctx, .changes, .keyboard);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
     try finishCanonicalPageTransitionSource(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         reads,
         .changed,
     );
     try finishCanonicalPageTransitionBranch(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         reads,
@@ -1592,8 +1613,9 @@ test "Changes canonical publication page transition retires an old projection re
     defer app.pages.changes.deinit(allocator);
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
@@ -1603,7 +1625,7 @@ test "Changes canonical publication page transition retires an old projection re
     const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
     try finishCanonicalPublicationStatus(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         reads,
@@ -1611,13 +1633,13 @@ test "Changes canonical publication page transition retires an old projection re
     );
     try finishCanonicalPageTransitionSource(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         reads,
         .changed,
     );
-    try app.update(.git_action_spinner_tick, &ctx);
-    var old_request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    var old_request = try takeCanonicalPublicationProjectionRequest(&ctx);
     var old_request_owned = true;
     defer if (old_request_owned) old_request.deinit(allocator);
     try std.testing.expect(app.pages.changes.changes_projection.pending != null);
@@ -1627,16 +1649,16 @@ test "Changes canonical publication page transition retires an old projection re
     try std.testing.expect(app.pages.changes.deferred_source_apply == null);
     try std.testing.expect(app.pages.changes.changes_projection.pending == null);
     try requestCanonicalPageTransition(&app, &ctx, .changes, .page_bar);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = old_request,
         .result = .{ .failed_static = "stale projection" },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     old_request_owned = false;
     try finishCanonicalPageTransitionBranch(
         &app,
-        &ctx,
+        &ctx.ctx,
         allocator,
         roots.a,
         reads,
@@ -1664,9 +1686,9 @@ test "Changes canonical publication page transition retires generic page exits" 
         defer app.pages.changes.deinit(allocator);
         defer app.pages.repository.deinit(allocator);
         defer app.repo_session.repo_state.deinit(allocator);
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer ctx.runtimeClearPendingEffectCopies();
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
         _ = try startCanonicalPublicationWatch(&app, &ctx, allocator);
 
         try requestCanonicalPageTransition(
@@ -1693,8 +1715,9 @@ test "Changes canonical publication retains the prior body for every direct acti
                 var app = try canonicalPublicationTestApp(allocator, roots.a);
                 defer app.pages.changes.deinit(allocator);
                 defer app.repo_session.repo_state.deinit(allocator);
-                var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-                defer ctx.runtimeClearPendingEffectCopies();
+                var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+                ctx.init(allocator, std.testing.io);
+                defer ctx.deinit();
 
                 const prior = changesNavigationView(&app).activeCombinedProjection() orelse
                     return error.ExpectedCombinedProjection;
@@ -1702,20 +1725,20 @@ test "Changes canonical publication retains the prior body for every direct acti
                 const prior_content_token = prior.presentation.content_token;
                 const source_revision_before = app.pages.changes.source_session_revision;
                 const status_revision_before = app.pages.changes.status_snapshot_revision;
-                try finishCanonicalPublicationAction(&app, &ctx, allocator, action, roots.a);
+                try finishCanonicalPublicationAction(&app, &ctx.ctx, allocator, action, roots.a);
                 const reads = try takeCanonicalPublicationReads(&ctx, allocator);
                 app.screen_transition.arm(app.pages.changes.activation.currentIdentity().?);
 
                 if (status_first) {
-                    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
+                    try finishCanonicalPublicationStatus(&app, &ctx.ctx, allocator, roots.a, reads, "MM a\x00");
                     try expectRetainedCanonicalPublication(&app, prior_hunks);
                 }
                 if (source_empty) {
-                    try finishCanonicalPublicationEmpty(&app, &ctx, reads);
+                    try finishCanonicalPublicationEmpty(&app, &ctx.ctx, reads);
                 } else {
                     try finishCanonicalPublicationSource(
                         &app,
-                        &ctx,
+                        &ctx.ctx,
                         allocator,
                         reads,
                         app_test_support.diff_unstaged_projection,
@@ -1723,13 +1746,13 @@ test "Changes canonical publication retains the prior body for every direct acti
                 }
                 try expectRetainedCanonicalPublication(&app, prior_hunks);
                 if (!status_first) {
-                    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
+                    try finishCanonicalPublicationStatus(&app, &ctx.ctx, allocator, roots.a, reads, "MM a\x00");
                     try expectRetainedCanonicalPublication(&app, prior_hunks);
                 }
 
-                try app.update(.git_action_spinner_tick, &ctx);
+                try app.update(.git_action_spinner_tick, &ctx.ctx);
                 try std.testing.expect(app.screen_transition == .waiting);
-                var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+                var request = try takeCanonicalPublicationProjectionRequest(&ctx);
                 if (source_empty) {
                     try std.testing.expectEqual(app_changes_projection.Kind.cached_diff, request.kind);
                     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
@@ -1740,18 +1763,18 @@ test "Changes canonical publication retains the prior body for every direct acti
                                 app_test_support.diff_cached_projection,
                             ),
                         } },
-                    } } }), &ctx);
+                    } } }), &ctx.ctx);
                 } else {
                     try std.testing.expectEqual(app_changes_projection.Kind.combined_hunks, request.kind);
                     const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
                     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
                         .request = request,
                         .result = .{ .ready = .{ .combined_hunks = final_bundle } },
-                    } } }), &ctx);
+                    } } }), &ctx.ctx);
                 }
                 try std.testing.expect(app.screen_transition == .running);
                 request = undefined;
-                try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+                try finishCanonicalPublicationBranch(&app, &ctx.ctx, allocator, roots.a, reads);
 
                 if (source_empty) {
                     try expectFreshCanonicalCachedPublication(
@@ -1787,8 +1810,9 @@ test "Changes canonical publication retains the prior body for a stage hunk succ
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const hunk_pending = beginAcceptedTestAction(&app, .stage_hunk);
     try installTestActionCursor(&app, allocator, .file, "a", hunk_pending.generation);
@@ -1799,10 +1823,11 @@ test "Changes canonical publication retains the prior body for a stage hunk succ
         .hunk_index = 1,
         .session_mark_mutation = .none,
         .result = .ok,
-    } }), &ctx);
-    const hunk_entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), hunk_entries.len);
-    var hunk_status_message = hunk_entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    } }), &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var hunk_entries = ctx.takeTask(0).?;
+    defer hunk_entries.deinit();
+    var hunk_status_message = try hunk_entries.fail(error.ConcurrencyUnavailable);
     defer hunk_status_message.deinitUndelivered(allocator);
     const hunk_status_task = hunk_status_message.load_finished.changes.status;
     const hunk_identity = hunk_status_task.identity;
@@ -1815,10 +1840,10 @@ test "Changes canonical publication retains the prior body for a stage hunk succ
         .generation = hunk_generation,
         .repo_root = try allocator.dupe(u8, roots.a),
         .result = .{ .loaded = hunk_status },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     hunk_status = undefined;
     try std.testing.expect(!app.pages.changes.action_cursor.hasOwner());
-    var hunk_projection_request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+    var hunk_projection_request = try takeCanonicalPublicationProjectionRequest(&ctx);
     try std.testing.expectEqual(
         app_changes_projection.Kind.combined_hunks,
         hunk_projection_request.kind,
@@ -1830,7 +1855,7 @@ test "Changes canonical publication retains the prior body for a stage hunk succ
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = hunk_projection_request,
         .result = .{ .ready = .{ .combined_hunks = hunk_projection } },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     hunk_projection_request = undefined;
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
@@ -1841,21 +1866,21 @@ test "Changes canonical publication retains the prior body for a stage hunk succ
     const status_revision_before = app.pages.changes.status_snapshot_revision;
     const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
     const cycle_id = reads.source_cycle_id orelse return error.ExpectedBackgroundCycle;
-    try finishCanonicalPublicationSource(&app, &ctx, allocator, reads, reordered_action_refresh_diff);
+    try finishCanonicalPublicationSource(&app, &ctx.ctx, allocator, reads, reordered_action_refresh_diff);
     try expectCanonicalPublicationCycleTransfer(&app, cycle_id);
     try expectRetainedCanonicalPublication(&app, prior_hunks);
-    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00 M b\x00");
+    try finishCanonicalPublicationStatus(&app, &ctx.ctx, allocator, roots.a, reads, "MM a\x00 M b\x00");
     try expectRetainedCanonicalPublication(&app, prior_hunks);
 
-    try app.update(.git_action_spinner_tick, &ctx);
-    var request = try takeCanonicalPublicationProjectionRequest(&ctx, allocator);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    var request = try takeCanonicalPublicationProjectionRequest(&ctx);
     const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = request,
         .result = .{ .ready = .{ .combined_hunks = final_bundle } },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     request = undefined;
-    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+    try finishCanonicalPublicationBranch(&app, &ctx.ctx, allocator, roots.a, reads);
     try std.testing.expect(app.pages.changes.deferred_source_apply == null);
     try std.testing.expect(app.pages.changes.auto_reload.background_cycle == null);
     try expectFreshCanonicalPublication(
@@ -1882,8 +1907,9 @@ test "background status completion during repository action is discarded and rel
     app.pages.changes.status_load.begin(cycle_id, .{});
     _ = beginAcceptedTestAction(&app, .stage_file);
     const changed = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M new.zig\x00");
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .status = .{
         .identity = page.RequestIdentity.changes(0, 1),
@@ -1891,7 +1917,7 @@ test "background status completion during repository action is discarded and rel
         .background_cycle_id = cycle_id,
         .repo_root = try std.testing.allocator.dupe(u8, "/repo"),
         .result = .{ .loaded = changed },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expectEqualStrings("old.zig", app.pages.changes.git_status.document.entries[0].path);
     try std.testing.expect(!app.pages.changes.status_load.isPending());
@@ -1920,15 +1946,16 @@ test "background source completion during repository action is discarded and rel
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const pending = beginAcceptedTestAction(&app, .stage_file);
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
         .identity = page.RequestIdentity.changes(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expectEqualStrings("old", changesNavigationView(&app).activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.changes.auto_reload.accepted_source.?.fingerprint.eql(accepted));
@@ -1941,7 +1968,7 @@ test "background source completion during repository action is discarded and rel
         .repo_root = &.{},
         .path = try std.testing.allocator.dupe(u8, "a"),
         .result = .ok,
-    } }), &ctx);
+    } }), &ctx.ctx);
     ownTestSourceRead(&app, 3, .action_result);
     const authoritative = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
@@ -1949,7 +1976,7 @@ test "background source completion during repository action is discarded and rel
         .read_epoch = app.pages.changes.repository_read_authority.epoch,
         .generation = 3,
         .result = .{ .loaded = authoritative },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     try std.testing.expectEqualStrings(app_test_support.diff_one, changesNavigationView(&app).activeLoadedDiffConst().?.text);
 }
 test "deferred background source is discarded when a repository action starts" {
@@ -1972,20 +1999,21 @@ test "deferred background source is discarded when a repository action starts" {
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
         .identity = page.RequestIdentity.changes(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .{ .loaded = bundle },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     try std.testing.expect(app.pages.changes.deferred_source_apply != null);
 
     _ = beginAcceptedTestAction(&app, .stage_file);
     changesNavigation(&app).clearDiffSelection();
-    try app.update(.git_action_spinner_tick, &ctx);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
 
     try std.testing.expectEqualStrings("old", changesNavigationView(&app).activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.changes.deferred_source_apply == null);
@@ -2011,19 +2039,20 @@ test "empty watch result defers during selection and focus loss applies it" {
     app.pages.changes.auto_reload = .init(.inherit, .{});
     const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
         .identity = page.RequestIdentity.changes(0, 1),
         .generation = 2,
         .background_cycle_id = cycle_id,
         .result = .empty,
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     try std.testing.expect(app.pages.changes.deferred_source_apply != null);
     try std.testing.expectEqualStrings("old", changesNavigationView(&app).activeLoadedDiffConst().?.text);
 
-    try app.update(.focus_lost, &ctx);
+    try app.update(.focus_lost, &ctx.ctx);
     try std.testing.expect(!app.pages.changes.selection_owner.activeMouseSelection());
     try std.testing.expect(app.pages.changes.deferred_source_apply == null);
     try std.testing.expect(app.pages.changes.load.state == .empty);
@@ -2378,18 +2407,19 @@ fn finishCanonicalPublicationAction(
 }
 
 pub fn takeCanonicalPublicationReads(
-    ctx: *chasen.Ctx(App.Msg),
+    ctx: *chasen.testing.TestCtx(App.Msg),
     allocator: std.mem.Allocator,
 ) !CanonicalPublicationReads {
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 3), entries.len);
-    var status_task_message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
+    var entries = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&entries) |*task| task.deinit();
+    var status_task_message = try entries[0].fail(error.ConcurrencyUnavailable);
     defer status_task_message.deinitUndelivered(allocator);
     const status_task = status_task_message.load_finished.changes.status;
-    var branch_task_message = entries[1].failed(error.ConcurrencyUnavailable, allocator);
+    var branch_task_message = try entries[1].fail(error.ConcurrencyUnavailable);
     defer branch_task_message.deinitUndelivered(allocator);
     const branch_task = branch_task_message.load_finished.changes.branch_status;
-    var source_task_message = entries[2].failed(error.ConcurrencyUnavailable, allocator);
+    var source_task_message = try entries[2].fail(error.ConcurrencyUnavailable);
     defer source_task_message.deinitUndelivered(allocator);
     const source_task = source_task_message.load_finished.changes.source;
     const reads: CanonicalPublicationReads = .{
@@ -2411,10 +2441,10 @@ pub fn takeCanonicalPublicationReads(
 
 pub fn startCanonicalPublicationWatch(
     app: *App,
-    ctx: *chasen.Ctx(App.Msg),
+    ctx: *chasen.testing.TestCtx(App.Msg),
     allocator: std.mem.Allocator,
 ) !CanonicalPublicationReads {
-    try app.update(.auto_reload_tick, ctx);
+    try app.update(.auto_reload_tick, &ctx.ctx);
     const reads = try takeCanonicalPublicationReads(ctx, allocator);
     const cycle_id = reads.source_cycle_id orelse return error.ExpectedBackgroundCycle;
     try std.testing.expectEqual(@as(?u64, cycle_id), reads.status_cycle_id);
@@ -2528,12 +2558,12 @@ pub fn finishCanonicalPublicationBranch(
 }
 
 fn takeCanonicalPublicationProjectionRequest(
-    ctx: *chasen.Ctx(App.Msg),
-    allocator: std.mem.Allocator,
+    ctx: *chasen.testing.TestCtx(App.Msg),
 ) !app_changes_projection.Request {
-    const entries = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
-    const message = entries[0].failed(error.ConcurrencyUnavailable, allocator);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var entries = ctx.takeTask(0).?;
+    defer entries.deinit();
+    const message = try entries.fail(error.ConcurrencyUnavailable);
     // Move the owned request out; the static failure has no separate allocation.
     return message.load_finished.changes.projection.request;
 }
@@ -2791,7 +2821,7 @@ fn canonicalPageTransitionMessage(
 
 fn requestCanonicalPageTransition(
     app: *App,
-    ctx: *chasen.Ctx(App.Msg),
+    ctx: *chasen.testing.TestCtx(App.Msg),
     target: page.Id,
     input: CanonicalPageTransitionInput,
 ) !void {
@@ -2799,9 +2829,9 @@ fn requestCanonicalPageTransition(
     switch (message) {
         .switch_page => |requested| {
             try std.testing.expectEqual(target, requested);
-            try requestPageSwitchForTest(app, ctx, requested);
+            try requestPageSwitchForTest(app, &ctx.ctx, requested);
             if (requested == .repository) {
-                chasen.testing.discardPendingTasks(App.Msg, ctx);
+                ctx.discardPendingTasks();
             }
         },
         else => return error.ExpectedPageSwitch,
@@ -2867,15 +2897,15 @@ fn finishCanonicalPageTransitionBranch(
 
 fn expectFreshCanonicalPageTransitionReads(
     app: *App,
-    ctx: *chasen.Ctx(App.Msg),
+    ctx: *chasen.testing.TestCtx(App.Msg),
     allocator: std.mem.Allocator,
     old_identity: page.RequestIdentity,
 ) !void {
     // Public completion delivery runs the exact App update tail, so the fresh
     // revalidation may already have started in that same turn. If not, give
     // the retained intent one neutral scheduling opportunity.
-    if (ctx._pending_tasks_len == 0) {
-        try app.update(.git_action_spinner_tick, ctx);
+    if (ctx.pendingTaskCount() == 0) {
+        try app.update(.git_action_spinner_tick, &ctx.ctx);
     }
     const fresh = try takeCanonicalPublicationReads(ctx, allocator);
     const active = app.pages.changes.activation.currentIdentity() orelse

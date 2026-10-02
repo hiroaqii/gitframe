@@ -110,7 +110,9 @@ test "quit waits for pending git action" {
     var app: App = .{ .allocator = std.testing.allocator };
     action_lifecycle.testing.installAccepted(&app.action_runtime, .{ .generation = 7, .kind = .stage_file });
     defer action_lifecycle.testing.clear(&app.action_runtime);
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
 
     try app.update(.quit, &tc.ctx);
@@ -122,8 +124,9 @@ test "quit waits for pending git action" {
 
 test "quit exits when no git action is pending" {
     var app: App = .{ .allocator = std.testing.allocator };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
     app.drag_auto_scroll.active = .{
         .generation = 5,
         .target = .changes,
@@ -131,12 +134,12 @@ test "quit exits when no git action is pending" {
     };
     app.drag_auto_scroll.scheduled_generation = 5;
 
-    try app.update(.quit, &ctx);
+    try app.update(.quit, &ctx.ctx);
 
     try std.testing.expect(ctx.shouldQuit());
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_cancels_len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingCancelCount());
 }
 
 test "selectionContext keeps status-only selection while status load is pending" {

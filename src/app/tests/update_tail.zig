@@ -139,7 +139,9 @@ test "Repository path history known unavailable and stale completions preserve p
     var app: App = .{ .allocator = allocator, .active_page = .repository };
     defer app.pages.repository.deinit(allocator);
     defer app.repo_session.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = std.testing.io };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     for (0..2) |case| {
         app.status.set("root diagnostic", .{});
@@ -158,12 +160,12 @@ test "Repository path history known unavailable and stale completions preserve p
             .generation = 4,
             .path = try allocator.dupe(u8, "stale.zig"),
             .outcome = outcome,
-        } } }, &ctx);
+        } } }, &ctx.ctx);
         try std.testing.expectEqualStrings("root diagnostic", app.status.text());
         try std.testing.expectEqualStrings("Repository diagnostic", app.pages.repository.status.text());
     }
 
-    try app.update(.{ .repository = .move_down }, &ctx);
+    try app.update(.{ .repository = .move_down }, &ctx.ctx);
     try std.testing.expectEqualStrings("", app.status.text());
     try std.testing.expectEqualStrings("", app.pages.repository.status.text());
 }
@@ -183,7 +185,9 @@ test "git action spinner ticks keep previous ephemeral status" {
 test "git action spinner starts when pending action is visible after update" {
     var app: App = .{};
     _ = beginAcceptedTestAction(&app, .push);
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
 
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 40 } }, &tc.ctx);
@@ -195,7 +199,9 @@ test "git action spinner starts when pending action is visible after update" {
 test "git action spinner self-cancels stale ticks without redraw" {
     var app: App = .{};
     action_lifecycle.testing.setSpinner(&app.action_runtime, 0, true);
-    var tc: chasen.testing.TestCtx(App.Msg) = .{};
+    var tc: chasen.testing.TestCtx(App.Msg) = undefined;
+    tc.init(std.testing.allocator, std.testing.io);
+    defer tc.deinit();
     defer tc.resetTransient();
 
     try app.update(.git_action_spinner_tick, &tc.ctx);
@@ -219,9 +225,11 @@ test "branch time pickers sample one real-clock snapshot at every non-skipped re
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
     _ = app.pages.compare.beginBasePicker(allocator).?;
     var clock = FakeRealClock.init(1_700_000_059);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = clock.io() };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, clock.io());
+    defer ctx.deinit();
 
-    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx.ctx);
     try std.testing.expectEqual(@as(?i64, 1_700_000_059), app.pages.compare.base_picker.render_now_unix);
     try std.testing.expectEqual(@as(usize, 1), clock.samples);
 
@@ -235,29 +243,29 @@ test "branch time pickers sample one real-clock snapshot at every non-skipped re
         refresh.generation,
         'a',
         'b',
-    ) } } }, &ctx);
+    ) } } }, &ctx.ctx);
     try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.compare.base_picker.render_now_unix);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
 
     // A stale list terminal resolves to skip and therefore does not sample.
     clock.seconds += 1;
-    ctx.resetRedrawSuppressed();
+    ctx.resetTransient();
     try app.update(.{ .load_finished = .{ .compare = .{ .branch_list = .{
         .identity = refresh.identity,
         .generation = app.pages.compare.base_picker.generation + 1,
         .result = .empty,
-    } } } }, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    } } } }, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
     try std.testing.expectEqual(@as(?i64, 1_700_000_060), app.pages.compare.base_picker.render_now_unix);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
 
     // Hidden and idle picker states do not consult the wall clock.
     app.active_page = .changes;
-    try app.update(.{ .terminal_resized = .{ .width = 100, .height = 24 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 100, .height = 24 } }, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
     app.active_page = .compare;
     app.pages.compare.closeBasePicker(allocator);
-    try app.update(.{ .terminal_resized = .{ .width = 90, .height = 20 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 90, .height = 20 } }, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 2), clock.samples);
 
     var repo_root = "/repo".*;
@@ -280,7 +288,7 @@ test "branch time pickers sample one real-clock snapshot at every non-skipped re
     app.overlay.openSwitchBranch(.changes);
     app.active_page = .changes;
     clock.seconds += 1;
-    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx.ctx);
     try std.testing.expectEqual(@as(?i64, 1_700_000_062), app.remote_workflow.branch_switch.render_now_unix);
     try std.testing.expectEqual(@as(usize, 3), clock.samples);
 }
@@ -292,16 +300,18 @@ test "branch time pickers fail closed for unavailable and zero-resolution real c
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
     _ = app.pages.compare.beginBasePicker(allocator).?;
     var clock = FakeRealClock.init(1_700_000_000);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator, ._io = clock.io() };
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, clock.io());
+    defer ctx.deinit();
 
     clock.available = false;
-    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx.ctx);
     try std.testing.expect(app.pages.compare.base_picker.render_now_unix == null);
     try std.testing.expectEqual(@as(usize, 0), clock.samples);
 
     clock.available = true;
     clock.resolution_ns = 0;
-    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx.ctx);
     try std.testing.expect(app.pages.compare.base_picker.render_now_unix == null);
     try std.testing.expectEqual(@as(usize, 0), clock.samples);
 
@@ -325,7 +335,7 @@ test "branch time pickers fail closed for unavailable and zero-resolution real c
     };
     app.overlay.openSwitchBranch(.changes);
     app.active_page = .changes;
-    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx);
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 12 } }, &ctx.ctx);
     try std.testing.expect(app.remote_workflow.branch_switch.render_now_unix == null);
     try std.testing.expectEqual(@as(usize, 0), clock.samples);
 }
@@ -457,8 +467,10 @@ fn commitDiscovery(
     active_index: usize,
     origin: repo_session.CommitOrigin,
 ) !repo_session.CommitOutcome {
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    return repoSession(app).commitDiscovered(&ctx, result, active_index, origin);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    return repoSession(app).commitDiscovered(&ctx.ctx, result, active_index, origin);
 }
 
 test "Compare wheel redraw completion defers as one bundle during drag and applies afterward" {
@@ -466,8 +478,9 @@ test "Compare wheel redraw completion defers as one bundle during drag and appli
     var app: App = .{ .allocator = allocator, .active_page = .compare };
     defer app.pages.compare.deinit(allocator);
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const initial = app.pages.compare.beginRefresh().?;
     try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
@@ -476,7 +489,7 @@ test "Compare wheel redraw completion defers as one bundle during drag and appli
         initial.generation,
         'a',
         'b',
-    ) } } }, &ctx);
+    ) } } }, &ctx.ctx);
     app.pages.compare.diff.selection_owner = .{ .diff = .{
         .identity = .{ .loaded_file = .{ .file_index = 0, .path_key = "b/src/compare.zig" } },
         .content = .{ .source_side = .{ .side = .new } },
@@ -491,7 +504,7 @@ test "Compare wheel redraw completion defers as one bundle during drag and appli
         replacement.generation,
         'd',
         'e',
-    ) } } }, &ctx);
+    ) } } }, &ctx.ctx);
 
     try std.testing.expect(app.pages.compare.deferred_load_apply != null);
     try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.compare.basis.?.target.head_oid.slice());
@@ -501,15 +514,15 @@ test "Compare wheel redraw completion defers as one bundle during drag and appli
     // composition, not a claim that a wheel and deferred publication naturally
     // arrive as one event. The visible deferred owner must win over the
     // provisional skip candidate.
-    ctx.resetRedrawSuppressed();
-    try app.update(.git_action_spinner_tick, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(app.pages.compare.deferred_load_apply == null);
     try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.compare.basis.?.target.head_oid.slice());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.git_action_spinner_tick, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 }
 
 const CompareInactiveCompletionOrder = enum { completion_before_reentry, completion_after_reentry };
@@ -536,50 +549,52 @@ fn expectCompareInactiveCompletionOrder(order: CompareInactiveCompletionOrder) !
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     _ = app.pages.compare.activate(app.repo_session.repo_epoch);
     const old = app.pages.compare.beginRefresh().?;
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .switch_page = .repository }, &ctx);
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.repository, app.active_page);
     // The destination page queues its own reads, separate from Compare's
     // completion/re-entry ordering exercised below.
-    chasen.testing.discardPendingTasks(App.Msg, &ctx);
-    try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+    ctx.discardPendingTasks();
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     app.status.set("visible page sentinel", .{});
 
     if (order == .completion_before_reentry) {
-        ctx.resetRedrawSuppressed();
+        ctx.resetTransient();
         try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
             allocator,
             old.identity,
             old.generation,
             'a',
             'b',
-        ) } } }, &ctx);
-        try std.testing.expect(ctx.redrawWasSuppressed());
+        ) } } }, &ctx.ctx);
+        try std.testing.expect(ctx.redrawSuppressed());
         try std.testing.expectEqual(page.Id.repository, app.active_page);
         try std.testing.expectEqualStrings("visible page sentinel", app.status.text());
         try std.testing.expectEqualStrings(reviewAppTestOid('b').slice(), app.pages.compare.basis.?.target.head_oid.slice());
     }
 
-    try app.update(.{ .switch_page = .compare }, &ctx);
+    try app.update(.{ .switch_page = .compare }, &ctx.ctx);
     try std.testing.expectEqual(page.Id.compare, app.active_page);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
-    const pending_0 = ctx.takePendingTasks();
-    var newer_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer newer_message.deinitUndelivered(ctx.allocator());
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending_0 = ctx.takeTask(0).?;
+    defer pending_0.deinit();
+    var newer_message = try pending_0.fail(error.ConcurrencyUnavailable);
+    defer newer_message.deinitUndelivered(ctx.ctx.allocator());
     const newer = newer_message.load_finished.compare.source;
     try std.testing.expect(newer.generation > old.generation);
 
-    ctx.resetRedrawSuppressed();
+    ctx.resetTransient();
     try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
         allocator,
         old.identity,
         old.generation,
         'c',
         'd',
-    ) } } }, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ) } } }, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
     switch (order) {
         .completion_before_reentry => try std.testing.expectEqualStrings(
             reviewAppTestOid('b').slice(),
@@ -604,8 +619,9 @@ test "repository commitment resets Compare and refreshes the new physical root" 
     defer app.repo_session.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     _ = app.pages.compare.activate(0);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const initial = app.pages.compare.beginRefresh().?;
     try app.update(.{ .load_finished = .{ .compare = .{ .source = try reviewAppLoadedFinished(
@@ -614,7 +630,7 @@ test "repository commitment resets Compare and refreshes the new physical root" 
         initial.generation,
         'a',
         'b',
-    ) } } }, &ctx);
+    ) } } }, &ctx.ctx);
     try std.testing.expect(app.pages.compare.basis != null);
 
     const changes_activation = app.pages.changes.activation.activate(0, .pending, .unavailable, .unavailable);
@@ -624,7 +640,7 @@ test "repository commitment resets Compare and refreshes the new physical root" 
         .identity = page.RequestIdentity.changes(0, changes_activation),
         .generation = discovery_generation,
         .result = .{ .discovered = try testSingleRepoDiscovery(allocator, roots.b) },
-    } } } }, &ctx);
+    } } } }, &ctx.ctx);
 
     try std.testing.expectEqual(@as(u64, 1), app.repo_session.view().epoch());
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
@@ -632,10 +648,11 @@ test "repository commitment resets Compare and refreshes the new physical root" 
     try std.testing.expect(app.pages.compare.base_target == null);
     try std.testing.expect(app.pages.compare.activation.state == .active);
     try std.testing.expectEqual(@as(u64, 1), app.pages.compare.activation.state.active.repo_epoch);
-    try std.testing.expectEqual(@as(u8, 1), ctx._pending_tasks_len);
-    const pending_0 = ctx.takePendingTasks();
-    var task_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer task_message.deinitUndelivered(ctx.allocator());
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var pending_0 = ctx.takeTask(0).?;
+    defer pending_0.deinit();
+    var task_message = try pending_0.fail(error.ConcurrencyUnavailable);
+    defer task_message.deinitUndelivered(ctx.ctx.allocator());
     const task = task_message.load_finished.compare.source;
     try std.testing.expectEqual(app.repo_session.view().epoch(), task.identity.repo_epoch);
 }
@@ -658,34 +675,37 @@ test "repository activation and manual reload route to page-owned manifest tasks
     defer if (app.repo_session.repo_state.root) |*root| root.deinit();
     defer app.pages.repository.deinit(std.testing.allocator);
     _ = activateChanges(&app);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = std.testing.allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(std.testing.allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .switch_page = .repository }, &ctx);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
-    const pending_0 = ctx.takePendingTasks();
-    var first_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer first_message.deinitUndelivered(ctx.allocator());
+    try app.update(.{ .switch_page = .repository }, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskCount());
+    var pending_0 = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&pending_0) |*task| task.deinit();
+    var first_message = try pending_0[0].fail(error.ConcurrencyUnavailable);
+    defer first_message.deinitUndelivered(ctx.ctx.allocator());
     const first = first_message.repository.manifest_finished;
     try std.testing.expectEqual(page.Id.repository, first.identity.origin);
     try std.testing.expectEqual(app.repo_session.repo_epoch, first.identity.repo_epoch);
     const first_generation = first.generation;
-    var first_branch_message = pending_0[1].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer first_branch_message.deinitUndelivered(ctx.allocator());
+    var first_branch_message = try pending_0[1].fail(error.ConcurrencyUnavailable);
+    defer first_branch_message.deinitUndelivered(ctx.ctx.allocator());
     const first_branch = first_branch_message.repository.branch_finished;
     const first_branch_generation = first_branch.generation;
     try std.testing.expectEqual(first.identity, first_branch.identity);
 
-    try app.update(.reload, &ctx);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
-    const pending_1 = ctx.takePendingTasks();
-    var second_message = pending_1[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer second_message.deinitUndelivered(ctx.allocator());
+    try app.update(.reload, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskCount());
+    var pending_1 = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&pending_1) |*task| task.deinit();
+    var second_message = try pending_1[0].fail(error.ConcurrencyUnavailable);
+    defer second_message.deinitUndelivered(ctx.ctx.allocator());
     const second = second_message.repository.manifest_finished;
     try std.testing.expect(second.generation > first_generation);
     try std.testing.expectEqual(second.generation, app.pages.repository.pending_generation.?);
-    var second_branch_message = pending_1[1].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer second_branch_message.deinitUndelivered(ctx.allocator());
+    var second_branch_message = try pending_1[1].fail(error.ConcurrencyUnavailable);
+    defer second_branch_message.deinitUndelivered(ctx.ctx.allocator());
     const second_branch = second_branch_message.repository.branch_finished;
     try std.testing.expect(second_branch.generation > first_branch_generation);
     try std.testing.expectEqual(second_branch.generation, app.pages.repository.branch.pending.?.generation);
@@ -719,16 +739,18 @@ test "changes repository transition active repository replacement rejects old ow
         .{ .location = .{ .path = "pending.zig" } },
     );
     app.pages.repository.acceptIncoming(allocator, &incoming);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.reload, &ctx);
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
-    const pending_0 = ctx.takePendingTasks();
-    var old_task_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer old_task_message.deinitUndelivered(ctx.allocator());
+    try app.update(.reload, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskCount());
+    var pending_0 = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&pending_0) |*task| task.deinit();
+    var old_task_message = try pending_0[0].fail(error.ConcurrencyUnavailable);
+    defer old_task_message.deinitUndelivered(ctx.ctx.allocator());
     const old_task = old_task_message.repository.manifest_finished;
-    pending_0[1].discard(ctx.allocator());
+    pending_0[1].deinit();
     const old_identity = old_task.identity;
     const old_root_identity = old_task.root_identity;
     const old_generation = old_task.generation;
@@ -764,7 +786,7 @@ test "changes repository transition active repository replacement rejects old ow
         .root_identity = old_root_identity,
         .generation = old_generation,
         .result = .{ .failed_static = "stale old manifest" },
-    } } }, &ctx);
+    } } }, &ctx.ctx);
 
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
     try std.testing.expectEqual(@as(u64, 2), app.pages.repository.repo_epoch);
@@ -776,12 +798,13 @@ test "changes repository transition active repository replacement rejects old ow
         return error.ExpectedReplacementManifest;
     try std.testing.expect(!app.pages.repository.needs_revalidation);
     try std.testing.expect(!app.pages.repository.wantsManifestRequest());
-    try std.testing.expectEqual(@as(u8, 2), ctx._pending_tasks_len);
-    const pending_1 = ctx.takePendingTasks();
-    var replacement_task_message = pending_1[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer replacement_task_message.deinitUndelivered(ctx.allocator());
+    try std.testing.expectEqual(@as(usize, 2), ctx.pendingTaskCount());
+    var pending_1 = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&pending_1) |*task| task.deinit();
+    var replacement_task_message = try pending_1[0].fail(error.ConcurrencyUnavailable);
+    defer replacement_task_message.deinitUndelivered(ctx.ctx.allocator());
     const replacement_task = replacement_task_message.repository.manifest_finished;
-    pending_1[1].discard(ctx.allocator());
+    pending_1[1].deinit();
     try std.testing.expectEqual(replacement_generation, replacement_task.generation);
     try std.testing.expectEqualStrings(roots.b, app.repo_session.view().activeRoot().?);
     try std.testing.expect(replacement_task.root_identity.eql(root_b_identity));
@@ -835,9 +858,11 @@ test "changes repository transition post-commit manifest start failures stay on 
         acceptTestSource(&app);
         const changes_activation = app.pages.changes.activation.state.active.activation_id;
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = case.fail_index });
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator() };
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(failing.allocator(), std.testing.io);
+        defer ctx.deinit();
 
-        try std.testing.expectError(error.OutOfMemory, app.update(.{ .switch_page = .repository }, &ctx));
+        try std.testing.expectError(error.OutOfMemory, app.update(.{ .switch_page = .repository }, &ctx.ctx));
 
         try std.testing.expectEqual(page.Id.repository, app.active_page);
         try std.testing.expect(app.pages.changes.activation.state == .inactive);
@@ -850,8 +875,8 @@ test "changes repository transition post-commit manifest start failures stay on 
         try std.testing.expectEqual(case.generation, app.pages.repository.generation);
         try std.testing.expect(app.pages.repository.pending_generation == null);
         try std.testing.expectEqualStrings(case.status, app.pages.repository.status.text());
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
-        try std.testing.expectEqual(@as(u8, 0), ctx._pending_tasks_len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
+        try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     }
 }
 
@@ -883,13 +908,14 @@ test "wheel redraw error terminal does not suppress the root frame" {
     app.pages.history.diff.viewer = .{ .focus = .diff, .sidebar_hidden = true, .display_mode = .unified };
 
     const wheel_down: App.Msg = .{ .history = .{ .common = .{ .shared = .mouse_diff_wheel_down } } };
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     var reached_noop = false;
     for (0..128) |_| {
-        ctx.resetRedrawSuppressed();
-        try app.update(wheel_down, &ctx);
-        if (ctx.redrawWasSuppressed()) {
+        ctx.resetTransient();
+        try app.update(wheel_down, &ctx.ctx);
+        if (ctx.redrawSuppressed()) {
             reached_noop = true;
             break;
         }
@@ -899,11 +925,12 @@ test "wheel redraw error terminal does not suppress the root frame" {
     app.pages.history.needs_initial = true;
     app.pages.history.load_state = .loading;
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    var failing_ctx: chasen.Ctx(App.Msg) = .{ ._allocator = failing.allocator() };
-    defer failing_ctx.runtimeClearPendingEffectCopies();
-    try std.testing.expectError(error.OutOfMemory, app.update(wheel_down, &failing_ctx));
+    var failing_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    failing_ctx.init(failing.allocator(), std.testing.io);
+    defer failing_ctx.deinit();
+    try std.testing.expectError(error.OutOfMemory, app.update(wheel_down, &failing_ctx.ctx));
     try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expect(!failing_ctx.redrawWasSuppressed());
+    try std.testing.expect(!failing_ctx.redrawSuppressed());
 }
 
 test "Repository tree wheel redraw preserves meaningful owner path and incoming transitions" {
@@ -914,8 +941,9 @@ test "Repository tree wheel redraw preserves meaningful owner path and incoming 
         "zero\none\ntwo\nthree\nfour\nfive\n",
     );
     defer app.pages.repository.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const wheel_up: App.Msg = .{ .repository = .wheel_up };
     const wheel_down: App.Msg = .{ .repository = .wheel_down };
@@ -923,19 +951,19 @@ test "Repository tree wheel redraw preserves meaningful owner path and incoming 
     // Ownerless tree input first changes focus/cursor, then becomes a complete
     // top-edge no-op; the opposite direction remains immediately meaningful.
     app.pages.repository.viewer.focus = .source;
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_up, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_up, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqual(@as(usize, 0), app.pages.repository.viewer.tree_cursor);
     try std.testing.expectEqual(@import("../pages/repository/model.zig").Focus.tree, app.pages.repository.viewer.focus);
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_up, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_up, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqualStrings("a.zig", app.pages.repository.selected_path.?);
 
     // This is the lifetime-sensitive sequence: the first wheel clears a
@@ -946,27 +974,27 @@ test "Repository tree wheel redraw preserves meaningful owner path and incoming 
         repositoryContentTokenForTest(&app.pages.repository),
         1,
     ) };
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(app.pages.repository.selection_owner == .none);
     try std.testing.expectEqualStrings("b.zig", app.pages.repository.selected_path.?);
     try std.testing.expect(app.pages.repository.displayed_document == null);
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_up, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_up, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqualStrings("a.zig", app.pages.repository.selected_path.?);
 
     // At the bottom edge, dismissing an incoming destination is itself the
     // only meaningful first transition; the following event is a true no-op.
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     var incoming = try page_link.RepositoryIncoming.initOwned(
         allocator,
         app.pages.repository.repo_epoch,
@@ -975,32 +1003,32 @@ test "Repository tree wheel redraw preserves meaningful owner path and incoming 
     );
     app.pages.repository.acceptIncoming(allocator, &incoming);
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(app.pages.repository.incoming == .none);
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_up, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_up, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
 
     // A provisional edge skip cannot hide a Repository tail diagnostic.
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     app.pages.repository.needs_revalidation = true;
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqual(repository_page.LoadState.no_repository, app.pages.repository.load_state);
     app.pages.repository.status.clear();
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 }
 
 test "Repository source wheel redraw preserves semantic and pointer owners" {
@@ -1011,8 +1039,9 @@ test "Repository source wheel redraw preserves semantic and pointer owners" {
         "row 00\nrow 01\nrow 02\nrow 03\nrow 04\nrow 05\nrow 06\nrow 07\nrow 08\nrow 09\nrow 10\nrow 11\n",
     );
     defer app.pages.repository.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const body_size = app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).bodySize();
     const source = switch (app.pages.repository.displayed_document.?.value) {
@@ -1032,18 +1061,18 @@ test "Repository source wheel redraw preserves semantic and pointer owners" {
     // the semantic cursor and focus. Only the following edge event is inert.
     app.pages.repository.viewer.focus = .tree;
     app.pages.repository.viewer.source_cursor = source.rowCount() - 2;
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqual(source.rowCount() - 1, app.pages.repository.viewer.source_cursor);
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_up, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_up, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
 
     // A keyboard-line owner keeps its token, endpoint, and semantic cursor;
     // pointer wheel changes only the source viewport.
@@ -1054,17 +1083,17 @@ test "Repository source wheel redraw preserves semantic and pointer owners" {
     app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(token, 3) };
     const endpoint_before = app.pages.repository.selection_owner.activeKeyboardLineSelection().?.focus;
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expectEqual(bottom, app.pages.repository.viewer.source_vertical_scroll);
     try std.testing.expectEqual(@as(usize, 3), app.pages.repository.viewer.source_cursor);
     try std.testing.expect(std.meta.eql(endpoint_before, app.pages.repository.selection_owner.activeKeyboardLineSelection().?.focus));
     try std.testing.expect(app.pages.repository.selection_owner.activeKeyboardLineSelection().?.token.eql(token));
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
     var incoming = try page_link.RepositoryIncoming.initOwned(
         allocator,
@@ -1073,19 +1102,19 @@ test "Repository source wheel redraw preserves semantic and pointer owners" {
         .{ .location = .{ .path = "incoming.zig" } },
     );
     app.pages.repository.acceptIncoming(allocator, &incoming);
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(app.pages.repository.incoming == .none);
     try std.testing.expect(app.pages.repository.activeKeyboardLineSelection());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_down, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_down, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
 
-    ctx.resetRedrawSuppressed();
-    try app.update(wheel_up, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(wheel_up, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
 }
 
 test "repository incoming viewport scroll App immediate and deferred routes use current body size" {
@@ -1116,8 +1145,9 @@ test "repository incoming viewport scroll App immediate and deferred routes use 
         app.repo_session.repo_state.discovery = try testSingleRepoDiscovery(allocator, roots.a);
         app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
         const identity = app.repo_session.view().activeIdentity().?;
-        var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-        defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+        var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+        ctx.init(allocator, std.testing.io);
+        defer ctx.deinit();
         try std.testing.expectEqual(
             chasen.Size{ .width = 118, .height = 7 },
             app_shell_layout.compute(app.terminal_size, .{ .page_bar_visible = true }).bodySize(),
@@ -1149,7 +1179,7 @@ test "repository incoming viewport scroll App immediate and deferred routes use 
                         .left,
                     )) orelse return error.ExpectedPageSwitch;
                 };
-                try app.update(msg, &ctx);
+                try app.update(msg, &ctx.ctx);
             },
             .deferred_manifest => {
                 app.active_page = .repository;
@@ -1176,7 +1206,7 @@ test "repository incoming viewport scroll App immediate and deferred routes use 
                     .root_identity = identity,
                     .generation = 7,
                     .result = .{ .loaded = try repositoryIncomingViewportBundleForTest(allocator) },
-                } } }, &ctx);
+                } } }, &ctx.ctx);
             },
         }
 
@@ -1226,22 +1256,24 @@ test "changes repository transition unavailable path is not replayed after reloa
     defer app.repo_session.repo_state.deinit(allocator);
     app.repo_session.repo_state.root = try repo_root_capability.RootCapability.openCanonical(roots.a);
     app.pages.repository.root_identity = app.repo_session.view().activeIdentity().?;
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer chasen.testing.discardPendingTasks(App.Msg, &ctx);
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    try app.update(.{ .switch_page = .changes }, &ctx);
+    try app.update(.{ .switch_page = .changes }, &ctx.ctx);
 
     try std.testing.expectEqualStrings("Repository file is not part of the current Changes", app.status.text());
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
-    try std.testing.expectEqual(@as(u8, 3), ctx._pending_tasks_len);
-    const pending_0 = ctx.takePendingTasks();
-    var diff_task_message = pending_0[2].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer diff_task_message.deinitUndelivered(ctx.allocator());
+    try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
+    var pending_0 = [_]chasen.testing.TestTask(App.Msg){ ctx.takeTask(0).?, ctx.takeTask(0).?, ctx.takeTask(0).? };
+    defer for (&pending_0) |*task| task.deinit();
+    var diff_task_message = try pending_0[2].fail(error.ConcurrencyUnavailable);
+    defer diff_task_message.deinitUndelivered(ctx.ctx.allocator());
     const diff_task = diff_task_message.load_finished.changes.source;
-    var status_task_message = pending_0[0].failed(error.ConcurrencyUnavailable, ctx.allocator());
-    defer status_task_message.deinitUndelivered(ctx.allocator());
+    var status_task_message = try pending_0[0].fail(error.ConcurrencyUnavailable);
+    defer status_task_message.deinitUndelivered(ctx.ctx.allocator());
     const status_task = status_task_message.load_finished.changes.status;
-    pending_0[1].discard(ctx.allocator());
+    pending_0[1].deinit();
     var replacement = app_test_support.loadedDiffTwo();
     replacement.text = "new";
     try app.update(.{ .load_finished = .{ .changes = .{ .source = .{
@@ -1252,7 +1284,7 @@ test "changes repository transition unavailable path is not replayed after reloa
             .arena = .init(allocator),
             .loaded = replacement,
         } },
-    } } } }, &ctx);
+    } } } }, &ctx.ctx);
     try app.update(.{ .load_finished = .{ .changes = .{ .status = .{
         .identity = status_task.identity,
         .read_epoch = status_task.read_epoch,
@@ -1260,7 +1292,7 @@ test "changes repository transition unavailable path is not replayed after reloa
         .background_cycle_id = status_task.background_cycle_id,
         .repo_root = try allocator.dupe(u8, roots.a),
         .result = .empty,
-    } } } }, &ctx);
+    } } } }, &ctx.ctx);
 
     const reloaded = changesNavigationView(&app).activeLoadedDiffConst().?;
     try std.testing.expectEqual(@as(usize, 2), reloaded.document.files.len);
@@ -1685,18 +1717,15 @@ fn branchListForTest(allocator: std.mem.Allocator, specs: []const BranchListItem
     return .{ .loaded = .{ .branches = items } };
 }
 
-fn discardSingleQueuedTask(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) !void {
-    const queued = ctx.takePendingTasks();
-    try std.testing.expectEqual(@as(usize, 1), queued.len);
-    queued[0].discard(allocator);
+fn discardSingleQueuedTask(ctx: *chasen.testing.TestCtx(App.Msg)) !void {
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    ctx.discardPendingTasks();
 }
 
-fn discardQueuedTasks(ctx: *chasen.Ctx(App.Msg), allocator: std.mem.Allocator) usize {
-    const queued = ctx.takePendingTasks();
-    for (queued) |task| {
-        task.discard(allocator);
-    }
-    return queued.len;
+fn discardQueuedTasks(ctx: *chasen.testing.TestCtx(App.Msg)) usize {
+    const count = ctx.pendingTaskCount();
+    ctx.discardPendingTasks();
+    return count;
 }
 
 fn deliverStagedBoundaryStatus(
@@ -1796,21 +1825,22 @@ test "Changes staged boundary keeps owner body through real update tail" {
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
     const revision_before = app.pages.changes.status_snapshot_revision;
 
-    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try deliverStagedBoundaryStatus(&app, &ctx.ctx, allocator, roots.a);
     try std.testing.expectEqual(revision_before + 1, app.pages.changes.status_snapshot_revision);
 
     const pending = app.pages.changes.changes_projection.pending orelse
         return error.ExpectedBoundaryProjection;
     try std.testing.expectEqual(app_changes_projection.Kind.cached_diff, pending.kind);
-    try discardSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx);
 
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
     var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
@@ -1823,11 +1853,11 @@ test "Changes staged boundary keeps owner body through real update tail" {
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = result_request,
         .result = .{ .staged_only_reuse_candidate = candidate },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     candidate = undefined;
 
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "Changes staged boundary with queued revalidation defers to canonical gate" {
     const allocator = std.testing.allocator;
@@ -1836,15 +1866,16 @@ test "Changes staged boundary with queued revalidation defers to canonical gate"
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
 
     app.pages.changes.activation.queueRevalidation();
-    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try deliverStagedBoundaryStatus(&app, &ctx.ctx, allocator, roots.a);
 
     // The queued full revalidation starts in the same tail and its canonical
     // authority takes over: no navigation-side projection request is issued
@@ -1863,26 +1894,27 @@ test "Changes staged boundary result lands safely while canonical gate is open" 
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
 
-    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
+    try deliverStagedBoundaryStatus(&app, &ctx.ctx, allocator, roots.a);
     try std.testing.expect(app.pages.changes.changes_projection.pending != null);
-    try discardSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
 
     // A watch tick cannot open the gate while the boundary read is pending.
-    try app.update(.auto_reload_tick, &ctx);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try app.update(.auto_reload_tick, &ctx.ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 
     // A queued full revalidation is not blocked by the pending read: the next
     // update tail starts it while the canonical boundary read is in flight.
     app.pages.changes.activation.queueRevalidation();
-    try app.update(.git_action_spinner_tick, &ctx);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
     try std.testing.expect(app.pages.changes.auto_reload.background_cycle != null);
     const reads = try takeCanonicalPublicationReads(&ctx, allocator);
     _ = reads;
@@ -1894,7 +1926,7 @@ test "Changes staged boundary result lands safely while canonical gate is open" 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = result_request,
         .result = .{ .staged_only_reuse_candidate = candidate },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     candidate = undefined;
 
     // The gate's fresh cycle already retired the boundary read: the late
@@ -1904,7 +1936,7 @@ test "Changes staged boundary result lands safely while canonical gate is open" 
     const held = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedRetainedCombinedProjection;
     try std.testing.expect(held.displayFile().hunks.ptr == prior_hunks);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "Changes watch cycle after staged boundary advances revisions monotonically" {
     const allocator = std.testing.allocator;
@@ -1913,15 +1945,16 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
 
-    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
-    try discardSingleQueuedTask(&ctx, allocator);
+    try deliverStagedBoundaryStatus(&app, &ctx.ctx, allocator, roots.a);
+    try discardSingleQueuedTask(&ctx);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
     var candidate = try canonicalPublicationStagedOnlyReuseCandidate(
         allocator,
@@ -1930,7 +1963,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = result_request,
         .result = .{ .staged_only_reuse_candidate = candidate },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     candidate = undefined;
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
     const boundary_revision = app.pages.changes.status_snapshot_revision;
@@ -1938,7 +1971,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     // Watch repair cycle: the fully staged worktree reports an empty unstaged
     // source and the same staged-only status. Revisions must only move
     // forward and the owned body must stay visible at every acceptance.
-    try app.update(.auto_reload_tick, &ctx);
+    try app.update(.auto_reload_tick, &ctx.ctx);
     const reads = try takeCanonicalPublicationReads(&ctx, allocator);
 
     var watch_status = try git_status.StatusBundle.parseOwned(allocator, "M  a\x00");
@@ -1949,11 +1982,11 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
         .background_cycle_id = reads.status_cycle_id,
         .repo_root = try allocator.dupe(u8, roots.a),
         .result = .{ .loaded = watch_status },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     watch_status = undefined;
     try std.testing.expect(app.pages.changes.status_snapshot_revision >= boundary_revision);
     const status_revision = app.pages.changes.status_snapshot_revision;
-    _ = discardQueuedTasks(&ctx, allocator);
+    _ = discardQueuedTasks(&ctx);
     try std.testing.expect(changesNavigationView(&app).displayedChangesBody() != .none);
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .branch_status = .{
@@ -1963,8 +1996,8 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
         .background_cycle_id = reads.branch_cycle_id,
         .repo_root = try allocator.dupe(u8, roots.a),
         .result = .empty,
-    } } }), &ctx);
-    _ = discardQueuedTasks(&ctx, allocator);
+    } } }), &ctx.ctx);
+    _ = discardQueuedTasks(&ctx);
     try std.testing.expect(changesNavigationView(&app).displayedChangesBody() != .none);
 
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
@@ -1973,7 +2006,7 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
         .generation = reads.source_generation,
         .background_cycle_id = reads.source_cycle_id,
         .result = .empty,
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.status_snapshot_revision >= status_revision);
     try std.testing.expect(changesNavigationView(&app).displayedChangesBody() != .none);
@@ -1982,20 +2015,20 @@ test "Changes watch cycle after staged boundary advances revisions monotonically
     // The committed publication resolves the staged-only row through a fresh
     // canonical cached read; deliver it and land on the cached preview.
     const canonical_request = try cloneBoundaryProjectionRequest(&app, allocator);
-    try discardSingleQueuedTask(&ctx, allocator);
+    try discardSingleQueuedTask(&ctx);
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = canonical_request,
         .result = .{ .ready = .{ .cached_diff = try app_load.buildLoadedBundle(
             allocator,
             app_test_support.diff_cached_projection,
         ) } },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.changes_projection.pending == null);
     try std.testing.expect(app.pages.changes.changes_projection.displayed == .ready);
     try std.testing.expect(app.pages.changes.changes_projection.displayed.ready.value == .cached_diff);
     try std.testing.expect(app.pages.changes.status_snapshot_revision >= status_revision);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "Changes staged boundary result defers during drag and lands afterward" {
     const allocator = std.testing.allocator;
@@ -2004,15 +2037,16 @@ test "Changes staged boundary result defers during drag and lands afterward" {
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
 
-    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
-    try discardSingleQueuedTask(&ctx, allocator);
+    try deliverStagedBoundaryStatus(&app, &ctx.ctx, allocator, roots.a);
+    try discardSingleQueuedTask(&ctx);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
 
     app.pages.changes.selection_owner = .{ .diff = .{
@@ -2030,7 +2064,7 @@ test "Changes staged boundary result defers during drag and lands afterward" {
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = result_request,
         .result = .{ .staged_only_reuse_candidate = candidate },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     candidate = undefined;
 
     // Drag holds the display mutation: the combined body stays visible and
@@ -2041,11 +2075,11 @@ test "Changes staged boundary result defers during drag and lands afterward" {
     try std.testing.expect(held.displayFile().hunks.ptr == prior_hunks);
 
     app.pages.changes.selection_owner = .none;
-    try app.update(.git_action_spinner_tick, &ctx);
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.deferred_projection_apply == null);
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "Changes deferred boundary publication forces frame past skip latch" {
     const allocator = std.testing.allocator;
@@ -2054,15 +2088,16 @@ test "Changes deferred boundary publication forces frame past skip latch" {
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const prior = changesNavigationView(&app).activeCombinedProjection() orelse
         return error.ExpectedCombinedProjection;
     const prior_hunks = prior.displayFile().hunks.ptr;
 
-    try deliverStagedBoundaryStatus(&app, &ctx, allocator, roots.a);
-    try discardSingleQueuedTask(&ctx, allocator);
+    try deliverStagedBoundaryStatus(&app, &ctx.ctx, allocator, roots.a);
+    try discardSingleQueuedTask(&ctx);
     const result_request = try cloneBoundaryProjectionRequest(&app, allocator);
 
     app.pages.changes.selection_owner = .{ .diff = .{
@@ -2079,23 +2114,23 @@ test "Changes deferred boundary publication forces frame past skip latch" {
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
         .request = result_request,
         .result = .{ .staged_only_reuse_candidate = candidate },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     candidate = undefined;
     try std.testing.expect(app.pages.changes.deferred_projection_apply != null);
 
     // The drag ends on a message whose handler skips its redraw; the tail
     // publishes the deferred owner and must still produce a frame.
     app.pages.changes.selection_owner = .none;
-    ctx.resetRedrawSuppressed();
-    try app.update(.git_action_spinner_tick, &ctx);
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    ctx.resetTransient();
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try std.testing.expect(!ctx.redrawSuppressed());
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
 
     // An unchanged tail on the same steady state keeps the handler's skip.
-    ctx.resetRedrawSuppressed();
-    try app.update(.git_action_spinner_tick, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    ctx.resetTransient();
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "Changes unchanged tail keeps handler redraw skip" {
     const allocator = std.testing.allocator;
@@ -2104,13 +2139,14 @@ test "Changes unchanged tail keeps handler redraw skip" {
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
-    ctx.resetRedrawSuppressed();
-    try app.update(.git_action_spinner_tick, &ctx);
-    try std.testing.expect(ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    ctx.resetTransient();
+    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try std.testing.expect(ctx.redrawSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "canonical noop commit clearing failure banner forces frame" {
     const allocator = std.testing.allocator;
@@ -2119,12 +2155,13 @@ test "canonical noop commit clearing failure banner forces frame" {
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
-    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, "MM a\x00");
-    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+    try finishCanonicalPublicationStatus(&app, &ctx.ctx, allocator, roots.a, reads, "MM a\x00");
+    try finishCanonicalPublicationBranch(&app, &ctx.ctx, allocator, roots.a, reads);
 
     // A previous watch failure left a banner; this cycle finds the same
     // content again (noop commit) and recovers that failure.
@@ -2138,21 +2175,21 @@ test "canonical noop commit clearing failure banner forces frame" {
 
     // The unchanged source terminal lands on a skip-latched cycle; the tail's
     // noop commit clears the banner and must still produce a frame.
-    ctx.resetRedrawSuppressed();
+    ctx.resetTransient();
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
         .identity = reads.source_identity,
         .read_epoch = reads.source_read_epoch,
         .generation = reads.source_generation,
         .background_cycle_id = reads.source_cycle_id,
         .result = .{ .unchanged = content_fingerprint.Fingerprint.init("test source") },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.canonical_publication == null);
     try std.testing.expect(
         std.mem.indexOf(u8, app.pages.changes.status.text(), "auto reload failed") == null,
     );
-    try std.testing.expect(!ctx.redrawWasSuppressed());
-    try std.testing.expectEqual(@as(usize, 0), ctx.takePendingTasks().len);
+    try std.testing.expect(!ctx.redrawSuppressed());
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
 test "canonical noop commit without projection kind clears banner and forces frame" {
     const allocator = std.testing.allocator;
@@ -2161,8 +2198,9 @@ test "canonical noop commit without projection kind clears banner and forces fra
     var app = try canonicalPublicationTestApp(allocator, roots.a);
     defer app.pages.changes.deinit(allocator);
     defer app.repo_session.repo_state.deinit(allocator);
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
 
     // Baseline where the gate path resolves no canonical projection kind:
     // the entry is unstaged-only, so the commit takes the kind-less noop
@@ -2171,8 +2209,8 @@ test "canonical noop commit without projection kind clears banner and forces fra
     try app.pages.changes.git_status.replace(roots.a, &unstaged_baseline);
 
     const reads = try startCanonicalPublicationWatch(&app, &ctx, allocator);
-    try finishCanonicalPublicationStatus(&app, &ctx, allocator, roots.a, reads, " M a\x00");
-    try finishCanonicalPublicationBranch(&app, &ctx, allocator, roots.a, reads);
+    try finishCanonicalPublicationStatus(&app, &ctx.ctx, allocator, roots.a, reads, " M a\x00");
+    try finishCanonicalPublicationBranch(&app, &ctx.ctx, allocator, roots.a, reads);
 
     const failure = app_auto_reload.FailureIdentity.init("watch failed");
     app.pages.changes.auto_reload.last_failure = failure;
@@ -2182,20 +2220,20 @@ test "canonical noop commit without projection kind clears banner and forces fra
         .{"boom"},
     );
 
-    ctx.resetRedrawSuppressed();
+    ctx.resetTransient();
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .source = .{
         .identity = reads.source_identity,
         .read_epoch = reads.source_read_epoch,
         .generation = reads.source_generation,
         .background_cycle_id = reads.source_cycle_id,
         .result = .{ .unchanged = content_fingerprint.Fingerprint.init("test source") },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.canonical_publication == null);
     try std.testing.expect(
         std.mem.indexOf(u8, app.pages.changes.status.text(), "auto reload failed") == null,
     );
-    try std.testing.expect(!ctx.redrawWasSuppressed());
+    try std.testing.expect(!ctx.redrawSuppressed());
 }
 test "Changes boundary repair revalidation starts in the same update cycle" {
     const allocator = std.testing.allocator;
@@ -2253,8 +2291,9 @@ test "Changes boundary repair revalidation starts in the same update cycle" {
     // the repair reload must still start inside this same update cycle. The
     // unstage action's cursor restores the path anchor exactly like the real
     // hunk-unstage flow does.
-    var ctx: chasen.Ctx(App.Msg) = .{ ._allocator = allocator };
-    defer ctx.runtimeClearPendingEffectCopies();
+    var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
     app.pages.changes.status_load = .{ .generation = 6, .pending = .{ .generation = 6 } };
     try installTestActionCursor(&app, allocator, .file, "a", 8);
     try promoteTestActionCursorWithRequirement(&app, 8, .status_only);
@@ -2265,7 +2304,7 @@ test "Changes boundary repair revalidation starts in the same update cycle" {
         .generation = 6,
         .repo_root = try allocator.dupe(u8, roots.a),
         .result = .{ .loaded = unstaged_status },
-    } } }), &ctx);
+    } } }), &ctx.ctx);
     unstaged_status = undefined;
 
     try std.testing.expect(app.pages.changes.changes_projection.displayed == .ready);
