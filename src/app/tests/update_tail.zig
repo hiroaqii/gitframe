@@ -176,7 +176,7 @@ test "git action spinner ticks keep previous ephemeral status" {
     _ = beginAcceptedTestAction(&app, .push);
     action_lifecycle.testing.setSpinner(&app.action_runtime, 0, true);
 
-    try app.update(.git_action_spinner_tick, undefined);
+    try app.update(.{ .git_action_spinner_tick = app.action_runtime.view().generation() }, undefined);
 
     try std.testing.expectEqualStrings("pushing: main -> origin/main", app.status.text());
     try std.testing.expectEqual(@as(u8, 1), action_lifecycle.testing.spinnerTick(&app.action_runtime));
@@ -204,7 +204,7 @@ test "git action spinner self-cancels stale ticks without redraw" {
     defer tc.deinit();
     defer tc.resetTransient();
 
-    try app.update(.git_action_spinner_tick, &tc.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &tc.ctx);
 
     try std.testing.expect(!action_lifecycle.testing.spinnerTimerRunning(&app.action_runtime));
     try std.testing.expectEqual(@as(u8, 0), action_lifecycle.testing.spinnerTick(&app.action_runtime));
@@ -215,7 +215,7 @@ test "git action spinner self-cancels stale ticks without redraw" {
 test "grouped result messages keep previous ephemeral status" {
     try std.testing.expect(app_message.keepsEphemeralStatus(.{ .load_finished = undefined }));
     try std.testing.expect(app_message.keepsEphemeralStatus(.{ .action_finished = undefined }));
-    try std.testing.expect(app_message.keepsEphemeralStatus(.git_action_spinner_tick));
+    try std.testing.expect(app_message.keepsEphemeralStatus(.{ .git_action_spinner_tick = 0 }));
 }
 
 test "branch time pickers sample one real-clock snapshot at every non-skipped redraw tail" {
@@ -515,13 +515,13 @@ test "Compare wheel redraw completion defers as one bundle during drag and appli
     // arrive as one event. The visible deferred owner must win over the
     // provisional skip candidate.
     ctx.resetTransient();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(app.pages.compare.deferred_load_apply == null);
     try std.testing.expectEqualStrings(reviewAppTestOid('e').slice(), app.pages.compare.basis.?.target.head_oid.slice());
 
     ctx.resetTransient();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expect(ctx.redrawSuppressed());
 }
 
@@ -1914,7 +1914,7 @@ test "Changes staged boundary result lands safely while canonical gate is open" 
     // A queued full revalidation is not blocked by the pending read: the next
     // update tail starts it while the canonical boundary read is in flight.
     app.pages.changes.activation.queueRevalidation();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expect(app.pages.changes.auto_reload.background_cycle != null);
     const reads = try takeCanonicalPublicationReads(&ctx, allocator);
     _ = reads;
@@ -2075,7 +2075,7 @@ test "Changes staged boundary result defers during drag and lands afterward" {
     try std.testing.expect(held.displayFile().hunks.ptr == prior_hunks);
 
     app.pages.changes.selection_owner = .none;
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.deferred_projection_apply == null);
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
@@ -2122,13 +2122,13 @@ test "Changes deferred boundary publication forces frame past skip latch" {
     // publishes the deferred owner and must still produce a frame.
     app.pages.changes.selection_owner = .none;
     ctx.resetTransient();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expect(!ctx.redrawSuppressed());
     try expectRetainedStagedOnlyOwner(&app, prior_hunks);
 
     // An unchanged tail on the same steady state keeps the handler's skip.
     ctx.resetTransient();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expect(ctx.redrawSuppressed());
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
@@ -2144,7 +2144,7 @@ test "Changes unchanged tail keeps handler redraw skip" {
     defer ctx.deinit();
 
     ctx.resetTransient();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expect(ctx.redrawSuppressed());
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }

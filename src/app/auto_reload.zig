@@ -1,4 +1,16 @@
 const std = @import("std");
+const chasen = @import("chasen");
+const app_message = @import("message.zig");
+
+pub const timer_id = "gitframe.auto_reload";
+
+pub fn timerNotice(notice: app_message.Msg.TimerNotice, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?app_message.Msg {
+    std.debug.assert(notice == .auto_reload);
+    return switch (outcome) {
+        .fired => .auto_reload_tick,
+        .failed => .auto_reload_timer_failed,
+    };
+}
 const config = @import("../config.zig");
 const content_fingerprint = @import("../content_fingerprint.zig");
 const diff_source = @import("../diff/source.zig");
@@ -210,6 +222,10 @@ pub const State = struct {
 
     pub fn enabled(self: State) bool {
         return self.activation != .disabled;
+    }
+
+    pub fn timerFailed(self: *State) void {
+        self.activation = .disabled;
     }
 
     pub fn beginCycle(self: *State) ?u64 {

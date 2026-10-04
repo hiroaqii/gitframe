@@ -46,7 +46,7 @@ pub const LatestRequest = struct {
     request: git_history.SelectionRequest,
 };
 
-/// A debounce worker carries no selection request or repository descriptor.
+/// A debounce TimerNotice carries no selection request or repository descriptor.
 pub const DebounceStamp = struct {
     page: app_page.RequestIdentity,
     root: root_capability.Identity,

@@ -2363,7 +2363,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 try std.testing.expect(compare.deferred_load_apply != null);
                 try std.testing.expect(if (success) app.screen_transition == .waiting else app.screen_transition == .idle);
                 diff.selection_owner = .none;
-                try app.update(.git_action_spinner_tick, &ctx.ctx);
+                try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
                 try std.testing.expect(if (success) app.screen_transition == .running else app.screen_transition == .idle);
                 try std.testing.expect(compare.basis.?.target.head_oid.eql(&new_head));
                 try std.testing.expectEqualStrings("refs/heads/main", compare.base_target.?.full_ref);

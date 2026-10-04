@@ -118,7 +118,7 @@ test "screen transition redraw requirement wins over background skip" {
     tc.init(std.testing.allocator, std.testing.io);
     defer tc.deinit();
     defer tc.resetTransient();
-    try app.update(.git_action_spinner_tick, &tc.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &tc.ctx);
     try std.testing.expect(app.screen_transition == .running);
     try std.testing.expect(!tc.redrawSuppressed());
 }
@@ -174,6 +174,6 @@ test "screen transition release and movement keep the effect and disabled ignore
     app.config.transitions = false;
     app.screen_transition = .idle;
     try std.testing.expect(app.handleEvent(.{ .frame = .{ .now_ns = 1, .delta_ns = 1, .index = 0 } }) == null);
-    try app.update(.git_action_spinner_tick, &tc.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &tc.ctx);
     try std.testing.expect(!tc.frameRequested());
 }

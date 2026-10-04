@@ -54,7 +54,7 @@ const diff_source = @import("diff/source.zig");
 const keymap = @import("keymap");
 const theme = @import("theme");
 
-const auto_reload_timer_id = "gitframe.auto_reload";
+const auto_reload = @import("app/auto_reload.zig");
 const CliConfig = diff_source.CliConfig;
 
 const RepoDiscoveryFinished = app_load.RepoDiscoveryFinished;
@@ -152,13 +152,20 @@ pub const App = struct {
         _ = self.pageCoordinator().activateChanges();
         if (self.config.transitions) self.screen_transition.arm(self.transitionIdentity().?);
         if (self.pages.changes.auto_reload.enabled()) {
-            try ctx.timer().every(auto_reload_timer_id, self.pages.changes.auto_reload.interval_ns, .auto_reload_tick);
+            ctx.timer().every(auto_reload.timer_id, self.pages.changes.auto_reload.interval_ns, .auto_reload, auto_reload.timerNotice) catch {
+                self.autoReloadTimerFailed();
+            };
         }
         if (diff_source.sourceRequiresRepo(self.config.source)) {
             try self.changesRead().startRepoDiscovery(ctx, null);
         } else {
             try self.changesRead().startDiffLoad(ctx, .initial);
         }
+    }
+
+    fn autoReloadTimerFailed(self: *App) void {
+        self.pages.changes.auto_reload.timerFailed();
+        self.status.set("Automatic reload unavailable; use manual reload", .{});
     }
 
     pub fn deinit(self: *App, deinit_ctx: chasen.AppDeinitContext) void {
@@ -677,6 +684,7 @@ pub const App = struct {
             .mouse_selection_drag => |continuation| try self.updateMouseSelectionDrag(ctx, continuation),
             .mouse_selection_release => |continuation| try self.updateMouseSelectionRelease(ctx, continuation),
             .drag_auto_scroll_tick => |generation| try self.updateDragAutoScrollTick(ctx, generation),
+            .drag_auto_scroll_timer_failed => |generation| self.drag_auto_scroll.timerFailed(generation),
             .cancel_commit_panel => self.localWorkflow().closeCommitPanel(),
             .submit_commit_panel => {
                 if (self.localWorkflowView().commitPanel().mode == .amend) {
@@ -790,6 +798,7 @@ pub const App = struct {
                 .compare => try self.compareCoordinator().refresh(ctx),
             },
             .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
+            .auto_reload_timer_failed => self.autoReloadTimerFailed(),
             .focus_lost => {
                 self.drag_auto_scroll.clear();
                 self.command_session = .inactive;
@@ -800,7 +809,8 @@ pub const App = struct {
                     .compare => self.pages.compare.diff.selection_owner = .none,
                 }
             },
-            .git_action_spinner_tick => if (self.actionLifecycle().tick(ctx)) self.redraw_plan.requestSkip(),
+            .git_action_spinner_tick => |generation| if (self.actionLifecycle().tick(generation)) self.redraw_plan.requestSkip(),
+            .git_action_spinner_timer_failed => |generation| self.actionLifecycle().timerFailed(generation),
             .cancel_remote_action => _ = self.remoteWorkflow().cancelActiveRemote(false),
             .quit => {
                 self.drag_auto_scroll.clear();
@@ -1007,7 +1017,8 @@ pub const App = struct {
         ctx.timer().every(
             drag_auto_scroll.timer_id,
             drag_auto_scroll.interval_ns,
-            .{ .drag_auto_scroll_tick = active.generation },
+            .{ .drag_scroll = active.generation },
+            drag_auto_scroll.timerNotice,
         ) catch {
             if (self.drag_auto_scroll.active) |current| {
                 if (current.generation == active.generation) self.drag_auto_scroll.clear();

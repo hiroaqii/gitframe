@@ -1123,34 +1123,6 @@ pub fn HistoryDiffTask(comptime Msg: type) type {
     };
 }
 
-/// Finite coalescing worker. Its context is one plain stamp: it owns neither
-/// repository authority nor a selection request.
-pub fn HistoryPreviewDebounceTask(comptime Msg: type) type {
-    return struct {
-        stamp: history_preview.DebounceStamp,
-
-        pub fn run(task: *@This(), _: std.mem.Allocator, io: std.Io) std.Io.Cancelable!Msg {
-            try io.sleep(.fromMilliseconds(75), .awake);
-            return task.finish(.elapsed);
-        }
-
-        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) Msg {
-            return task.finish(.{ .failed = historyPreviewTaskFailure(failure) });
-        }
-
-        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
-            allocator.destroy(task);
-        }
-
-        fn finish(task: *@This(), result: history_preview.DebounceResult) Msg {
-            return Msg.loadFinished(.{ .history = .{ .preview = .{ .debounce = .{
-                .stamp = task.stamp,
-                .result = result,
-            } } } });
-        }
-    };
-}
-
 /// One exact History preview read. Key and request are inline; the duplicated
 /// root plus the command boundary's sanitized environment are its only owned
 /// execution inputs.

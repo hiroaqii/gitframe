@@ -34,7 +34,6 @@ const repo_discovery = @import("../../repo/discovery.zig");
 const App = app_mod.App;
 const OverlayKind = app_state.OverlayKind;
 const DiffLoadTask = app_load.DiffLoadTask(app_message.Msg);
-const HistoryPreviewDebounceTask = app_load.HistoryPreviewDebounceTask(app_message.Msg);
 const sidebar_header_rows: u16 = @import("../pages/changes/layout.zig").sidebar_header_rows;
 
 fn shellLayout(app: *const App) app_shell_layout.Layout {
@@ -268,8 +267,8 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
     try std.testing.expect(app.pages.changes.selection_owner.activeDiff().?.moved);
-    const first_generation = switch (tc.everyAt(0).?.msg) {
-        .drag_auto_scroll_tick => |generation| generation,
+    const first_generation = switch (tc.everyAt(0).?.notice) {
+        .drag_scroll => |generation| generation,
         else => return error.ExpectedDragAutoScrollTimer,
     };
     try std.testing.expectEqual(first_generation, app.drag_auto_scroll.scheduled_generation.?);
@@ -292,8 +291,8 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
-    const second_generation = switch (tc.everyAt(0).?.msg) {
-        .drag_auto_scroll_tick => |generation| generation,
+    const second_generation = switch (tc.everyAt(0).?.notice) {
+        .drag_scroll => |generation| generation,
         else => return error.ExpectedDragAutoScrollTimer,
     };
     try std.testing.expect(second_generation != first_generation);
@@ -327,8 +326,8 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     } }, &tc.ctx);
     try std.testing.expectEqual(@as(usize, 1), tc.pendingCancelCount());
     try std.testing.expectEqual(@as(usize, 1), tc.pendingEveryCount());
-    const third_generation = switch (tc.everyAt(0).?.msg) {
-        .drag_auto_scroll_tick => |generation| generation,
+    const third_generation = switch (tc.everyAt(0).?.notice) {
+        .drag_scroll => |generation| generation,
         else => return error.ExpectedDragAutoScrollTimer,
     };
     try std.testing.expect(third_generation != second_generation);
@@ -445,7 +444,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
     defer tc.deinit();
     defer tc.resetTransient();
     const ids = [_][]const u8{ "full-0", "full-1", "full-2", "full-3", "full-4", "full-5", "full-6", "full-7" };
-    for (ids) |id| try tc.ctx.timer().every(id, 1, .git_action_spinner_tick);
+    for (ids) |id| try tc.ctx.timer().every(id, 1, .{ .spinner = 0 }, action_lifecycle.timerNotice);
 
     const last_row = shellLayout(&app).body.height - 1;
     try app.update(.{ .mouse_selection_drag = .{
@@ -1321,8 +1320,8 @@ test "History picker replaces preview immediately and fences detail clipboard co
     try std.testing.expect(app.pages.history.preview_state.phase == .loading);
     try std.testing.expect(app.pages.history.preview_state.accepted == null);
     try std.testing.expect(app.pages.history.preview_state.current_key.?.identity.selection == .single);
-    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
-    ctx.discardPendingTasks();
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTickCount());
+    ctx.discardPendingEffects();
 
     try app.update(.{ .history = .copy_detail }, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingClipboardCopyCount());

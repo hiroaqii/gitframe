@@ -5,6 +5,15 @@
 //! semantic step. Timer admission remains an App/runtime concern.
 
 const std = @import("std");
+const chasen = @import("chasen");
+const app_message = @import("message.zig");
+
+pub fn timerNotice(notice: app_message.Msg.TimerNotice, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?app_message.Msg {
+    return switch (outcome) {
+        .fired => .{ .drag_auto_scroll_tick = notice.drag_scroll },
+        .failed => .{ .drag_auto_scroll_timer_failed = notice.drag_scroll },
+    };
+}
 
 pub const timer_id = "gitframe.drag_auto_scroll";
 pub const interval_ns: u64 = 80 * std.time.ns_per_ms;
@@ -92,6 +101,14 @@ pub const State = struct {
 
     pub fn clear(self: *State) void {
         self.active = null;
+    }
+
+    pub fn timerFailed(self: *State, generation: u64) void {
+        if (self.scheduled_generation != generation) return;
+        self.scheduled_generation = null;
+        if (self.active) |active| {
+            if (active.generation == generation) self.active = null;
+        }
     }
 
     pub fn acceptedTick(self: State, generation: u64) ?Active {

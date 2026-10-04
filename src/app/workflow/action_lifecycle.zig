@@ -20,7 +20,7 @@ pub const ActionRuntime = struct {
     pending: ?PendingOwner = null,
     generation_value: u64 = 0,
     spinner_tick: u8 = 0,
-    spinner_timer_running: bool = false,
+    spinner_timer: union(enum) { stopped, running: u64, failed: u64 } = .stopped,
 
     pub fn view(self: *const ActionRuntime) View {
         return .{ .runtime = self };
@@ -189,35 +189,60 @@ pub const Controller = struct {
         _ = self.fence.clearMatchingActionCursor(allocator, generation_value);
     }
 
-    /// Returns true when an idle tick should suppress redraw.
-    pub fn tick(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) bool {
-        if (self.runtime.pending) |owner| {
-            if (owner.phase != .accepted) @panic("preparing action crossed the update boundary");
-        } else {
-            self.runtime.spinner_tick = 0;
-            self.runtime.spinner_timer_running = false;
-            ctx.timer().cancel(spinner_timer_id) catch {};
-            return true;
+    /// Stale ticks cannot animate a newer action or a failed timer.
+    pub fn tick(self: Controller, generation: u64) bool {
+        const pending = self.view().acceptedPending() orelse return true;
+        if (pending.generation != generation) return true;
+        switch (self.runtime.spinner_timer) {
+            .running => |running| if (running != generation) return true,
+            else => return true,
         }
         self.runtime.spinner_tick +%= 1;
         return false;
     }
 
+    pub fn timerFailed(self: Controller, generation: u64) void {
+        const pending = self.view().acceptedPending() orelse return;
+        if (pending.generation != generation) return;
+        switch (self.runtime.spinner_timer) {
+            .running => |running| if (running != generation) return,
+            else => return,
+        }
+        self.runtime.spinner_timer = .{ .failed = generation };
+        self.runtime.spinner_tick = 0;
+    }
+
     pub fn reconcileSpinner(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) void {
         if (self.runtime.pending) |owner| {
             if (owner.phase != .accepted) @panic("preparing action crossed the update boundary");
-            if (self.runtime.spinner_timer_running) return;
-            ctx.timer().every(spinner_timer_id, spinner_interval_ns, .git_action_spinner_tick) catch return;
-            self.runtime.spinner_timer_running = true;
+            const generation = owner.token.generation;
+            switch (self.runtime.spinner_timer) {
+                .running, .failed => |current| if (current == generation) return,
+                .stopped => {},
+            }
+            ctx.timer().every(spinner_timer_id, spinner_interval_ns, .{ .spinner = generation }, timerNotice) catch {
+                self.runtime.spinner_timer = .{ .failed = generation };
+                self.runtime.spinner_tick = 0;
+                return;
+            };
+            self.runtime.spinner_timer = .{ .running = generation };
+            self.runtime.spinner_tick = 0;
             return;
         }
 
-        if (!self.runtime.spinner_timer_running) return;
-        self.runtime.spinner_timer_running = false;
+        if (self.runtime.spinner_timer == .stopped) return;
+        self.runtime.spinner_timer = .stopped;
         self.runtime.spinner_tick = 0;
         ctx.timer().cancel(spinner_timer_id) catch {};
     }
 };
+
+pub fn timerNotice(notice: app_message.Msg.TimerNotice, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?app_message.Msg {
+    return switch (outcome) {
+        .fired => .{ .git_action_spinner_tick = notice.spinner },
+        .failed => .{ .git_action_spinner_timer_failed = notice.spinner },
+    };
+}
 
 pub const testing = if (builtin.is_test) struct {
     pub fn installAccepted(
@@ -234,7 +259,7 @@ pub const testing = if (builtin.is_test) struct {
 
     pub fn setSpinner(runtime: *ActionRuntime, tick_value: u8, timer_running: bool) void {
         runtime.spinner_tick = tick_value;
-        runtime.spinner_timer_running = timer_running;
+        runtime.spinner_timer = if (timer_running) .{ .running = runtime.generation_value } else .stopped;
     }
 
     pub fn spinnerTick(runtime: *const ActionRuntime) u8 {
@@ -242,7 +267,7 @@ pub const testing = if (builtin.is_test) struct {
     }
 
     pub fn spinnerTimerRunning(runtime: *const ActionRuntime) bool {
-        return runtime.spinner_timer_running;
+        return runtime.spinner_timer == .running;
     }
 } else struct {};
 

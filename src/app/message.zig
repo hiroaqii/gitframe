@@ -74,6 +74,12 @@ pub const MouseSelectionContinuation = struct {
 
 pub const Msg = union(enum) {
     pub const undelivered_policy = .deinit;
+    pub const TimerNotice = union(enum) {
+        auto_reload,
+        spinner: u64,
+        drag_scroll: u64,
+        history_preview: history_page.preview.DebounceStamp,
+    };
 
     terminal_resized: chasen.Size,
     switch_page: page.Id,
@@ -91,6 +97,7 @@ pub const Msg = union(enum) {
     mouse_selection_drag: MouseSelectionContinuation,
     mouse_selection_release: MouseSelectionContinuation,
     drag_auto_scroll_tick: u64,
+    drag_auto_scroll_timer_failed: u64,
     cancel_commit_panel,
     submit_commit_panel,
     copy_commit_message,
@@ -154,12 +161,14 @@ pub const Msg = union(enum) {
     run_interactive_push,
     reload,
     auto_reload_tick,
+    auto_reload_timer_failed,
     transition_frame,
     transition_cancel,
     // Borrowed terminal input is consumed synchronously in the same dispatch.
     transition_input: chasen.Event,
     focus_lost,
-    git_action_spinner_tick,
+    git_action_spinner_tick: u64,
+    git_action_spinner_timer_failed: u64,
     cancel_remote_action,
     quit,
 
@@ -223,11 +232,14 @@ pub fn keepsEphemeralStatus(msg: Msg) bool {
         .push_upstream_finalize_finished,
         .shell_effect_finished,
         .auto_reload_tick,
+        .auto_reload_timer_failed,
         .transition_frame,
         .transition_cancel,
         .drag_auto_scroll_tick,
+        .drag_auto_scroll_timer_failed,
         .focus_lost,
         .git_action_spinner_tick,
+        .git_action_spinner_timer_failed,
         // The copy handler must resolve and queue the currently visible text
         // before clearing its ephemeral status owner.
         .copy_footer_status,

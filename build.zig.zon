@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .chasen = .{
-            .url = "git+https://github.com/hiroaqii/chasen.git#c08b87eaf151e5706a9c95e8cd64da9895dc3e59",
-            .hash = "chasen-0.1.0-lvlHSaecCAAAYdMbBeAJ5UDxB4ZYwMrUi4LRakf2z4Ey",
+            .url = "git+https://github.com/hiroaqii/chasen.git#d3e04c3278e74e1b52a4c376a7f62e67cc2523ba",
+            .hash = "chasen-0.1.0-lvlHSWyiCQDERhBL6zJXAkzXvSZR7ZD4f2E3yvB79kaH",
         },
         .chasen_ui = .{
             .url = "git+https://github.com/hiroaqii/chasen-ui.git#c9a3f1579ce0f89ee45bb3ba26afecf476065470",

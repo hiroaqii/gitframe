@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(
         usize,
         "expected_package_root_test_count",
-        if (!provider_enabled and test_filters.len == 0) 1981 else 0,
+        if (!provider_enabled and test_filters.len == 0) 1988 else 0,
     );
     const build_options_mod = build_options.createModule();
 
@@ -141,6 +141,14 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const package_root_test_step = b.step("test-package-root", "Run only the package-root test artifact");
     package_root_test_step.dependOn(&run_mod_tests.step);
+
+    const ui_consumer_tests = b.addTest(.{
+        .root_module = chasen_ui_mod,
+        .use_llvm = if (target.result.os.tag == .linux) true else null,
+        .use_lld = if (target.result.os.tag == .linux) true else null,
+    });
+    const ui_consumer_step = b.step("test-chasen-ui-consumer", "Test Chasen UI against GitFrame's exact Chasen module");
+    ui_consumer_step.dependOn(&b.addRunArtifact(ui_consumer_tests).step);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,

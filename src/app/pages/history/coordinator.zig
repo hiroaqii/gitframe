@@ -16,7 +16,6 @@ const committed_diff_navigation = @import("../committed_diff/navigation.zig");
 
 const CatalogTask = app_load.HistoryCatalogTask(app_message.Msg);
 const DiffTask = app_load.HistoryDiffTask(app_message.Msg);
-const PreviewDebounceTask = app_load.HistoryPreviewDebounceTask(app_message.Msg);
 const PreviewReadTask = app_load.HistoryPreviewReadTask(app_message.Msg);
 
 pub const UpdateOutcome = struct {
@@ -292,15 +291,9 @@ pub const Controller = struct {
 
     fn startPreviewDebounce(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         const stamp = self.page_state.preview_state.reserveDebounce() orelse return;
-        const task = ctx.allocator().create(PreviewDebounceTask) catch |err| {
-            self.page_state.preview_state.rejectDebouncePreparation(stamp, .allocation);
-            return err;
-        };
-        task.* = .{ .stamp = stamp };
         self.page_state.preview_state.armDebounce(stamp);
-        _ = ctx.task().spawnOwned(task, .{ .run = PreviewDebounceTask.run, .failed = PreviewDebounceTask.failed, .cleanup = PreviewDebounceTask.destroy }) catch |err| {
-            PreviewDebounceTask.destroy(task, ctx.allocator());
-            self.page_state.preview_state.rejectDebounceStart(stamp, .task_start);
+        ctx.timer().tick("gitframe.history_preview", 75 * std.time.ns_per_ms, .{ .history_preview = stamp }, timerNotice) catch |err| {
+            self.page_state.preview_state.rejectDebounceStart(stamp, if (err == error.OutOfMemory) .allocation else .task_start);
             return err;
         };
     }
@@ -415,3 +408,13 @@ pub const Controller = struct {
         };
     }
 };
+
+pub fn timerNotice(notice: app_message.Msg.TimerNotice, outcome: chasen.TimerOutcome, _: std.mem.Allocator) ?app_message.Msg {
+    return app_message.Msg.loadFinished(.{ .history = .{ .preview = .{ .debounce = .{
+        .stamp = notice.history_preview,
+        .result = switch (outcome) {
+            .fired => .elapsed,
+            .failed => .{ .failed = .task_start },
+        },
+    } } } });
+}

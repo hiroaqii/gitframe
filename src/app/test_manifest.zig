@@ -24,6 +24,7 @@ pub fn include() void {
     _ = @import("tests/stash.zig");
     _ = @import("tests/remote_shell.zig");
     _ = @import("tests/root_shell.zig");
+    _ = @import("tests/timer_integration.zig");
     _ = @import("tests/root_view.zig");
     _ = @import("tests/update_tail.zig");
 }

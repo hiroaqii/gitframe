@@ -791,7 +791,7 @@ test "mutation read start gate retains manual and queued revalidation until reop
         activation_id,
         app.pages.changes.activation.revalidation_requested orelse return error.ExpectedRevalidationIntent,
     );
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expectEqual(
         activation_id,
@@ -806,7 +806,7 @@ test "mutation read start gate retains manual and queued revalidation until reop
     );
 
     try std.testing.expect(app.pages.changes.repository_read_authority.reopenForMutation(owner));
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.activation.revalidation_requested == null);
     try std.testing.expect(app.pages.changes.load.pending != null);
@@ -857,7 +857,7 @@ test "closed read authority queues action-terminal revalidation instead of dropp
     // Model the exact terminal's activation-scoped fallback, then let the
     // public update tail encounter the still-closed read fence.
     app.pages.changes.activation.queueActionTerminalRevalidation();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
 
     try std.testing.expect(app.pages.changes.activation.hasQueuedFullRevalidation());
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
@@ -972,7 +972,7 @@ test "mutation read promotion gate makes App projection scheduling inert" {
     ctx.init(allocator, std.testing.io);
     defer ctx.deinit();
 
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
 
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
     try std.testing.expect(app.pages.changes.changes_projection.pending == null);
@@ -1638,7 +1638,7 @@ test "Changes canonical publication page transition retires an old projection re
         reads,
         .changed,
     );
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     var old_request = try takeCanonicalPublicationProjectionRequest(&ctx);
     var old_request_owned = true;
     defer if (old_request_owned) old_request.deinit(allocator);
@@ -1750,7 +1750,7 @@ test "Changes canonical publication retains the prior body for every direct acti
                     try expectRetainedCanonicalPublication(&app, prior_hunks);
                 }
 
-                try app.update(.git_action_spinner_tick, &ctx.ctx);
+                try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
                 try std.testing.expect(app.screen_transition == .waiting);
                 var request = try takeCanonicalPublicationProjectionRequest(&ctx);
                 if (source_empty) {
@@ -1872,7 +1872,7 @@ test "Changes canonical publication retains the prior body for a stage hunk succ
     try finishCanonicalPublicationStatus(&app, &ctx.ctx, allocator, roots.a, reads, "MM a\x00 M b\x00");
     try expectRetainedCanonicalPublication(&app, prior_hunks);
 
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     var request = try takeCanonicalPublicationProjectionRequest(&ctx);
     const final_bundle = try canonicalPublicationFinalBundle(allocator, request);
     try app.update(App.Msg.loadFinished(.{ .changes = .{ .projection = .{
@@ -2013,7 +2013,7 @@ test "deferred background source is discarded when a repository action starts" {
 
     _ = beginAcceptedTestAction(&app, .stage_file);
     changesNavigation(&app).clearDiffSelection();
-    try app.update(.git_action_spinner_tick, &ctx.ctx);
+    try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
 
     try std.testing.expectEqualStrings("old", changesNavigationView(&app).activeLoadedDiffConst().?.text);
     try std.testing.expect(app.pages.changes.deferred_source_apply == null);
@@ -2905,7 +2905,7 @@ fn expectFreshCanonicalPageTransitionReads(
     // revalidation may already have started in that same turn. If not, give
     // the retained intent one neutral scheduling opportunity.
     if (ctx.pendingTaskCount() == 0) {
-        try app.update(.git_action_spinner_tick, &ctx.ctx);
+        try app.update(.{ .git_action_spinner_tick = 0 }, &ctx.ctx);
     }
     const fresh = try takeCanonicalPublicationReads(ctx, allocator);
     const active = app.pages.changes.activation.currentIdentity() orelse
