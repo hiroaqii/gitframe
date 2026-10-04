@@ -10,6 +10,8 @@ worktree, file path, current state, commits, and comparison basis. GitFrame
 preserves that frame so you always know exactly what you are viewing or
 changing.
 
+https://github.com/user-attachments/assets/38aef9d7-db65-48eb-89bb-c76b498770dd
+
 ## Highlights
 
 - Switch repositories and branches.
