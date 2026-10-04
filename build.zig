@@ -415,6 +415,11 @@ pub fn build(b: *std.Build) void {
     check_core_wasm_step.dependOn(&core_wasm.step);
 
     const test_step = b.step("test", "Run tests");
+    if (test_filters.len == 0) {
+        const startup_tests = b.addSystemCommand(&.{ "sh", b.pathFromRoot("scripts/startup-test.sh") });
+        startup_tests.addArtifactArg(exe);
+        test_step.dependOn(&startup_tests.step);
+    }
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_draw_tests.step);

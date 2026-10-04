@@ -26,9 +26,20 @@ The prebuilt binaries support the following platforms:
 | macOS | macOS 15 or newer on Apple Silicon |
 | Linux | x86_64, kernel 5.15 or newer, glibc 2.35 or newer |
 
-GitFrame runs in an interactive terminal and requires Git on your `PATH`.
+GitFrame runs in an interactive terminal and requires **Git 2.45.1 or newer**
+on your `PATH`. Check the installed version with `git --version`.
 Homebrew installs Git as a dependency; install Git separately when using mise
 or building from source.
+
+GitFrame checks Git before opening the TUI. An older or unavailable Git, or a
+failed version check, produces a terminal message and exits with status 1.
+`gitframe --help` and `gitframe --version` work without Git.
+
+The OS and Git requirements are separate: Ubuntu 24.04's standard Git 2.43
+needs an update. Follow the [official Git instructions for Ubuntu](https://git-scm.com/install/linux),
+which provide the `ppa:git-core/ppa` repository. On macOS with Homebrew, run
+`brew update` and `brew upgrade git`. Check `git --version` again afterward;
+if it still reports an older version, put the updated Git first on your `PATH`.
 
 ### Homebrew
 
@@ -68,7 +79,7 @@ for details.
 
 ### From source
 
-Install Zig **0.16.0** and Git on Linux or macOS. Download **Source code
+Install Zig **0.16.0** and Git **2.45.1 or newer** on Linux or macOS. Download **Source code
 (tar.gz)** or **Source code (zip)** from the
 [latest release](https://github.com/hiroaqii/gitframe/releases/latest),
 extract the archive, and open a terminal in the extracted directory.

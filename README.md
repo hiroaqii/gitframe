@@ -36,6 +36,9 @@ branch comparison into four working views.
 
 ## Getting started
 
+Git **2.45.1 or newer** must be on your `PATH`. Check with `git --version`;
+see [requirements and Git updates](docs/guide.md#requirements) if needed.
+
 Run GitFrame inside a Git worktree to review staged and unstaged changes:
 
 ```sh

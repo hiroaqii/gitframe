@@ -3,13 +3,13 @@ const gitframe = @import("gitframe");
 const chasen = @import("chasen");
 const build_options = @import("build_options");
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
     if (wantsHelp(args)) {
         try printHelp(init.io);
-        return;
+        return 0;
     }
 
     const config = gitframe.parseArgs(args) catch |err| {
@@ -18,8 +18,10 @@ pub fn main(init: std.process.Init) !void {
     };
     if (config.version) {
         try printVersion(init.io);
-        return;
+        return 0;
     }
+
+    if (!try checkGitVersion(init.gpa, init.io)) return 1;
 
     var config_paths = try gitframe.config.resolvePaths(init.gpa, init.environ_map);
     defer config_paths.deinit(init.gpa);
@@ -74,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
             .executable_path = executable_path,
         });
         try printStatsSummary(init.io, summary);
-        return;
+        return 0;
     }
 
     const app_recent_repos = recent_repos;
@@ -103,6 +105,57 @@ pub fn main(init: std.process.Init) !void {
         .theme = palette,
         .executable_path = executable_path,
     });
+    return 0;
+}
+
+const minimum_git_version: std.SemanticVersion = .{ .major = 2, .minor = 45, .patch = 1 };
+
+fn parseGitVersion(output: []const u8) !std.SemanticVersion {
+    const prefix = "git version ";
+    if (!std.mem.startsWith(u8, output, prefix)) return error.InvalidVersion;
+    var tokens = std.mem.tokenizeAny(u8, output[prefix.len..], " \t\r\n");
+    return std.SemanticVersion.parse(tokens.next() orelse return error.InvalidVersion);
+}
+
+fn checkGitVersion(allocator: std.mem.Allocator, io: std.Io) !bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "git", "--version" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch |err| return gitStartupFailure(io, switch (err) {
+        error.FileNotFound => "Git was not found in PATH.",
+        error.StreamTooLong => "Git version output is too long.",
+        else => "Could not run `git --version`.",
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term != .exited or result.term.exited != 0)
+        return gitStartupFailure(io, "`git --version` did not exit successfully.");
+    const version = parseGitVersion(result.stdout) catch
+        return gitStartupFailure(io, "Could not parse Git version output.");
+    if (version.order(minimum_git_version) != .lt) return true;
+
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.File.Writer = .initStreaming(.stderr(), io, &buffer);
+    try stderr.interface.print(
+        "gitframe: Git {f} or later is required.\nDetected Git version: {f}\n\n" ++
+            "Please update Git and run GitFrame again.\n",
+        .{ minimum_git_version, version },
+    );
+    try stderr.flush();
+    return false;
+}
+
+fn gitStartupFailure(io: std.Io, message: []const u8) !bool {
+    var buffer: [512]u8 = undefined;
+    var stderr: std.Io.File.Writer = .initStreaming(.stderr(), io, &buffer);
+    try stderr.interface.print(
+        "gitframe: {s}\n\nPlease install or update Git to {f} or later and run GitFrame again.\n",
+        .{ message, minimum_git_version },
+    );
+    try stderr.flush();
+    return false;
 }
 
 fn startupDiagnosticWriter(file: std.Io.File, io: std.Io, buffer: []u8) std.Io.File.Writer {
@@ -189,6 +242,10 @@ fn printHelp(io: std.Io) !void {
         \\  --stats-summary   Print runtime timing summary after exit
         \\  --version         Print version and exit
         \\  -h, --help        Show this help
+        \\
+        \\Requirements:
+        \\  Git 2.45.1 or later on PATH. Check with: git --version
+        \\  Update: https://github.com/hiroaqii/gitframe/blob/main/docs/guide.md#requirements
         \\
         \\Default:
         \\  gitframe          Show staged and unstaged changes; reload every 3 seconds
@@ -280,6 +337,29 @@ test "wantsHelp detects help flags" {
     try std.testing.expect(wantsHelp(&.{ "gitframe", "--help", "--version" }));
     try std.testing.expect(wantsHelp(&.{ "gitframe", "--cached", "--version", "-h" }));
     try std.testing.expect(!wantsHelp(&.{ "gitframe", "--version" }));
+}
+
+test "Git version requirement compares numbers and accepts vendor suffixes" {
+    const cases = .{
+        .{ "git version 2.9.5\n", false },
+        .{ "git version 2.44.9\n", false },
+        .{ "git version 2.45.0\n", false },
+        .{ "git version 2.45.1\n", true },
+        .{ "git version 2.45.1 (Apple Git-157)\n", true },
+        .{ "git version 2.55.0\r\n", true },
+        .{ "git version 3.0.0\n", true },
+        .{ "git version 2.45.1-rc1\n", false },
+    };
+    inline for (cases) |case| {
+        const version = try parseGitVersion(case[0]);
+        try std.testing.expectEqual(case[1], version.order(minimum_git_version) != .lt);
+    }
+}
+
+test "Git version requirement rejects missing and malformed versions" {
+    for ([_][]const u8{ "", "2.45.1", "git version ", "git version 2.45", "git version 2.x.1", "git version 2.45.1junk", "git version 2.45.1.rc1" }) |output| {
+        try std.testing.expectError(error.InvalidVersion, parseGitVersion(output));
+    }
 }
 
 test "config startup borrows a successful result-owned config" {
