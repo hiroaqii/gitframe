@@ -18,11 +18,11 @@ ROOT = Path(__file__).resolve().parent.parent
 PLATFORMS = {
     "linux-x86_64": {
         "target": "x86_64-linux.5.15-gnu.2.35",
-        "requires": "Linux 5.15 or newer, glibc 2.35 or newer, Git",
+        "requires": "Linux 5.15 or newer, glibc 2.35 or newer, Git 2.45.1 or newer",
     },
     "macos-arm64": {
         "target": "aarch64-macos.15.0",
-        "requires": "macOS 15 or newer, Apple Silicon, Git",
+        "requires": "macOS 15 or newer, Apple Silicon, Git 2.45.1 or newer",
     },
 }
 

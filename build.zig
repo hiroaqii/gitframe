@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const SyntaxProvider = enum {
     none,
@@ -27,8 +26,6 @@ pub fn build(b: *std.Build) void {
     });
     const chasen_mod = chasen_dep.module("chasen");
     const chasen_ui_mod = chasen_ui_dep.module("chasen_ui");
-    // Shared public types require Chasen UI and GitFrame to import one module instance.
-    chasen_ui_mod.addImport("chasen", chasen_mod);
     const draw_mod = b.createModule(.{
         .root_source_file = b.path("src/draw.zig"),
         .target = target,
@@ -76,6 +73,7 @@ pub fn build(b: *std.Build) void {
             .none => break :mod b.addModule("gitframe", .{
                 .root_source_file = b.path("src/root.zig"),
                 .target = target,
+                .optimize = optimize,
                 .link_libc = target.result.os.tag == .linux or target.result.os.tag == .macos,
                 .imports = &base_imports,
             }),
@@ -97,6 +95,7 @@ pub fn build(b: *std.Build) void {
                 break :mod b.addModule("gitframe", .{
                     .root_source_file = b.path("src/root.zig"),
                     .target = target,
+                    .optimize = optimize,
                     .link_libc = target.result.os.tag == .linux or target.result.os.tag == .macos,
                     .imports = &flow_imports,
                 });
@@ -242,15 +241,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_sidebar_view_model_tests = b.addRunArtifact(sidebar_view_model_tests);
 
-    const check_flow_syntax_step = b.step("check-flow-syntax", "Compile the pinned flow-syntax provider API check");
+    const check_flow_syntax_step = b.step("check-flow-syntax", "Test the pinned flow-syntax provider API");
     const flow_syntax_check = b.option(
         bool,
         "flow-syntax-check",
-        "Fetch and compile the pinned flow-syntax API canary",
+        "Fetch and test the pinned flow-syntax API canary",
     ) orelse false;
     if (flow_syntax_check) {
-        // lazyDependency marks the package as needed when called. Keep the call
-        // behind an option so default build/test paths do not fetch it.
+        // With syntax-provider=none, fetch flow-syntax only when this check is requested.
         const flow_syntax_dep = b.lazyDependency("flow_syntax", .{
             .target = target,
             .optimize = optimize,
@@ -266,24 +264,18 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        flow_syntax_check_tests.use_llvm = true;
-        flow_syntax_check_tests.use_lld = if (builtin.os.tag.isDarwin()) null else true;
+        configureFlowSyntaxArtifact(flow_syntax_check_tests, target, true);
         const run_flow_syntax_check_tests = b.addRunArtifact(flow_syntax_check_tests);
         check_flow_syntax_step.dependOn(&run_flow_syntax_check_tests.step);
     } else {
         check_flow_syntax_step.dependOn(&b.addFail(
-            "run `zig build check-flow-syntax -Dflow-syntax-check=true` to fetch and compile the pinned flow-syntax API canary",
+            "run `zig build check-flow-syntax -Dflow-syntax-check=true` to fetch and test the pinned flow-syntax API canary",
         ).step);
     }
 
-    const test_syntax_provider_step = b.step("test-syntax-provider", "Run syntax provider integration tests");
+    const test_syntax_provider_step = b.step("test-syntax-provider", "Run package-root tests with the syntax provider");
     if (syntax_provider == .flow_syntax) {
-        const syntax_provider_tests = b.addTest(.{
-            .root_module = mod,
-        });
-        configureFlowSyntaxArtifact(syntax_provider_tests, target, true);
-        const run_syntax_provider_tests = b.addRunArtifact(syntax_provider_tests);
-        test_syntax_provider_step.dependOn(&run_syntax_provider_tests.step);
+        test_syntax_provider_step.dependOn(&run_mod_tests.step);
     } else {
         test_syntax_provider_step.dependOn(&b.addFail(
             "run `zig build test-syntax-provider -Dsyntax-provider=flow_syntax` on macOS or Linux",
@@ -438,7 +430,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = if (target.result.os.tag == .linux) true else null,
     });
     test_step.dependOn(&b.addRunArtifact(keymap_tests).step);
-    const check_tests_step = b.step("check-tests", "Compile all test artifacts without executing them");
+    const check_tests_step = b.step("check-tests", "Compile aggregate test artifacts without executing them");
     for ([_]*std.Build.Step.Compile{
         mod_tests,             exe_tests,         draw_tests,      diff_source_tests,        diff_parser_tests,
         diff_view_model_tests, diff_search_tests, file_tree_tests, sidebar_view_model_tests, keymap_tests,

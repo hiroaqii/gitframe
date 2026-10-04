@@ -8,8 +8,9 @@ The Release workflow builds with Zig 0.16.0 and `ReleaseSafe`:
 | `macos-arm64` | `macos-15` | `aarch64-macos.15.0` | `baseline` |
 
 Linux requires kernel 5.15+ and glibc 2.35+. macOS requires macOS 15+ on Apple
-Silicon. Both require Git at runtime. The macOS binary is not Developer ID
-signed or notarized; browser downloads can require a Gatekeeper override.
+Silicon. Both require Git 2.45.1 or newer on `PATH` at runtime. The macOS binary
+is not Developer ID signed or notarized; browser downloads can require a
+Gatekeeper override.
 
 ## Prepare the version and release notes
 
@@ -54,8 +55,14 @@ git show HEAD
 git push origin main
 ```
 
-You can also prepare manually: update `build.zig.zon`, write the matching notes,
-then commit and push both files before creating the tag or running Release.
+If dependency updates are part of the release, commit and validate those changes
+before using `prepare-release.py`; its clean-manifest check prevents bundling
+unrelated manifest edits into the automatic version commit.
+
+You can also prepare manually: update the version and dependencies in
+`build.zig.zon`, write the matching notes, then commit and push the reviewed
+changes before creating the tag or running Release. Once the version is already
+updated, skip `prepare-release.py` and use `release-github.py` after the push.
 
 Run the commands below from the repository root. The orchestration script reads
 the version from `build.zig.zon` at HEAD; the manual commands use the working-tree

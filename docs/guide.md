@@ -430,7 +430,7 @@ reproduce it.
 
 ## Development
 
-Install Zig **0.16.0** and Git, then clone the repository:
+Install Zig **0.16.0** and Git **2.45.1 or newer**, then clone the repository:
 
 ```sh
 git clone https://github.com/hiroaqii/gitframe.git
@@ -467,6 +467,21 @@ To test without the syntax provider, or focus on a matching test name:
 zig build test -Dsyntax-provider=none
 zig build test -Dsyntax-provider=none -Dtest-filter=parseArgs
 ```
+
+`-Dtest-filter` applies to the aggregate Zig test artifacts; filtered runs skip
+the startup CLI checks. `zig build check-tests` compiles the aggregate test
+artifacts without running them.
+
+Additional dependency checks are available separately:
+
+```sh
+zig build test-chasen-ui-consumer
+zig build check-flow-syntax -Dflow-syntax-check=true
+```
+
+`test-syntax-provider` runs the same package-root test artifact as
+`test-package-root`, with syntax highlighting required. Use the aggregate
+`test` step for the full application test suite.
 
 Use `zig build --help` for additional build steps and options. Release
 maintainers can find publishing instructions in
