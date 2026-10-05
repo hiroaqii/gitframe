@@ -248,7 +248,7 @@ pub const RecentStore = struct {
             repo_owned = try allocator.dupe(u8, repo_path);
         }
 
-        const additional: usize = @intFromBool(workspace_owned != null) + @intFromBool(repo_owned != null);
+        const additional = @as(usize, @intFromBool(workspace_owned != null)) + @as(usize, @intFromBool(repo_owned != null));
         try self.entries.ensureUnusedCapacity(allocator, additional);
         self.rememberPrepared(.workspace, workspace.current_root, &workspace_owned);
         self.rememberPrepared(.repo, repo_path, &repo_owned);
@@ -354,19 +354,35 @@ test "RecentStore owns and deduplicates paths" {
     try std.testing.expectEqualStrings("/tmp/one", store.entries.items[0].path);
     try std.testing.expectEqualStrings("/tmp/two", store.entries.items[1].path);
 
+    var workspace_path = "/tmp/work".*;
+    var repo_path = "/tmp/work/repo".*;
     var repos = [_]repo_discovery.RepoEntry{.{
         .label = "repo",
         .display_path = "repo",
-        .canonical_root = "/tmp/work/repo",
+        .canonical_root = &repo_path,
     }};
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, store.rememberDiscovery(failing.allocator(), .{ .workspace = .{
-        .current_root = "/tmp/work",
+    const discovery: repo_discovery.DiscoveryResult = .{ .workspace = .{
+        .current_root = &workspace_path,
         .repos = &repos,
-    } }));
+    } };
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, store.rememberDiscovery(failing.allocator(), discovery));
     try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
     try std.testing.expectEqualStrings("/tmp/one", store.entries.items[0].path);
     try std.testing.expectEqualStrings("/tmp/two", store.entries.items[1].path);
+
+    try store.rememberDiscovery(allocator, discovery);
+    try store.rememberDiscovery(allocator, discovery);
+    try std.testing.expectEqual(@as(usize, 4), store.entries.items.len);
+    try std.testing.expectEqual(RecentKind.repo, store.entries.items[0].kind);
+    try std.testing.expectEqual(RecentKind.workspace, store.entries.items[1].kind);
+    try std.testing.expectEqualStrings("/tmp/one", store.entries.items[2].path);
+    try std.testing.expectEqualStrings("/tmp/two", store.entries.items[3].path);
+
+    @memset(&workspace_path, 'x');
+    @memset(&repo_path, 'x');
+    try std.testing.expectEqualStrings("/tmp/work/repo", store.entries.items[0].path);
+    try std.testing.expectEqualStrings("/tmp/work", store.entries.items[1].path);
 }
 
 test "RecentStore loads persisted recent entries" {
