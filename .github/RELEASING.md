@@ -196,7 +196,7 @@ from the release's `SHA256SUMS`, then submit a PR. **Install** tests Homebrew an
 mise installation on Linux and macOS, including execution without removing
 quarantine attributes on macOS.
 
-The [guide's mise command](../docs/guide.md#mise) uses `@latest`, so it needs no
+The [README's mise command](../README.md#mise) uses `@latest`, so it needs no
 version edit for each release. mise uses the existing GitHub Release directly
 and needs no separate registry update. Its default minimum release age can
 exclude a newly published version from `@latest` for 24 hours. Keep the

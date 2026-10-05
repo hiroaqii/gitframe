@@ -34,10 +34,79 @@ branch comparison into four working views.
 | `3` | **History** | Commits and commit ranges |
 | `4` | **Compare** | Current `HEAD` and selected Base branch |
 
-## Getting started
+## Installation
 
-Git **2.45.1 or newer** must be on your `PATH`. Check with `git --version`;
-see [requirements and Git updates](docs/guide.md#requirements) if needed.
+GitFrame can be installed with Homebrew or mise, or built from source.
+Homebrew and mise use prebuilt binaries from
+[GitHub Releases](https://github.com/hiroaqii/gitframe/releases), so no Zig
+compiler is required for those methods.
+
+### Requirements
+
+The prebuilt binaries support the following platforms:
+
+| Platform | Requirements |
+| --- | --- |
+| macOS | macOS 15 or newer on Apple Silicon |
+| Linux | x86_64, kernel 5.15 or newer, glibc 2.35 or newer |
+
+GitFrame runs in an interactive terminal and requires **Git 2.45.1 or newer**
+on your `PATH`. Check the installed version with `git --version`.
+Homebrew installs Git as a dependency; install Git separately when using mise
+or building from source. For Git updates and startup failures, see
+[requirements troubleshooting](docs/guide.md#requirements).
+
+### Homebrew
+
+With [Homebrew](https://brew.sh/) installed, run:
+
+```sh
+brew install hiroaqii/tap/gitframe
+```
+
+On Apple Silicon, use native ARM Homebrew.
+
+To update GitFrame:
+
+```sh
+brew update
+brew upgrade hiroaqii/tap/gitframe
+```
+
+### mise
+
+With [mise](https://mise.jdx.dev/) installed and activated in your shell, run:
+
+```sh
+mise use -g github:hiroaqii/gitframe@latest
+```
+
+This makes GitFrame available globally in shells using mise. To update:
+
+```sh
+mise upgrade github:hiroaqii/gitframe
+```
+
+By default, mise waits 24 hours before selecting a newly published release
+with `@latest`. See mise's
+[minimum release age setting](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)
+for details.
+
+### From source
+
+See the guide's [source build instructions](docs/guide.md#from-source) to
+build GitFrame with Zig and install the binary.
+
+### Check the installation
+
+Check that GitFrame is available:
+
+```sh
+gitframe --version
+gitframe --help
+```
+
+## Getting started
 
 Run GitFrame inside a Git worktree to review staged and unstaged changes:
 
@@ -48,8 +117,8 @@ gitframe
 In the main views, press `?` for help or `q` to quit. Run `gitframe --help`
 to see the available command-line options.
 
-See the [guide](docs/guide.md) for installation, usage, and development
-instructions.
+See the [guide](docs/guide.md) for usage, configuration, troubleshooting,
+and development instructions.
 
 ## Design boundaries
 

@@ -1,83 +1,19 @@
 # GitFrame guide
 
-This guide covers installation, everyday use, optional configuration, and
+This guide covers source builds, everyday use, optional configuration, and
 development.
 
-- [Installation](#installation)
+For supported platforms and installation with Homebrew or mise, see the
+[README](../README.md#installation).
+
+- [From source](#from-source)
 - [Basic usage](#basic-usage)
 - [Working views](#working-views)
 - [Configuration (optional)](#configuration-optional)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 
-## Installation
-
-GitFrame can be installed with Homebrew or mise, or built from source.
-Homebrew and mise use prebuilt binaries from
-[GitHub Releases](https://github.com/hiroaqii/gitframe/releases), so no Zig
-compiler is required for those methods.
-
-### Requirements
-
-The prebuilt binaries support the following platforms:
-
-| Platform | Requirements |
-| --- | --- |
-| macOS | macOS 15 or newer on Apple Silicon |
-| Linux | x86_64, kernel 5.15 or newer, glibc 2.35 or newer |
-
-GitFrame runs in an interactive terminal and requires **Git 2.45.1 or newer**
-on your `PATH`. Check the installed version with `git --version`.
-Homebrew installs Git as a dependency; install Git separately when using mise
-or building from source.
-
-GitFrame checks Git before opening the TUI. An older or unavailable Git, or a
-failed version check, produces a terminal message and exits with status 1.
-`gitframe --help` and `gitframe --version` work without Git.
-
-The OS and Git requirements are separate: Ubuntu 24.04's standard Git 2.43
-needs an update. Follow the [official Git instructions for Ubuntu](https://git-scm.com/install/linux),
-which provide the `ppa:git-core/ppa` repository. On macOS with Homebrew, run
-`brew update` and `brew upgrade git`. Check `git --version` again afterward;
-if it still reports an older version, put the updated Git first on your `PATH`.
-
-### Homebrew
-
-With [Homebrew](https://brew.sh/) installed, run:
-
-```sh
-brew install hiroaqii/tap/gitframe
-```
-
-On Apple Silicon, use native ARM Homebrew.
-
-To update GitFrame:
-
-```sh
-brew update
-brew upgrade hiroaqii/tap/gitframe
-```
-
-### mise
-
-With [mise](https://mise.jdx.dev/) installed and activated in your shell, run:
-
-```sh
-mise use -g github:hiroaqii/gitframe@latest
-```
-
-This makes GitFrame available globally in shells using mise. To update:
-
-```sh
-mise upgrade github:hiroaqii/gitframe
-```
-
-By default, mise waits 24 hours before selecting a newly published release
-with `@latest`. See mise's
-[minimum release age setting](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)
-for details.
-
-### From source
+## From source
 
 Install Zig **0.16.0** and Git **2.45.1 or newer** on Linux or macOS. Download **Source code
 (tar.gz)** or **Source code (zip)** from the
@@ -86,7 +22,7 @@ extract the archive, and open a terminal in the extracted directory.
 
 Choose one of the following builds.
 
-#### With Tree-sitter (default)
+### With Tree-sitter (default)
 
 ```sh
 zig build -Doptimize=ReleaseSafe
@@ -96,7 +32,7 @@ Tree-sitter syntax highlighting is enabled by default. Zig downloads and
 builds the required dependencies automatically; a separate Tree-sitter
 installation is not needed.
 
-#### Without Tree-sitter
+### Without Tree-sitter
 
 ```sh
 zig build -Doptimize=ReleaseSafe -Dsyntax-provider=none
@@ -107,7 +43,7 @@ especially when building from scratch. It omits Tree-sitter and its language
 parsers. Syntax highlighting in diffs and source views is disabled; added and
 removed lines still use their diff colors.
 
-#### Install the binary
+### Install the binary
 
 Both builds produce `zig-out/bin/gitframe`. Check it and install it into your
 local binary directory:
@@ -125,14 +61,8 @@ startup file, such as `~/.zshrc` or `~/.bashrc`, and open a new terminal:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Check the installation
-
-Check that GitFrame is available:
-
-```sh
-gitframe --version
-gitframe --help
-```
+After installing, follow the README's
+[installation check](../README.md#check-the-installation).
 
 ## Basic usage
 
@@ -384,6 +314,21 @@ managed by GitFrame; use the repository picker to remove recent entries.
 Reviewed marks are not saved across application restarts.
 
 ## Troubleshooting
+
+### Requirements
+
+See the [installation requirements](../README.md#requirements) for supported
+platforms and the required Git version.
+
+GitFrame checks Git before opening the TUI. An older or unavailable Git, or a
+failed version check, produces a terminal message and exits with status 1.
+`gitframe --help` and `gitframe --version` work without Git.
+
+The OS and Git requirements are separate: Ubuntu 24.04's standard Git 2.43
+needs an update. Follow the [official Git instructions for Ubuntu](https://git-scm.com/install/linux),
+which provide the `ppa:git-core/ppa` repository. On macOS with Homebrew, run
+`brew update` and `brew upgrade git`. Check `git --version` again afterward;
+if it still reports an older version, put the updated Git first on your `PATH`.
 
 ### The command is not found
 
