@@ -26,7 +26,7 @@ if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then
   fi
 else
   gh release create "$tag" --verify-tag --draft \
-    --title "GitFrame $tag" --notes-file "$notes_file"
+    --title "$tag" --notes-file "$notes_file"
 fi
 
 gh release upload "$tag" "${assets[@]}" --clobber
