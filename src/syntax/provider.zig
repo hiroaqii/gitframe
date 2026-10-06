@@ -169,6 +169,8 @@ pub const ByteRange = struct {
     end: usize,
 };
 
+/// line_maps must contain the ordered, non-overlapping byte intervals produced
+/// by buildFragment. Capture ranges may arrive in any order.
 pub fn appendRangeSpans(
     allocator: std.mem.Allocator,
     line_maps: []const FragmentLine,
@@ -177,9 +179,18 @@ pub fn appendRangeSpans(
     role: token.TokenRole,
 ) !void {
     if (range.end <= range.start) return;
-    for (line_maps, 0..) |line_map, index| {
-        if (range.end <= line_map.start) continue;
-        if (range.start >= line_map.end) continue;
+    var low: usize = 0;
+    var high: usize = line_maps.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (line_maps[mid].end <= range.start) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    for (line_maps[low..], low..) |line_map, index| {
+        if (range.end <= line_map.start) break;
         const clipped_start = @max(range.start, line_map.start);
         const clipped_end = @min(range.end, line_map.end);
         if (clipped_end <= clipped_start) continue;
@@ -278,4 +289,92 @@ test "appendRangeSpans maps fragment byte ranges to line-local spans" {
     try std.testing.expectEqual(token.TokenSpan{ .start = 2, .end = 3, .role = .keyword }, line_lists[0].items[0]);
     try std.testing.expectEqual(@as(usize, 1), line_lists[1].items.len);
     try std.testing.expectEqual(token.TokenSpan{ .start = 0, .end = 2, .role = .keyword }, line_lists[1].items[0]);
+
+    // Exhaustive byte boundaries, including empty lines and Unicode.
+    {
+        const hunk: diff_parser.Hunk = .{
+            .old_start = 1,
+            .old_count = 5,
+            .new_start = 1,
+            .new_count = 5,
+            .section = "",
+            .lines = &.{
+                .{ .kind = .context, .text = "" },
+                .{ .kind = .removed, .text = "old" },
+                .{ .kind = .added, .text = "abc" },
+                .{ .kind = .context, .text = "e\u{301}x" },
+                .{ .kind = .context, .text = "👩‍💻" },
+                .{ .kind = .context, .text = "" },
+            },
+        };
+        const fragment = try buildFragment(std.testing.allocator, hunk, .new);
+        defer fragment.deinit(std.testing.allocator);
+        var actual: [5]std.ArrayList(token.TokenSpan) = @splat(.empty);
+        var expected: [5]std.ArrayList(token.TokenSpan) = @splat(.empty);
+        defer for (&actual) |*list| list.deinit(std.testing.allocator);
+        defer for (&expected) |*list| list.deinit(std.testing.allocator);
+
+        // Descending starts deliberately exercise out-of-order captures. Including
+        // every byte also covers partial UTF-8/graphemes, empty/reversed ranges and
+        // offsets past the fragment; sanitization remains a separate responsibility.
+        const limit = fragment.text.len + 3;
+        for (0..limit) |reverse_start| {
+            for (0..limit) |end| {
+                const range: ByteRange = .{ .start = limit - 1 - reverse_start, .end = end };
+                const role: token.TokenRole = if (end % 2 == 0) .keyword else .string;
+                try appendRangeSpans(std.testing.allocator, fragment.lines, &actual, range, role);
+                try appendRangeSpansLinearForTest(fragment.lines, &expected, range, role);
+            }
+        }
+        for (actual, expected) |a, e| try std.testing.expectEqualSlices(token.TokenSpan, e.items, a.items);
+        try appendRangeSpans(std.testing.allocator, &.{}, &.{}, .{ .start = 0, .end = 1 }, .keyword);
+    }
+
+    // Fixed-seed ranges exercise deeper lower-bound positions.
+    {
+        var maps: [512]FragmentLine = undefined;
+        for (&maps, 0..) |*line, index| {
+            const text: []const u8 = if (index % 7 == 0) "" else "abc";
+            line.* = .{ .line_index = index * 2, .text = text, .start = index * 4, .end = index * 4 + text.len };
+        }
+        var actual: [maps.len]std.ArrayList(token.TokenSpan) = @splat(.empty);
+        var expected: [maps.len]std.ArrayList(token.TokenSpan) = @splat(.empty);
+        defer for (&actual) |*list| list.deinit(std.testing.allocator);
+        defer for (&expected) |*list| list.deinit(std.testing.allocator);
+
+        var seed: u64 = 17;
+        for (0..2000) |iteration| {
+            seed = seed *% 1664525 +% 1013904223;
+            const start: usize = @intCast(seed % (maps.len * 4 + 8));
+            seed = seed *% 1664525 +% 1013904223;
+            const end: usize = @intCast(seed % (maps.len * 4 + 8));
+            const range: ByteRange = .{ .start = start, .end = end };
+            const role: token.TokenRole = if (iteration % 2 == 0) .comment else .variable;
+            try appendRangeSpans(std.testing.allocator, &maps, &actual, range, role);
+            try appendRangeSpansLinearForTest(&maps, &expected, range, role);
+        }
+        for (actual, expected) |a, e| try std.testing.expectEqualSlices(token.TokenSpan, e.items, a.items);
+    }
+}
+
+// Preserve the original full scan as a test oracle for clipping and append order.
+fn appendRangeSpansLinearForTest(
+    line_maps: []const FragmentLine,
+    line_lists: []std.ArrayList(token.TokenSpan),
+    range: ByteRange,
+    role: token.TokenRole,
+) !void {
+    if (range.end <= range.start) return;
+    for (line_maps, 0..) |line_map, index| {
+        if (range.end <= line_map.start) continue;
+        if (range.start >= line_map.end) continue;
+        const clipped_start = @max(range.start, line_map.start);
+        const clipped_end = @min(range.end, line_map.end);
+        if (clipped_end <= clipped_start) continue;
+        try line_lists[index].append(std.testing.allocator, .{
+            .start = clipped_start - line_map.start,
+            .end = clipped_end - line_map.start,
+            .role = role,
+        });
+    }
 }
