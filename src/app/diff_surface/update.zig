@@ -257,6 +257,11 @@ pub const Controller = struct {
                 self.navigation.controller.surface.viewer.view_options.toggleLineNumbers();
                 self.navigation.clampDiffHorizontalScrollToVisibleRows();
             },
+            .toggle_line_wrap => {
+                self.navigation.controller.surface.viewer.view_options.toggleLineWrap();
+                self.navigation.controller.resetDiffHorizontalScroll();
+                self.navigation.keepDiffCursorVisible();
+            },
             .enter_search => {
                 if (self.navigation.controller.surface.selection_owner.* != .none) {
                     self.navigation.controller.clearDiffSelection();

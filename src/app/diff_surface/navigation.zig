@@ -59,9 +59,37 @@ pub const ParsedMouseLine = struct {
 /// painter. Page adapters may interpret tokens, but shared diff geometry stays
 /// authoritative.
 pub const PresentationCellHit = union(enum) {
-    source: struct { source_offset: usize, local_col: u16 },
+    source: struct { source_offset: usize, local_col: u16, wrap_row: usize = 0 },
     card: struct { token: usize, local_row: usize, local_col: u16 },
     spacer: struct { local_col: u16 },
+};
+
+const WrapLayout = struct {
+    visible_rows: usize,
+    target_screen_row: ?usize,
+    used_rows: usize = 0,
+    fitting_rows: usize = 0,
+    hit: ?struct {
+        offset: usize,
+        wrap_row: usize,
+    } = null,
+
+    /// Returns false once the pane is full.
+    fn add(self: *WrapLayout, offset: usize, height: usize) bool {
+        if (self.target_screen_row) |target| {
+            if (target >= self.used_rows and target - self.used_rows < height) {
+                self.hit = .{ .offset = offset, .wrap_row = target - self.used_rows };
+            }
+        }
+
+        if (self.used_rows +| height <= self.visible_rows) {
+            self.fitting_rows += 1;
+        }
+
+        self.used_rows +|= height;
+
+        return self.used_rows < self.visible_rows;
+    }
 };
 
 pub const KeyboardLineHit = struct {
@@ -610,8 +638,20 @@ pub const BodyView = struct {
 
         const visible_body_row: usize = point.row - diff_render.body_start_row;
         if (visible_body_row >= self.view.diffVisibleRows()) return null;
-        const presentation_offset = self.view.surface.viewer.diff_scroll + visible_body_row;
         const source_rows = self.sourceDiffLineCount();
+
+        if (self.lineWrapActive()) {
+            const hit = self.wrapLayoutFrom(self.view.surface.viewer.diff_scroll, visible_body_row).hit orelse return null;
+            return .{
+                .source = .{
+                    .source_offset = hit.offset,
+                    .local_col = local_col,
+                    .wrap_row = hit.wrap_row,
+                },
+            };
+        }
+
+        const presentation_offset = self.view.surface.viewer.diff_scroll + visible_body_row;
         if (self.view.presentation_rows) |rows| {
             if (rows.source_rows != source_rows) return null;
             const mode = self.view.effectiveDisplayMode();
@@ -882,7 +922,7 @@ pub const BodyView = struct {
             const point_value = if (region.leading_boundary)
                 diff_selection.pointFromBoundary(hit.hunk_index, hit.line_index, 0)
             else
-                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, self.view.surface.viewer.diff_horizontal_scroll, region.text_cell) orelse return null;
+                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, self.textCellScroll(source.wrap_row, region.side, body_width), region.text_cell) orelse return null;
             return .{
                 .identity = target.identity,
                 .content = .{ .source_side = .{ .side = region.side, .mode = model_mode } },
@@ -908,7 +948,7 @@ pub const BodyView = struct {
             .point = if (region.leading_boundary)
                 diff_selection.pointFromBoundary(0, offset, 0)
             else
-                pointForTextCell(0, offset, line, model_mode, self.view.surface.viewer.diff_horizontal_scroll, region.text_cell) orelse return null,
+                pointForTextCell(0, offset, line, model_mode, self.textCellScroll(source.wrap_row, region.side, body_width), region.text_cell) orelse return null,
         };
     }
 
@@ -917,7 +957,88 @@ pub const BodyView = struct {
         return generated.source.rowCount();
     }
 
+    pub fn lineWrapActive(self: BodyView) bool {
+        return self.view.surface.viewer.view_options.line_wrap and self.view.presentation_rows == null;
+    }
+
+    pub fn diffVisibleLogicalRows(self: BodyView) usize {
+        return self.diffVisibleLogicalRowsAt(self.view.surface.viewer.diff_scroll);
+    }
+
+    pub fn diffVisibleLogicalRowsAt(self: BodyView, scroll: usize) usize {
+        const visible_rows = self.view.diffVisibleRows();
+        if (visible_rows == 0 or !self.lineWrapActive()) return visible_rows;
+        return @max(self.wrapLayoutFrom(scroll, null).fitting_rows, 1);
+    }
+
+    fn textCellScroll(self: BodyView, wrap_row: usize, side: diff_selection.Side, body_width: u16) usize {
+        if (!self.lineWrapActive()) return self.view.surface.viewer.diff_horizontal_scroll;
+        const geometry = diff_render.sideBySideGeometry(body_width);
+        const pane_width = switch (side) {
+            .old => geometry.old.width,
+            .new => geometry.new.width,
+        };
+        const text_col = diff_render.lineTextStart(self.view.surface.viewer.view_options.line_numbers, .side_by_side);
+        return wrap_row *| visibleTextWidth(pane_width, text_col);
+    }
+
+    fn wrapLayoutFrom(self: BodyView, scroll: usize, target_screen_row: ?usize) WrapLayout {
+        const mode = self.view.effectiveDisplayMode();
+        const body_width = diff_render.bodyWidth(self.view.diffPaneWidth());
+        const line_numbers = self.view.surface.viewer.view_options.line_numbers;
+
+        var layout_value: WrapLayout = .{
+            .visible_rows = self.view.diffVisibleRows(),
+            .target_screen_row = target_screen_row,
+        };
+
+        if (self.generatedBody()) |body| {
+            var row_index = scroll;
+
+            while (row_index < body.source.rowCount()) : (row_index += 1) {
+                const line: diff_parser.DiffLine = .{ .kind = .added, .text = body.source.lineBody(row_index) orelse break };
+
+                if (!layout_value.add(row_index, diff_render.wrappedRowHeight(diff_render.generatedBodyRow(line, mode), body_width, line_numbers))) {
+                    break;
+                }
+            }
+
+            return layout_value;
+        }
+
+        const file = self.displayedDiffFile() orelse return layout_value;
+        const line_index = self.displayedDiffLineIndex(mode);
+
+        var rows =
+            if (line_index) |index|
+                diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, scroll, self.selectedFoldedHunks())
+            else
+                diff_view_model.BodyRowIterator.initWithFolded(file, mode, self.selectedFoldedHunks());
+
+        var offset: usize =
+            if (line_index != null)
+                scroll
+            else
+                0;
+
+        while (rows.next()) |body_row| : (offset += 1) {
+            if (offset < scroll) {
+                continue;
+            }
+
+            if (!layout_value.add(offset, diff_render.wrappedRowHeight(body_row, body_width, line_numbers))) {
+                break;
+            }
+        }
+
+        return layout_value;
+    }
+
     pub fn visibleBodyTextMaxHorizontalScroll(self: BodyView) usize {
+        if (self.lineWrapActive()) {
+            return 0;
+        }
+
         const mode = self.view.effectiveDisplayMode();
         const visible_rows = self.view.diffVisibleRows();
         if (visible_rows == 0) return 0;
@@ -1163,7 +1284,7 @@ pub const BodyView = struct {
 
     pub fn visibleDiffCursorOffset(self: BodyView) ?usize {
         const offset = self.selectedDiffCursorPresentationOffset() orelse return null;
-        const visible_rows = self.view.diffVisibleRows();
+        const visible_rows = self.diffVisibleLogicalRows();
         if (offset < self.view.surface.viewer.diff_scroll) return null;
         if (visible_rows == 0 or offset >= self.view.surface.viewer.diff_scroll + visible_rows) return null;
         return offset;
@@ -1465,12 +1586,15 @@ pub const BodyController = struct {
     pub fn scrollSearchMatchIntoView(self: BodyController) void {
         const source_offset = self.controller.surface.search.match_offset orelse return;
         const offset = self.view().sourceToPresentationOffset(source_offset) orelse return;
-        const visible_rows = self.controller.view().diffVisibleRows();
+        const visible_rows = self.view().diffVisibleLogicalRows();
+
         if (offset < self.controller.surface.viewer.diff_scroll) {
             self.controller.surface.viewer.diff_scroll = offset;
         } else if (visible_rows > 0 and offset >= self.controller.surface.viewer.diff_scroll + visible_rows) {
             self.controller.surface.viewer.diff_scroll = offset + 1 - visible_rows;
         }
+
+        self.settleWrappedScroll(offset);
     }
 
     pub fn captureSelectionViewportAnchor(self: BodyController) ?selection_action.SelectionViewportAnchor {
@@ -2236,7 +2360,8 @@ pub const BodyController = struct {
         }
 
         const target = cursor_viewport.retargetCursorAfterViewportScroll(
-            bounds,
+            // Wrapped row heights differ at the new scroll.
+            self.diffCursorBounds(),
             old_scroll,
             new_scroll,
             old_cursor_offset,
@@ -2286,12 +2411,12 @@ pub const BodyController = struct {
     }
 
     pub fn moveDiffCursorHalfPage(self: BodyController, direction: VerticalDirection) void {
-        const step = @max(self.controller.view().diffVisibleRows() / 2, 1);
+        const step = @max(self.view().diffVisibleLogicalRows() / 2, 1);
         self.moveDiffCursorByDocumentStep(direction, step);
     }
 
     pub fn moveDiffCursorPage(self: BodyController, direction: VerticalDirection) void {
-        const step = @max(self.controller.view().diffVisibleRows(), 1);
+        const step = @max(self.view().diffVisibleLogicalRows(), 1);
         self.moveDiffCursorByDocumentStep(direction, step);
     }
 
@@ -2524,6 +2649,21 @@ pub const BodyController = struct {
             self.controller.surface.viewer.diff_scroll,
             offset,
         );
+        self.settleWrappedScroll(offset);
+    }
+
+    fn settleWrappedScroll(self: BodyController, offset: usize) void {
+        const body_view = self.view();
+
+        if (!body_view.lineWrapActive()) {
+            return;
+        }
+
+        const viewer = self.controller.surface.viewer;
+
+        while (viewer.diff_scroll < offset and offset - viewer.diff_scroll >= body_view.diffVisibleLogicalRowsAt(viewer.diff_scroll)) {
+            viewer.diff_scroll += 1;
+        }
     }
 
     pub fn clampSelection(self: BodyController, file_count: usize) void {
@@ -2612,7 +2752,7 @@ pub const BodyController = struct {
     fn diffCursorBounds(self: BodyController) cursor_viewport.Bounds {
         return .{
             .content_rows = self.view().presentationDiffLineCount(),
-            .visible_rows = self.controller.view().diffVisibleRows(),
+            .visible_rows = self.view().diffVisibleLogicalRows(),
         };
     }
 
@@ -2626,6 +2766,8 @@ pub const BodyController = struct {
             self.controller.surface.viewer.diff_scroll,
             cursor_offset,
         );
+
+        self.settleWrappedScroll(cursor_offset);
     }
 
     pub fn centerDiffCursor(self: BodyController) void {
@@ -2638,6 +2780,8 @@ pub const BodyController = struct {
             self.controller.surface.viewer.diff_scroll,
             cursor_offset,
         );
+
+        self.settleWrappedScroll(cursor_offset);
     }
 };
 

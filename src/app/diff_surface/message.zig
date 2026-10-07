@@ -84,4 +84,5 @@ pub const Msg = union(enum) {
     increase_sidebar_width,
     toggle_display_mode,
     toggle_line_numbers,
+    toggle_line_wrap,
 };

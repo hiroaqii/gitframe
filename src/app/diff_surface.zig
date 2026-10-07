@@ -55,9 +55,14 @@ pub const SelectionCompletionPolicy = enum {
 
 pub const ViewOptions = struct {
     line_numbers: bool = true,
+    line_wrap: bool = false,
 
     pub fn toggleLineNumbers(self: *ViewOptions) void {
         self.line_numbers = !self.line_numbers;
+    }
+
+    pub fn toggleLineWrap(self: *ViewOptions) void {
+        self.line_wrap = !self.line_wrap;
     }
 };
 

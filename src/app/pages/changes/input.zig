@@ -104,6 +104,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .discard => .request_discard_selected_file,
         .toggle_display_mode => .toggle_display_mode,
         .toggle_line_numbers => .toggle_line_numbers,
+        .toggle_line_wrap => .toggle_line_wrap,
         .toggle_sidebar => .toggle_sidebar_visibility,
         .decrease_sidebar_width => .decrease_sidebar_width,
         .increase_sidebar_width => .increase_sidebar_width,

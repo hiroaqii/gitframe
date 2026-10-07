@@ -88,6 +88,7 @@ fn publicActionToMsg(action: keymap.PublicAction, diff_focused: bool) ?Msg {
         .file_search => shared(.enter_file_search),
         .toggle_display_mode => shared(.toggle_display_mode),
         .toggle_line_numbers => shared(.toggle_line_numbers),
+        .toggle_line_wrap => shared(.toggle_line_wrap),
         .toggle_sidebar => shared(.toggle_sidebar_visibility),
         .decrease_sidebar_width => shared(.decrease_sidebar_width),
         .increase_sidebar_width => shared(.increase_sidebar_width),

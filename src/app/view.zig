@@ -42,7 +42,7 @@ const content_fingerprint = if (builtin.is_test) @import("../content_fingerprint
 /// shared with tests through small public helpers.
 const shell_frame_border = ui.Panel.Border.rounded;
 const help_dialog_max_width: u16 = 120;
-const help_dialog_max_height: u16 = 38;
+const help_dialog_max_height: u16 = 39;
 const help_two_column_min_width: u16 = 96;
 const help_column_gap: u16 = 2;
 const help_footer_rows: u16 = 1;
@@ -3999,6 +3999,7 @@ const help_diff_items = [_]HelpItem{
     .{ .key = .{ .action = .search }, .description = "search diff" },
     .{ .key = .{ .action = .toggle_display_mode }, .description = "unified / side-by-side" },
     .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
+    .{ .key = .{ .action = .toggle_line_wrap }, .description = "toggle line wrap" },
     .{ .key = .{ .text = "Enter" }, .description = "fold / unfold hunk" },
     .{ .key = .{ .text = "y / Esc" }, .description = "copy / clear selection" },
     help_group_separator,

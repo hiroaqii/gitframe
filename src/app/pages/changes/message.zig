@@ -87,6 +87,7 @@ pub const Msg = union(enum) {
     open_selected_file_in_editor,
     toggle_display_mode,
     toggle_line_numbers,
+    toggle_line_wrap,
     copy_current_line,
     copy_current_hunk,
     selection_action: selection_action.Action,
@@ -173,6 +174,7 @@ pub const Msg = union(enum) {
             .increase_sidebar_width,
             .toggle_display_mode,
             .toggle_line_numbers,
+            .toggle_line_wrap,
             => |payload, tag| @unionInit(shared_message.Msg, @tagName(tag), payload),
             else => null,
         };
