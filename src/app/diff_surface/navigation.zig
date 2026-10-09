@@ -23,6 +23,7 @@ const file_tree = @import("../../file_tree.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
 const sidebar_view_model = @import("../../sidebar/view_model.zig");
 const text_projection = @import("chasen_ui").text_projection;
+const line_wrap = @import("../../diff/line_wrap.zig");
 const selection_action = @import("selection_action.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
@@ -919,10 +920,7 @@ pub const BodyView = struct {
             };
             const region = hit.region orelse return null;
             const model_mode = if (locked) |selection_value| selection_value.mode() else region.mode;
-            const point_value = if (region.leading_boundary)
-                diff_selection.pointFromBoundary(hit.hunk_index, hit.line_index, 0)
-            else
-                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, self.textCellScroll(source.wrap_row, region.side, body_width), region.text_cell) orelse return null;
+            const point_value = self.pointForBodyText(hit.hunk_index, hit.line_index, hit.line.text, model_mode, region, body_width, source.wrap_row) orelse return null;
             return .{
                 .identity = target.identity,
                 .content = .{ .source_side = .{ .side = region.side, .mode = model_mode } },
@@ -945,10 +943,7 @@ pub const BodyView = struct {
         return .{
             .identity = .{ .generated_file = .{ .path_key = generated.path } },
             .content = .{ .source_side = .{ .side = .new, .mode = model_mode } },
-            .point = if (region.leading_boundary)
-                diff_selection.pointFromBoundary(0, offset, 0)
-            else
-                pointForTextCell(0, offset, line, model_mode, self.textCellScroll(source.wrap_row, region.side, body_width), region.text_cell) orelse return null,
+            .point = self.pointForBodyText(0, offset, line, model_mode, region, body_width, source.wrap_row) orelse return null,
         };
     }
 
@@ -971,15 +966,29 @@ pub const BodyView = struct {
         return @max(self.wrapLayoutFrom(scroll, null).fitting_rows, 1);
     }
 
-    fn textCellScroll(self: BodyView, wrap_row: usize, side: diff_selection.Side, body_width: u16) usize {
-        if (!self.lineWrapActive()) return self.view.surface.viewer.diff_horizontal_scroll;
+    fn pointForBodyText(self: BodyView, hunk_index: usize, line_index: usize, text: []const u8, mode: diff_selection.Mode, region: SelectionRegion, body_width: u16, wrap_row: usize) ?diff_selection.Point {
+        if (!self.lineWrapActive()) return if (region.leading_boundary)
+            diff_selection.pointFromBoundary(hunk_index, line_index, 0)
+        else
+            pointForTextCell(hunk_index, line_index, text, mode, self.view.surface.viewer.diff_horizontal_scroll, region.text_cell);
+
         const geometry = diff_render.sideBySideGeometry(body_width);
-        const pane_width = switch (side) {
+        const pane_width = switch (region.side) {
             .old => geometry.old.width,
             .new => geometry.new.width,
         };
         const text_col = diff_render.lineTextStart(self.view.surface.viewer.view_options.line_numbers, .side_by_side);
-        return wrap_row *| visibleTextWidth(pane_width, text_col);
+        const projection = text_projection.Projection.init(text, .{ .tab_width = review_tab_width }) catch return null;
+        var fragments = line_wrap.Iterator.init(projection, visibleTextWidth(pane_width, text_col));
+        for (0..wrap_row) |_| _ = fragments.next() orelse return null;
+        const fragment = fragments.next() orelse return null;
+        if (fragment.placeholder) return null;
+        if (mode == .line) return diff_selection.pointFromLine(hunk_index, line_index);
+        if (region.leading_boundary) return diff_selection.pointFromBoundary(hunk_index, line_index, fragment.bytes.start);
+        return switch (fragment.hitCell(region.text_cell) orelse return null) {
+            .token => |token| diff_selection.pointFromToken(hunk_index, line_index, token),
+            .boundary => |boundary| diff_selection.pointFromBoundary(hunk_index, line_index, boundary.byte_offset),
+        };
     }
 
     fn wrapLayoutFrom(self: BodyView, scroll: usize, target_screen_row: ?usize) WrapLayout {

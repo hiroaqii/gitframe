@@ -15,6 +15,7 @@ const syntax_style = @import("../syntax/style.zig");
 const syntax_token = @import("../syntax/token.zig");
 const theme = @import("theme");
 const text_projection = @import("chasen_ui").text_projection;
+const line_wrap = @import("line_wrap.zig");
 
 pub const DisplayMode = diff_view_model.DisplayMode;
 
@@ -65,69 +66,78 @@ pub const RenderOptions = struct {
     header_selection: bool = false,
     presentation_rows: ?PresentationRows = null,
     inline_row_painter: ?InlineRowPainter = null,
-
-    fn textWindow(self: RenderOptions, wrap_row: usize) TextWindow {
-        return if (self.line_wrap) .{ .wrap_row = wrap_row } else .{ .scroll = self.horizontal_scroll };
-    }
 };
 
-/// The slice of a line's cells one screen row shows: a horizontal scroll
-/// offset, or the Nth screen row of a wrapped line.
 const TextWindow = union(enum) {
     scroll: usize,
-    wrap_row: usize,
-
-    fn offset(self: TextWindow, text_width: u16) usize {
-        return switch (self) {
-            .scroll => |cells| cells,
-            .wrap_row => |index| index *| text_width,
-        };
-    }
+    wrap: ?line_wrap.Fragment,
 
     fn continuation(self: TextWindow) bool {
         return switch (self) {
             .scroll => false,
-            .wrap_row => |index| index > 0,
+            .wrap => |fragment| if (fragment) |value| value.continuation else true,
+        };
+    }
+
+    fn segments(self: TextWindow, projection: text_projection.Projection, width: u16) line_wrap.Segments {
+        return switch (self) {
+            .scroll => |cells| .{ .projected = projection.visibleSegments(cells, width) },
+            .wrap => |fragment| if (fragment) |value| value.segments() else .{ .replacement = null },
         };
     }
 };
 
-/// Screen rows one body row occupiies when line wrap is on. Navigation uses the same count
-/// to map screen rows back to body rows.
-pub fn wrappedRowHeight(body_row: diff_view_model.BodyRow, body_width: u16, line_numbers: bool) usize {
-    switch (body_row) {
-        .metadata, .binary_marker, .hunk_header => {
-            return 1;
-        },
-        .unified_line => |line| {
-            return wrappedTextHeight(line.text, body_width -| lineTextStart(line_numbers, .unified));
-        },
-        .side_by_side => |side_row| {
-            const geometry = sideBySideGeometry(body_width);
-            const text_col = lineTextStart(line_numbers, .side_by_side);
-            const old_width = geometry.old.width -| text_col;
-            const new_width = geometry.new.width -| text_col;
-            switch (side_row) {
-                .single => |line| return switch (line.kind) {
-                    .removed => wrappedTextHeight(line.text, old_width),
-                    .added => wrappedTextHeight(line.text, new_width),
-                    .context => wrappedTextHeight(line.text, @min(old_width, new_width)),
-                    .metadata => 1,
-                },
-                .paired => |pair| {
-                    const old_height = if (pair.removed) |line| wrappedTextHeight(line.text, old_width) else 1;
-                    const new_height = if (pair.added) |line| wrappedTextHeight(line.text, new_width) else 1;
-                    return @max(old_height, new_height);
-                },
-            }
-        },
-    }
-}
+const SideWindows = struct { old: TextWindow, new: TextWindow };
+const RowWindows = struct { unified: TextWindow, sides: SideWindows };
 
-fn wrappedTextHeight(text: []const u8, text_width: u16) usize {
-    if (text_width == 0) return 1;
-    const projection = text_projection.Projection.init(text, .{ .tab_width = review_tab_width }) catch return 1;
-    return @max(1, std.math.divCeil(usize, projection.displayWidth(), text_width) catch 1);
+/// One sequential token iterator per admitted side; no per-fragment prefix scan.
+const RowWrap = struct {
+    unified: ?line_wrap.Iterator = null,
+    old: ?line_wrap.Iterator = null,
+    new: ?line_wrap.Iterator = null,
+
+    fn init(projections: BodyRowProjections, body_width: u16, line_numbers: bool) RowWrap {
+        return switch (projections) {
+            .none => .{},
+            .unified => |text| .{ .unified = line_wrap.Iterator.init(text, body_width -| lineTextStart(line_numbers, .unified)) },
+            .side_by_side => |sides| blk: {
+                const geometry = sideBySideGeometry(body_width);
+                const text_col = lineTextStart(line_numbers, .side_by_side);
+                break :blk .{
+                    .old = if (sides.old) |text| line_wrap.Iterator.init(text, geometry.old.width -| text_col) else null,
+                    .new = if (sides.new) |text| line_wrap.Iterator.init(text, geometry.new.width -| text_col) else null,
+                };
+            },
+        };
+    }
+
+    fn height(self: RowWrap) usize {
+        var rows: usize = 1;
+        if (self.unified) |iterator| rows = @max(rows, iterator.height());
+        if (self.old) |iterator| rows = @max(rows, iterator.height());
+        if (self.new) |iterator| rows = @max(rows, iterator.height());
+        return rows;
+    }
+
+    fn next(self: *RowWrap, options: RenderOptions) RowWindows {
+        if (!options.line_wrap) {
+            const window: TextWindow = .{ .scroll = options.horizontal_scroll };
+            return .{ .unified = window, .sides = .{ .old = window, .new = window } };
+        }
+        return .{
+            .unified = .{ .wrap = if (self.unified) |*iterator| iterator.next() else null },
+            .sides = .{
+                .old = .{ .wrap = if (self.old) |*iterator| iterator.next() else null },
+                .new = .{ .wrap = if (self.new) |*iterator| iterator.next() else null },
+            },
+        };
+    }
+};
+
+/// Navigation and painting use the same fragment boundaries and paired height.
+pub fn wrappedRowHeight(body_row: diff_view_model.BodyRow, body_width: u16, line_numbers: bool) usize {
+    const projections = admitBodyRow(body_row) catch return 1;
+    return RowWrap.init(projections, body_width, line_numbers).height();
 }
 
 pub fn generatedBodyRow(line: diff_parser.DiffLine, mode: DisplayMode) diff_view_model.BodyRow {
@@ -1144,12 +1154,13 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         const first_row = cursor.nextRow() orelse continue;
         const presentation = RowPresentation.forBodyOffset(options, body_offset);
         const projections = try admitBodyRow(body_row);
-        const row_height = if (options.line_wrap) wrappedRowHeight(body_row, body_surface.size().width, options.line_numbers) else 1;
+        var wrapping = RowWrap.init(projections, body_surface.size().width, options.line_numbers);
+        const row_height = if (options.line_wrap) wrapping.height() else 1;
         var wrap_row: usize = 0;
 
         while (wrap_row < row_height) : (wrap_row += 1) {
             const row = if (wrap_row == 0) first_row else cursor.continuationRow() orelse break;
-            const window = options.textWindow(wrap_row);
+            const windows = wrapping.next(options);
             const wrap_tail = wrap_row + 1 == row_height;
             presentation.prefill(surface, row, styles);
             drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
@@ -1179,7 +1190,7 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                         if (rows.currentHunkIndex()) |hunk_index| drawHunkGuide(surface, row, if (wrap_tail) guideGlyph(guide_index, hunk_index, body_offset) else "┃", options.hunk_stages.stateForHunk(hunk_index), presentation, styles);
                     }
                     const syntax_ctx = unifiedSyntaxContext(options, rows, line);
-                    try drawUnifiedLine(&body_surface, row, line, projections.unified, window, options.line_numbers, presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
+                    try drawUnifiedLine(&body_surface, row, line, projections.unified, windows.unified, options.line_numbers, presentation, styles, syntax_ctx.line_spans, syntax_ctx.hunk_side_has_visible_syntax, unifiedSelectionForLine(options, rows, line));
                 },
                 .side_by_side => |side_row| {
                     if (current_hunk_highlighted) {
@@ -1190,8 +1201,8 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
                     const indexed_row = rows.currentSideBySideRow();
 
                     switch (side_row) {
-                        .single => |line| try drawSideBySideSingle(&body_surface, row, line, projections.side_by_side, geometry, window, options.line_numbers, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
-                        .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, projections.side_by_side, geometry, window, options.line_numbers, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                        .single => |line| try drawSideBySideSingle(&body_surface, row, line, projections.side_by_side, geometry, windows.sides, options.line_numbers, presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                        .paired => |pair| try drawSideBySidePair(&body_surface, row, pair.removed, pair.added, projections.side_by_side, geometry, windows.sides, options.line_numbers, presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
                     }
 
                     if (current_hunk_highlighted) {
@@ -1304,8 +1315,8 @@ fn renderFileWithPresentation(
                         const geometry = sideBySideGeometry(body_surface.size().width);
                         const indexed_row = rows.currentSideBySideRow();
                         switch (side_row) {
-                            .single => |line| try drawSideBySideSingle(body_surface, screen_row, line, projections.side_by_side, geometry, window, options.line_numbers, row_presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
-                            .paired => |pair| try drawSideBySidePair(body_surface, screen_row, pair.removed, pair.added, projections.side_by_side, geometry, window, options.line_numbers, row_presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                            .single => |line| try drawSideBySideSingle(body_surface, screen_row, line, projections.side_by_side, geometry, .{ .old = window, .new = window }, options.line_numbers, row_presentation, styles, sideBySideSingleSyntaxSpans(options, rows, line), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
+                            .paired => |pair| try drawSideBySidePair(body_surface, screen_row, pair.removed, pair.added, projections.side_by_side, geometry, .{ .old = window, .new = window }, options.line_numbers, row_presentation, styles, sideBySidePairSyntaxSpans(options, rows), sideBySideSelectionForIndexedRow(options, file, rows.currentHunkIndex(), indexed_row)),
                         }
                         if (current_hunk_highlighted) {
                             if (rows.currentHunkIndex()) |hunk_index| drawSideBySideHunkGuide(body_surface, screen_row, separatorGuideGlyph(guide_index, hunk_index, source_offset), options.hunk_stages.stateForHunk(hunk_index), row_presentation, styles);
@@ -1410,22 +1421,24 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
         };
         const projection = try text_projection.Projection.init(line.text, .{ .tab_width = review_tab_width });
         const presentation = RowPresentation.forBodyOffset(options, body_offset);
-        const row_height = if (options.line_wrap) wrappedRowHeight(generatedBodyRow(line, mode), body_surface.size().width, options.line_numbers) else 1;
+        const projections: BodyRowProjections = if (mode == .unified) .{ .unified = projection } else .{ .side_by_side = .{ .new = projection } };
+        var wrapping = RowWrap.init(projections, body_surface.size().width, options.line_numbers);
+        const row_height = if (options.line_wrap) wrapping.height() else 1;
         var wrap_row: usize = 0;
         while (wrap_row < row_height) : (wrap_row += 1) {
             const row = if (wrap_row == 0) first_row else cursor.continuationRow() orelse break;
-            const window = options.textWindow(wrap_row);
+            const windows = wrapping.next(options);
             presentation.prefill(surface, row, styles);
             drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
             const line_spans = options.source_syntax_spans.lineSpans(index);
             if (mode == .side_by_side) {
                 const geometry = sideBySideGeometry(body_surface.size().width);
-                try drawSideBySidePair(&body_surface, row, null, line, .{ .new = projection }, geometry, window, options.line_numbers, presentation, styles, .{
+                try drawSideBySidePair(&body_surface, row, null, line, .{ .new = projection }, geometry, windows.sides, options.line_numbers, presentation, styles, .{
                     .new = line_spans,
                     .new_hunk_side_has_visible_syntax = options.source_has_visible_syntax,
                 }, generatedSideBySideSelection(options, index, line));
             } else {
-                try drawUnifiedLine(&body_surface, row, line, projection, window, options.line_numbers, presentation, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
+                try drawUnifiedLine(&body_surface, row, line, projection, windows.unified, options.line_numbers, presentation, styles, line_spans, options.source_has_visible_syntax, generatedUnifiedSelection(options, index, line));
             }
         }
     }
@@ -1848,7 +1861,6 @@ fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLin
     const marker_style = selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), whole_line, styles);
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
     const layout = lineLayout(line_numbers, .unified);
-    const horizontal_scroll = window.offset(surface.size().width -| layout.text_col);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), whole_line, styles));
 
     if (line_numbers) {
@@ -1857,8 +1869,8 @@ fn drawUnifiedLine(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLin
         if (!window.continuation()) _ = try surface.copyTextAt(5, row, try lineNumberText(surface, line.new_line), selectedStyle(presentation.lineNumber(lineNumberStyle(line.kind, styles), line.new_line != null, styles), whole_line, styles));
     }
     if (!window.continuation()) _ = surface.borrowTextAt(layout.prefix_col, row, prefix, marker_style);
-    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, horizontal_scroll, text_style, syntax_spans, styles);
-    if (selection) |selected| if (selected.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, horizontal_scroll, selected, styles.selection.bg);
+    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, window, text_style, syntax_spans, styles);
+    if (selection) |selected| if (selected.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, window, selected, styles.selection.bg);
 }
 
 const SideBySideSyntaxSpans = struct {
@@ -1891,18 +1903,18 @@ fn generatedSideBySideSelection(options: RenderOptions, line_index: usize, line:
     return .{ .new = range };
 }
 
-fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, projections: SideBySideProjections, geometry: SideBySideGeometry, window: TextWindow, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySidePair(surface: *chasen.Surface, row: u16, removed: ?diff_parser.DiffLine, added: ?diff_parser.DiffLine, projections: SideBySideProjections, geometry: SideBySideGeometry, windows: SideWindows, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     if (removed) |line| prefillIntrinsicDiffBackground(surface, row, geometry.old, line.kind, presentation, styles);
     if (added) |line| prefillIntrinsicDiffBackground(surface, row, geometry.new, line.kind, presentation, styles);
     drawSideBySideSelection(surface, row, geometry, selection, styles);
     var columns = sideBySideRowColumns(surface, row, geometry);
     const selected = selection orelse SideBySideSelection{};
-    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, projections.old.?, window, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, projections.new.?, window, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+    if (removed) |line| try drawSideBySideOld(&columns.old, 0, line, projections.old.?, windows.old, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+    if (added) |line| try drawSideBySideNew(&columns.new, 0, line, projections.new.?, windows.new, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
     drawSideBySideGutter(surface, row, geometry, presentation, styles);
 }
 
-fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projections: SideBySideProjections, geometry: SideBySideGeometry, window: TextWindow, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
+fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projections: SideBySideProjections, geometry: SideBySideGeometry, windows: SideWindows, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: SideBySideSyntaxSpans, selection: ?SideBySideSelection) !void {
     switch (line.kind) {
         .removed => prefillIntrinsicDiffBackground(surface, row, geometry.old, line.kind, presentation, styles),
         .added => prefillIntrinsicDiffBackground(surface, row, geometry.new, line.kind, presentation, styles),
@@ -1913,16 +1925,16 @@ fn drawSideBySideSingle(surface: *chasen.Surface, row: u16, line: diff_parser.Di
     const selected = selection orelse SideBySideSelection{};
     switch (line.kind) {
         .removed => {
-            try drawSideBySideOld(&columns.old, 0, line, projections.old.?, window, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideOld(&columns.old, 0, line, projections.old.?, windows.old, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .added => {
-            try drawSideBySideNew(&columns.new, 0, line, projections.new.?, window, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            try drawSideBySideNew(&columns.new, 0, line, projections.new.?, windows.new, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .context => {
-            try drawSideBySideOld(&columns.old, 0, line, projections.old.?, window, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
-            try drawSideBySideNew(&columns.new, 0, line, projections.new.?, window, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
+            try drawSideBySideOld(&columns.old, 0, line, projections.old.?, windows.old, line_numbers, presentation, styles, syntax_spans.old, syntax_spans.old_hunk_side_has_visible_syntax, selected.old);
+            try drawSideBySideNew(&columns.new, 0, line, projections.new.?, windows.new, line_numbers, presentation, styles, syntax_spans.new, syntax_spans.new_hunk_side_has_visible_syntax, selected.new);
             drawSideBySideGutter(surface, row, geometry, presentation, styles);
         },
         .metadata => {
@@ -2017,7 +2029,6 @@ fn sideBySideSelectionForPair(options: RenderOptions, file: diff_parser.FileDiff
 fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projection: text_projection.Projection, window: TextWindow, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
-    const horizontal_scroll = window.offset(surface.size().width -| layout.text_col);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
     if (line_numbers) {
         fillRowRegion(surface, row, .{ .col = 0, .width = layout.prefix_col }, selectedStyle(presentation.compose(lineNumberStyle(line.kind, styles), styles), selected, styles));
@@ -2025,14 +2036,13 @@ fn drawSideBySideOld(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
     if (!window.continuation()) _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), selected, styles));
-    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
-    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, horizontal_scroll, range, styles.selection.bg);
+    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, window, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
+    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, window, range, styles.selection.bg);
 }
 
 fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffLine, projection: text_projection.Projection, window: TextWindow, line_numbers: bool, presentation: RowPresentation, styles: RenderStyles, syntax_spans: syntax_token.LineSpans, hunk_side_has_visible_syntax: bool, selection: ?diff_selection.LineVisualRange) !void {
     const selected = selection != null and selection.?.mode == .line;
     const layout = lineLayout(line_numbers, .side_by_side);
-    const horizontal_scroll = window.offset(surface.size().width -| layout.text_col);
     drawGutterLeadInBackground(surface, row, layout, selectedStyle(presentation.compose(gutterLeadInStyle(line.kind, styles), styles), selected, styles));
     if (line_numbers) {
         fillRowRegion(surface, row, .{ .col = 0, .width = layout.prefix_col }, selectedStyle(presentation.compose(lineNumberStyle(line.kind, styles), styles), selected, styles));
@@ -2040,8 +2050,8 @@ fn drawSideBySideNew(surface: *chasen.Surface, row: u16, line: diff_parser.DiffL
     }
     const prefix = presentation.prefix(line.kind, hunk_side_has_visible_syntax);
     if (!window.continuation()) _ = surface.borrowTextAt(layout.prefix_col, row, prefix, selectedStyle(presentation.compose(markerStyleForLine(line.kind, styles), styles), selected, styles));
-    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, horizontal_scroll, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
-    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, horizontal_scroll, range, styles.selection.bg);
+    copyStyledScrolledTextAt(surface, layout.text_col, row, projection, window, selectedStyle(presentation.compose(bodyTextStyleForLine(line.kind, styles, hunk_side_has_visible_syntax), styles), selected, styles), syntax_spans, styles);
+    if (selection) |range| if (range.mode == .character) applyCharacterSelection(surface, layout.text_col, row, projection, window, range, styles.selection.bg);
 }
 
 fn selectedStyle(style: chasen.TextStyle, selected: bool, styles: RenderStyles) chasen.TextStyle {
@@ -2081,15 +2091,15 @@ fn drawGutterLeadInBackground(surface: *chasen.Surface, row: u16, layout: LineLa
     }
 }
 
-fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, projection: text_projection.Projection, horizontal_scroll: usize, base_style: chasen.TextStyle, spans: syntax_token.LineSpans, styles: RenderStyles) void {
+fn copyStyledScrolledTextAt(surface: *chasen.Surface, col: u16, row: u16, projection: text_projection.Projection, window: TextWindow, base_style: chasen.TextStyle, spans: syntax_token.LineSpans, styles: RenderStyles) void {
     if (col >= surface.size().width) return;
     const width = surface.size().width - col;
-    var visible = projection.visibleSegments(horizontal_scroll, width);
+    var visible = window.segments(projection, width);
     while (visible.next()) |segment| drawVisibleSegment(surface, col, row, segment, base_style);
     if (spans.spans.len == 0) return;
 
     var span_index: usize = 0;
-    visible = projection.visibleSegments(horizontal_scroll, width);
+    visible = window.segments(projection, width);
     while (visible.next()) |segment| {
         while (span_index < spans.spans.len and spans.spans[span_index].end <= segment.token.byte_start) span_index += 1;
         if (span_index >= spans.spans.len) continue;
@@ -2131,13 +2141,13 @@ fn applyCharacterSelection(
     text_col: u16,
     row: u16,
     projection: text_projection.Projection,
-    horizontal_scroll: usize,
+    window: TextWindow,
     range: diff_selection.LineVisualRange,
     background: chasen.Color,
 ) void {
     if (text_col >= surface.size().width or range.byte_start >= range.byte_end) return;
     const width = surface.size().width - text_col;
-    var visible = projection.visibleSegments(horizontal_scroll, width);
+    var visible = window.segments(projection, width);
     while (visible.next()) |segment| {
         if (segment.token.byte_start >= range.byte_end) break;
         if (segment.token.byte_end <= range.byte_start) continue;
@@ -4460,6 +4470,47 @@ test "wrapped row height takes the taller side in side-by-side" {
     try std.testing.expectEqual(@as(usize, 1), wrappedRowHeight(.{ .unified_line = short }, 31, true));
     // 41 columns: 20 per pane, 13 text cells after the 7-cell gutter.
     try std.testing.expectEqual(@as(usize, 3), wrappedRowHeight(.{ .side_by_side = .{ .paired = .{ .removed = short, .added = long } } }, 41, true));
+}
+
+test "wrap rendering preserves parsed grapheme syntax and generated narrow replacement selection" {
+    var parsed: chasen.testing.TestSurface = undefined;
+    try parsed.init(32, 7);
+    defer parsed.deinit();
+    const document = try diff_parser.parse(std.testing.allocator, "--- a/a\n+++ b/a\n@@ -0,0 +1 @@\n+0123456789abcdefg界z\n");
+    defer document.deinit(std.testing.allocator);
+    const shape = [_]syntax_provider.FileShape{.{ .hunk_line_counts = &.{1} }};
+    var spans = try syntax_provider.allocateEmpty(std.testing.allocator, .{ .files = &shape });
+    defer spans.deinit(std.testing.allocator);
+    syntax_provider.putLineSpans(&spans, .{ .file_index = 0, .hunk_index = 0, .line_index = 0, .side = .new }, .{
+        .spans = try std.testing.allocator.dupe(syntax_token.TokenSpan, &.{.{ .start = 17, .end = 20, .role = .keyword }}),
+    });
+    const palette = theme.Palette.default();
+    try renderFile(&parsed.surface, document.files[0], .{ .line_wrap = true, .syntax = .initDirect(&spans, 0) });
+    try parsed.expectCellText(31, 4, " ");
+    try parsed.expectCellText(14, 5, "界");
+    try parsed.expectCellText(16, 5, "z");
+    try parsed.expectCellText(12, 5, " ");
+    try std.testing.expect(parsed.surface.readCell(14, 5).?.style.fg.eql(palette.color(.syntax_keyword)));
+
+    var generated: chasen.testing.TestSurface = undefined;
+    try generated.init(15, 6);
+    defer generated.deinit();
+    const bytes = "👩‍💻z";
+    var source = try repository_source.Document.initOwnedOrFree(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes), content_fingerprint.Fingerprint.init(bytes));
+    defer source.deinit(std.testing.allocator);
+    try renderGeneratedAddedFile(&generated.surface, "a", &source, .{
+        .line_wrap = true,
+        .selection = .{
+            .identity = .{ .generated_file = .{ .path_key = "a" } },
+            .content = .{ .source_side = .{ .side = .new, .mode = .character } },
+            .start = .{ .hunk_index = 0, .line_index = 0, .leading = 0, .trailing = 11 },
+            .end = .{ .hunk_index = 0, .line_index = 0, .leading = 0, .trailing = 11 },
+        },
+    });
+    try generated.expectCellText(14, 3, "�");
+    try generated.expectCellText(14, 4, "z");
+    try std.testing.expect(generated.surface.readCell(14, 3).?.style.bg.eql(palette.color(.diff_selection_bg)));
+    try std.testing.expect(!generated.surface.readCell(14, 4).?.style.bg.eql(palette.color(.diff_selection_bg)));
 }
 
 test "unified horizontal scroll keeps line numbers and prefix fixed" {

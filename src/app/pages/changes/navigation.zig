@@ -2886,6 +2886,72 @@ test "Changes mouse selection projects scrolled TAB wide combining and emoji cel
     try std.testing.expect(pointForTextCell(3, 4, &invalid, .character, 0, 0) == null);
 }
 
+test "wrap mouse hits share paired fragments and copy only original source bytes" {
+    var harness = TestHarness.init(.{
+        .viewer = .{ .display_mode = .side_by_side, .sidebar_hidden = true, .view_options = .{ .line_wrap = true } },
+    }, .{ .width = 100, .height = 14 });
+    const raw = harness.view().rawDiffPaneGeometry().?;
+    const pane_width = contentWidth(raw.width);
+    const geometry = diff_render.sideBySideGeometry(diff_render.bodyWidth(pane_width));
+    const gutter = diff_render.lineTextStart(true, .side_by_side);
+    const text_width = geometry.new.width - gutter;
+    const text = try std.testing.allocator.alloc(u8, text_width - 1 + "界z".len);
+    defer std.testing.allocator.free(text);
+    @memset(text[0 .. text_width - 1], 'a');
+    @memcpy(text[text_width - 1 ..], "界z");
+    const lines = [_]diff_parser.DiffLine{
+        .{ .kind = .removed, .text = "x", .old_line = 1 },
+        .{ .kind = .added, .text = text, .new_line = 1 },
+        .{ .kind = .context, .text = "next", .old_line = 2, .new_line = 2 },
+    };
+    const files = [_]diff_parser.FileDiff{.{
+        .header = "diff --git a/a b/a",
+        .old_path = "a",
+        .new_path = "a",
+        .metadata = &.{},
+        .hunks = &.{.{ .old_start = 1, .old_count = 2, .new_start = 1, .new_count = 2, .section = "", .lines = &lines }},
+    }};
+    const eligibility = [_]loaded_diff.FileTextEligibility{.selectable_utf8};
+    const tree = [_]file_tree.Node{.{ .kind = .file, .name = "a", .path = "a", .path_key = "a", .depth = 0, .target = .{ .diff_file = 0 } }};
+    harness.pages.changes.load = test_support.loadState(.{
+        .text = "",
+        .document = .{ .files = &files },
+        .file_text_eligibility = &eligibility,
+        .tree = .{ .nodes = &tree },
+        .bytes = 0,
+        .lines = 0,
+    });
+    const body_col = raw.col + raw.width - pane_width + diff_render.cursor_gutter_width;
+    const new_text = body_col + geometry.new.col + gutter;
+    const first_row = diff_render.body_start_row + 1;
+    const padding = harness.view().diffMouseHit(.{ .col = new_text + text_width - 1, .row = first_row }).?;
+    try std.testing.expectEqual(@as(usize, text_width - 1), padding.point.leading);
+    try std.testing.expectEqual(padding.point.leading, padding.point.trailing);
+    try std.testing.expect(harness.view().diffMouseHit(.{ .col = body_col + gutter, .row = first_row + 1 }) == null);
+    const continuation = harness.view().diffMouseHit(.{ .col = new_text, .row = first_row + 1 }).?;
+    try std.testing.expectEqual(@as(usize, text_width - 1), continuation.point.leading);
+    try std.testing.expectEqual(@as(usize, text_width + 2), continuation.point.trailing);
+    const next = harness.view().diffMouseHit(.{ .col = new_text, .row = first_row + 2 }).?;
+    try std.testing.expectEqual(@as(usize, 2), next.point.line_index);
+
+    harness.controller().pressDiffMouse(.{ .col = new_text + text_width - 2, .row = first_row });
+    harness.controller().dragDiffMouse(.{ .col = new_text + 2, .row = first_row + 1 });
+    const selected = harness.pages.changes.selection_owner.activeDiff().?;
+    const copied = try diff_selection.copyText(std.testing.allocator, files[0], selected);
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("a界z", copied);
+    harness.controller().dragDiffMouse(.{ .col = new_text - 1, .row = first_row + 1 });
+    try std.testing.expectEqual(@as(usize, text_width - 1), harness.pages.changes.selection_owner.activeDiff().?.focus.leading);
+
+    var rendered: chasen.testing.TestSurface = undefined;
+    try rendered.init(pane_width, 8);
+    defer rendered.deinit();
+    try diff_render.renderFile(&rendered.surface, files[0], .{ .requested_mode = .side_by_side, .line_wrap = true });
+    const render_new = diff_render.cursor_gutter_width + geometry.new.col + gutter;
+    try rendered.expectCellText(render_new, first_row + 1, "界");
+    try rendered.expectCellText(render_new, first_row + 2, "n");
+}
+
 test "unified body always selects complete marker-prefixed diff rows" {
     const lines = [_]diff_parser.DiffLine{
         .{ .kind = .context, .text = "ABCDEFG", .old_line = 1, .new_line = 1 },
