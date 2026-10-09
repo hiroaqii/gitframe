@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) void {
     });
     const chasen_mod = chasen_dep.module("chasen");
     const chasen_ui_mod = chasen_ui_dep.module("chasen_ui");
+    // Keep Chasen types shared across GitFrame and its Chasen UI consumer.
+    chasen_ui_mod.addImport("chasen", chasen_mod);
     const draw_mod = b.createModule(.{
         .root_source_file = b.path("src/draw.zig"),
         .target = target,
