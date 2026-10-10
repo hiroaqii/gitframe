@@ -270,7 +270,7 @@ fn defaultSpec(action: PublicAction) ?KeySpec {
         .discard => shiftedAscii('d', 'D'),
         .toggle_display_mode => .{ .plain_codepoint = 'u' },
         .toggle_line_numbers => shiftedAscii('l', 'L'),
-        .toggle_line_wrap => shiftedAscii('`', '~'),
+        .toggle_line_wrap => shiftedAscii('w', 'W'),
         .toggle_sidebar => shiftedAscii('b', 'B'),
         .decrease_sidebar_width => .{ .plain_codepoint = '<' },
         .increase_sidebar_width => .{ .plain_codepoint = '>' },
@@ -477,6 +477,21 @@ test "effective keymap matches overridden actions" {
 
     try std.testing.expectEqual(PublicAction.commit, effective.actionForKey(.{ .codepoint = 'm' }).?);
     try std.testing.expect(effective.actionForKey(.{ .codepoint = 'c' }) == null);
+}
+
+test "line wrap uses shifted W and remains configurable" {
+    const defaults: Effective = .{};
+    try std.testing.expectEqual(PublicAction.toggle_line_wrap, defaults.actionForKey(.{ .codepoint = 'W' }).?);
+    try std.testing.expectEqual(PublicAction.toggle_line_wrap, defaults.actionForKey(.{ .codepoint = 'w', .mods = .{ .shift = true } }).?);
+    try std.testing.expect(defaults.actionForKey(.{ .codepoint = 'w' }) == null);
+    try std.testing.expect(defaults.actionForKey(.{ .codepoint = '~' }) == null);
+
+    var config: Config = .{};
+    config.set(.toggle_line_wrap, parseKeySpec("x").?);
+    try std.testing.expect(validateConfig(config));
+    const effective = Effective.fromConfig(config);
+    try std.testing.expectEqual(PublicAction.toggle_line_wrap, effective.actionForKey(.{ .codepoint = 'x' }).?);
+    try std.testing.expect(effective.actionForKey(.{ .codepoint = 'W' }) == null);
 }
 
 test "fetch is unbound by default and configurable" {

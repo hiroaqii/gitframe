@@ -253,6 +253,33 @@ test "Repository active pointer owner blocks wheel redraw until release" {
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 }
 
+test "line wrap routes to diff pages while text and overlays retain input" {
+    const key: chasen.Key = .{ .codepoint = 'W' };
+    for ([_]page.Id{ .changes, .compare, .history }) |active_page| {
+        var input_context: app_input.KeyContext = .{ .active_page = active_page, .history = .{ .diff_view = true } };
+        const expected: App.Msg = switch (active_page) {
+            .changes => .{ .changes = .toggle_line_wrap },
+            .compare => .{ .compare = .{ .common = .{ .shared = .toggle_line_wrap } } },
+            .history => .{ .history = .{ .common = .{ .shared = .toggle_line_wrap } } },
+            .repository => unreachable,
+        };
+        try std.testing.expectEqual(expected, app_input.keyToMsg(input_context, key).?);
+        input_context.changes.search_mode = true;
+        input_context.compare.common.search_mode = true;
+        input_context.history.common.search_mode = true;
+        const search: App.Msg = switch (active_page) {
+            .changes => .{ .changes = .{ .search_insert = 'W' } },
+            .compare => .{ .compare = .{ .common = .{ .shared = .{ .search_insert = 'W' } } } },
+            .history => .{ .history = .{ .common = .{ .shared = .{ .search_insert = 'W' } } } },
+            .repository => unreachable,
+        };
+        try std.testing.expectEqual(search, app_input.keyToMsg(input_context, key).?);
+    }
+    try std.testing.expectEqual(App.Msg{ .command_line = .owned_noop }, app_input.keyToMsg(.{ .active_page = .repository }, key).?);
+    try std.testing.expect(app_input.keyToMsg(.{ .help_mode = true }, key) == null);
+    try std.testing.expectEqual(App.Msg{ .commit_panel_insert = 'W' }, app_input.keyToMsg(.{ .commit_panel_mode = true }, key).?);
+}
+
 test "keyboard and page bar mouse share the page switch transition" {
     var app: App = .{
         .allocator = std.testing.allocator,
@@ -298,7 +325,7 @@ test "page key 4 activates Compare without replacing retained Changes state" {
         .config = .{ .source = .{ .patch_file = "change.patch" } },
         .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
-            .viewer = .{ .diff_scroll = .{ .logical = 11 } },
+            .viewer = .{ .diff_scroll = .{ .logical = 11 }, .view_options = .{ .line_wrap = true } },
         } },
     };
     _ = activateChanges(&app);
@@ -319,6 +346,8 @@ test "page key 4 activates Compare without replacing retained Changes state" {
     );
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
     try std.testing.expectEqual(@as(usize, 11), app.pages.changes.viewer.diff_scroll.row());
+    try std.testing.expect(app.pages.changes.viewer.view_options.line_wrap);
+    try std.testing.expect(!app.pages.compare.diff.viewer.view_options.line_wrap);
     try std.testing.expect(app.pages.changes.load.state == .empty);
     try std.testing.expect(!app.redraw_plan.resolvesToSkip());
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
@@ -392,6 +421,7 @@ test "changes repository transition common switch commits exact path before reva
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
                     .selected_node = 0,
+                    .view_options = .{ .line_wrap = true },
                 },
             },
             .repository = .{
@@ -417,6 +447,7 @@ test "changes repository transition common switch commits exact path before reva
     try std.testing.expect(!app.pages.repository.active);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
+    try std.testing.expect(app.pages.changes.viewer.view_options.line_wrap);
     try std.testing.expectEqual(@as(usize, 0), app.status.text().len);
     try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
     const active = app.pages.changes.activation.state.active;

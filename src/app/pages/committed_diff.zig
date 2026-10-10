@@ -602,6 +602,8 @@ test "committed diff exact reload preserves folds selection pin and indexes for 
     for (cases) |case| {
         var state: State = .{};
         defer state.deinit(allocator);
+        try std.testing.expect(!state.viewer.view_options.line_wrap);
+        state.viewer.view_options.line_wrap = true;
 
         var initial: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) };
         defer initial.deinit();
@@ -687,6 +689,7 @@ test "committed diff exact reload preserves folds selection pin and indexes for 
         const clipboard_after = try state.completed_selection.?.clipboardText(allocator);
         defer allocator.free(clipboard_after);
         try std.testing.expectEqualStrings(clipboard_before, clipboard_after);
+        try std.testing.expect(state.viewer.view_options.line_wrap);
 
         transferred.setHunkFolded(0, 1, false);
         const unfolded_unified_rows = transferred.renderedLineIndex(0, .unified).lineCount();
@@ -750,5 +753,8 @@ test "committed diff exact reload preserves folds selection pin and indexes for 
         );
         try std.testing.expect(state.completed_selection == null);
         try std.testing.expect(state.pinned_selection_basis == null);
+        try std.testing.expect(state.viewer.view_options.line_wrap);
+        state.deinit(allocator);
+        try std.testing.expect(!state.viewer.view_options.line_wrap);
     }
 }

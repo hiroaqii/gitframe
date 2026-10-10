@@ -3268,6 +3268,24 @@ test "help preserves configured keys and aligned wrapped descriptions while scro
     }
 }
 
+test "diff Help displays the effective line wrap key" {
+    var harness: ShellViewTestHarness = .{};
+    for ([_][]const u8{ "W", "x" }) |binding| {
+        var config: keymap.Config = .{};
+        if (std.mem.eql(u8, binding, "x")) config.set(.toggle_line_wrap, keymap.parseKeySpec(binding).?);
+        harness.keymap = .fromConfig(config);
+        const context = harness.context();
+        var surface: chasen.testing.TestSurface = undefined;
+        try surface.init(60, 1);
+        defer surface.deinit();
+        _ = try drawHelpItem(helpContext(context), context.theme, &surface.surface, 0, 0, help_diff_items[6]);
+        try surface.expectCellText(0, 0, binding);
+        const snapshot = try surface.snapshot(std.testing.allocator);
+        defer std.testing.allocator.free(snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "toggle line wrap") != null);
+    }
+}
+
 test "diff Help copy keys and vocabulary follow the keymap and effective mode" {
     var harness: ShellViewTestHarness = .{ .terminal_size = .{ .width = 160, .height = 40 } };
     var config: keymap.Config = .{};

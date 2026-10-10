@@ -6940,6 +6940,7 @@ test "source session replacement clears populated projection cache" {
     defer status_bundle.deinit();
     var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
+    page.viewer.view_options.line_wrap = true;
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
@@ -6951,6 +6952,7 @@ test "source session replacement clears populated projection cache" {
     try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
     try std.testing.expectEqual(@as(usize, 0), page.changes_projection.cacheLen());
     try std.testing.expect(!page.changes_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(page.viewer.view_options.line_wrap);
 }
 
 fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !changes_page.ChangesPageState {

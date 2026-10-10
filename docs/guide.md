@@ -114,6 +114,31 @@ available for source selections in side-by-side mode and includes the
 before/after commit IDs and the selected side. Unified diff selections use
 diff text. Without a selection, `Y` in a diff pane copies the current hunk.
 
+### Wrap long diff lines
+
+Press `W` to toggle line wrapping in the Changes, History, or Compare diff
+view. It works in unified and side-by-side layouts, including the unified
+layout used in narrow terminals. Repository source views do not wrap.
+Help (`?`) shows the effective key if you remap `toggle_line_wrap`.
+
+Wrapping starts off. Each page keeps its own choice while its diff view is
+retained, including file changes, reloads, and switching away and back. A
+newly created diff view starts with wrapping off; the choice is not saved
+across restarts. With wrapping off, long lines are clipped and you can
+scroll horizontally with the left/right arrows.
+
+With wrapping on, continuation rows repeat neither line numbers nor diff
+markers. Use the mouse wheel, Page Up/Down, or Ctrl+u/d/b/f to read long
+wrapped lines. `j` / `k` still move between original diff rows. Search also
+moves by original row and reveals its first fragment; scroll down to read a
+match farther along that row. Selection and copying use the original text,
+without inserting newlines at wrap boundaries.
+
+Tabs retain their spacing across wrap boundaries. If a character cannot
+fit even on an empty row, a replacement glyph is shown so scrolling can
+continue; copying still preserves the original character. A pane with no
+room for text shows no fragments and restores them when widened.
+
 ### Switch repositories and branches
 
 Press `R` from any working view to open the repository picker. Select a
