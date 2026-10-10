@@ -517,6 +517,7 @@ pub fn viewDiffPane(
                 .requested_mode = state.viewer.display_mode,
                 .display_mode_toggle_key = display_mode_toggle_key,
                 .scroll = body.renderDiffScroll(),
+                .wrap_start = body.renderWrapStart(),
                 .horizontal_scroll = state.viewer.diff_horizontal_scroll,
                 .pane_active = active,
                 .line_numbers = state.viewer.view_options.line_numbers,
@@ -543,7 +544,7 @@ pub fn viewDiffPane(
         active,
         palette,
     );
-    drawSearchMatchMarkerAt(surface, state, palette, if (state.search.match_offset) |offset| body.sourceToPresentationOffset(offset) else null);
+    drawSearchMatchMarkerRow(surface, palette, if (state.search.match_offset) |offset| if (body.sourceToPresentationOffset(offset)) |logical| body.screenRowForOffset(logical) else null else null);
 }
 
 test "primary diff presentation preserves active selection precedence" {
@@ -630,6 +631,7 @@ fn projectedBodyRenderArgs(
         .requested_mode = state.viewer.display_mode,
         .display_mode_toggle_key = display_mode_toggle_key,
         .scroll = body.renderDiffScroll(),
+        .wrap_start = body.renderWrapStart(),
         .horizontal_scroll = state.viewer.diff_horizontal_scroll,
         .pane_active = active,
         .line_numbers = state.viewer.view_options.line_numbers,
@@ -951,20 +953,10 @@ pub fn drawPaneHeaderRule(surface: *chasen.Surface, active: bool, palette: theme
     }
 }
 
-pub fn drawSearchMatchMarker(surface: *chasen.Surface, state: diff_surface.ReadSurface, palette: theme.Palette) void {
-    drawSearchMatchMarkerAt(surface, state, palette, state.search.match_offset);
-}
-
-fn drawSearchMatchMarkerAt(surface: *chasen.Surface, state: diff_surface.ReadSurface, palette: theme.Palette, match_offset_opt: ?usize) void {
-    const match_offset = match_offset_opt orelse return;
-    if (match_offset < state.viewer.diff_scroll) return;
-
-    const visible_offset = match_offset - state.viewer.diff_scroll;
-    const body_rows = diff_render.visibleBodyRows(surface.size().height);
-    if (visible_offset >= body_rows) return;
-
-    const row: u16 = @intCast(layout.diff_body_start_row + visible_offset);
-    _ = surface.borrowTextAt(0, row, "»", .{ .bold = true, .reverse = true, .fg = palette.color(.prompt) });
+pub fn drawSearchMatchMarkerRow(surface: *chasen.Surface, palette: theme.Palette, visible_offset_opt: ?usize) void {
+    const visible_offset = visible_offset_opt orelse return;
+    if (visible_offset >= diff_render.visibleBodyRows(surface.size().height)) return;
+    _ = surface.borrowTextAt(0, @intCast(layout.diff_body_start_row + visible_offset), "»", .{ .bold = true, .reverse = true, .fg = palette.color(.prompt) });
 }
 
 pub fn diffContentSurface(surface: *chasen.Surface) chasen.Surface {

@@ -2126,7 +2126,7 @@ pub fn canonicalPublicationTestApp(
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
-                .diff_scroll = 1,
+                .diff_scroll = .{ .logical = 1 },
                 .diff_horizontal_scroll = 2,
                 .sidebar_horizontal_scroll = 1,
             },
@@ -2179,7 +2179,7 @@ fn canonicalPublicationPrimaryTestApp(
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
-                .diff_scroll = 1,
+                .diff_scroll = .{ .logical = 1 },
                 .diff_horizontal_scroll = 2,
                 .sidebar_horizontal_scroll = 1,
             },
@@ -2243,7 +2243,7 @@ fn ordinaryPrimaryPublicationTestApp(
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 0 },
-                .diff_scroll = 1,
+                .diff_scroll = .{ .logical = 1 },
                 .diff_horizontal_scroll = 2,
                 .sidebar_horizontal_scroll = 1,
             },
@@ -2623,7 +2623,7 @@ fn expectFreshCanonicalActionCapabilities(
         else => return error.ExpectedFreshFileUnstageCapability,
     }
 
-    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     app.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
     switch (changesOperations(app).selectedHunkUnstageTarget(allocator)) {
         .ready => |target| {
@@ -2756,7 +2756,7 @@ fn expectFreshCanonicalCachedPublication(
         else => return error.ExpectedFreshFileUnstageCapability,
     }
 
-    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     app.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
     switch (changesOperations(app).selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(

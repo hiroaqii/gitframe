@@ -236,7 +236,7 @@ pub const State = struct {
     }
 
     pub fn resetAcceptedDisplayNavigation(self: *State) void {
-        self.viewer.diff_scroll = 0;
+        self.viewer.diff_scroll = .{ .logical = 0 };
         self.viewer.diff_horizontal_scroll = 0;
         self.viewer.sidebar_horizontal_scroll = 0;
         self.viewer.diff_cursor = .{ .metadata = 0 };
@@ -523,10 +523,10 @@ test "committed diff state owns shared navigation without page target authority"
         .current_target = null,
         .live_drag_deferred_source = false,
     });
-    surface.viewer.diff_scroll = 7;
+    surface.viewer.diff_scroll = .{ .logical = 7 };
     surface.search.mode = true;
 
-    try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll.row());
     try std.testing.expect(state.search.mode);
     try std.testing.expect(surface.viewer == &state.viewer);
 }

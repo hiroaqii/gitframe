@@ -338,6 +338,7 @@ fn projectedBodyRenderArgs(
         .requested_mode = app.page.viewer.display_mode,
         .display_mode_toggle_key = display_mode_toggle_key,
         .scroll = app.navigation.renderDiffScroll(),
+        .wrap_start = app.navigation.renderWrapStart(),
         .horizontal_scroll = app.page.viewer.diff_horizontal_scroll,
         .pane_active = active,
         .line_numbers = app.page.viewer.view_options.line_numbers,
@@ -515,10 +516,10 @@ test "changes reviewed and file filters retain combined status" {
 }
 
 pub fn drawSearchMatchMarker(app: Context, surface: *chasen.Surface) void {
-    return diff_surface_view.drawSearchMatchMarker(
+    return diff_surface_view.drawSearchMatchMarkerRow(
         surface,
-        app.page.readSurface(app.source, app.navigation.layout),
         app.theme,
+        if (app.page.search.match_offset) |offset| app.navigation.screenRowForOffset(offset) else null,
     );
 }
 
@@ -1379,7 +1380,7 @@ test "reviewed sidebar marker and visible search marker are Changes view concern
             .lines = 0,
         }),
         .search = .{ .match_offset = 4 },
-        .viewer = .{ .diff_scroll = 3 },
+        .viewer = .{ .diff_scroll = .{ .logical = 3 } },
     };
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(34, 8);

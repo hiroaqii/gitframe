@@ -2251,7 +2251,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
             const diff = if (owner == .history) &history.diff else &compare.diff;
             diff.viewer.selected_target = .{ .diff_file = 0 };
             diff.viewer.diff_cursor = .{ .hunk_header = 0 };
-            diff.viewer.diff_scroll = 2;
+            diff.viewer.diff_scroll = .{ .logical = 2 };
             const old_identity = if (owner == .history) history.activation.currentIdentity().? else compare.activation.currentIdentity().?;
             if (owner == .history) {
                 history.armDiff(.{ .identity = old_identity, .root_identity = root_identity, .generation = 10, .request = history.accepted.?.request });
@@ -2288,7 +2288,7 @@ test "History and Compare branch switch terminals keep caller intent and retire 
                 try std.testing.expect(history.activation.state.satisfiesAction(.read_diff));
                 try std.testing.expect(history.accepted.?.request.basis.after.eql(&selected));
                 try std.testing.expect(history.accepted.?.request.basis.before.commit.eql(&before));
-                try std.testing.expectEqual(@as(usize, 2), diff.viewer.diff_scroll);
+                try std.testing.expectEqual(@as(usize, 2), diff.viewer.diff_scroll.row());
                 try std.testing.expectEqual(@as(usize, 0), diff.viewer.diff_cursor.hunk_header);
                 const probe = history.pending.?.catalog;
                 try std.testing.expectEqual(if (success) app_load.HistoryProbeReason.reload else .activation, probe.request.probe);

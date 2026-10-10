@@ -55,7 +55,7 @@ pub const Controller = struct {
     pub fn initializeAcceptedBody(
         self: Controller,
         allocator: std.mem.Allocator,
-        transferred_viewport: ?diff_surface.selection_action.SelectionViewportAnchor,
+        transferred_viewport: ?diff_surface.navigation.ViewportAnchor,
     ) void {
         var adapter = self.navigation.updateAdapter();
         const cleanup = adapter.selectionMappingCleanup(allocator);
@@ -67,7 +67,10 @@ pub const Controller = struct {
             }
             body.clampDiffNavigation();
             if (transferred_viewport) |anchor| {
-                if (self.navigation.diff.completed_selection != null) body.restoreSelectionViewportAnchor(anchor);
+                if (self.navigation.diff.completed_selection != null or body.view().lineWrapActive()) {
+                    body.restoreSelectionViewportAnchor(anchor);
+                    body.clampDiffNavigationKeepingHunkVisible();
+                }
             }
             body.refreshSearchForSelectedFile(cleanup);
             body.controller.rebuildFileSearchProjection(allocator);

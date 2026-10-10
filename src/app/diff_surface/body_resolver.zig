@@ -99,6 +99,7 @@ pub const RenderProjectedBodyArgs = struct {
     requested_mode: diff_render.DisplayMode,
     display_mode_toggle_key: ?[]const u8 = null,
     scroll: usize,
+    wrap_start: usize = 0,
     horizontal_scroll: usize,
     pane_active: bool,
     line_numbers: bool,

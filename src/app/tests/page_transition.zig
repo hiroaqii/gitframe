@@ -68,7 +68,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .{ .patch_file = "change.patch" } },
-        .pages = .{ .changes = .{ .viewer = .{ .diff_scroll = 17 } } },
+        .pages = .{ .changes = .{ .viewer = .{ .diff_scroll = .{ .logical = 17 } } } },
         .repo_session = .{
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, roots.a) },
         },
@@ -101,7 +101,7 @@ test "Compare entry resolves default and picker selection queues its full ref" {
     ) } } }, &ctx.ctx);
     try std.testing.expectEqualStrings("main", app.pages.compare.basis.?.base.display_name);
     try std.testing.expect(app.pages.compare.diff.load.state == .loaded);
-    try std.testing.expectEqual(@as(usize, 17), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 17), app.pages.changes.viewer.diff_scroll.row());
 
     // The production shared-input route must consume the same-owner bound
     // UpdateAdapter rather than reintroducing a raw controller/resolver pair.
@@ -298,7 +298,7 @@ test "page key 4 activates Compare without replacing retained Changes state" {
         .config = .{ .source = .{ .patch_file = "change.patch" } },
         .pages = .{ .changes = .{
             .load = .{ .state = .{ .empty = .no_changes } },
-            .viewer = .{ .diff_scroll = 11 },
+            .viewer = .{ .diff_scroll = .{ .logical = 11 } },
         } },
     };
     _ = activateChanges(&app);
@@ -318,7 +318,7 @@ test "page key 4 activates Compare without replacing retained Changes state" {
         app.pages.compare.activation.currentIdentity().?.origin,
     );
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
-    try std.testing.expectEqual(@as(usize, 11), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 11), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expect(app.pages.changes.load.state == .empty);
     try std.testing.expect(!app.redraw_plan.resolvesToSkip());
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
@@ -455,7 +455,7 @@ test "changes repository transition blocker retains page owner and Changes state
                 .viewer = .{
                     .selected_target = .{ .diff_file = 0 },
                     .selected_node = 0,
-                    .diff_scroll = 6,
+                    .diff_scroll = .{ .logical = 6 },
                 },
             },
             .repository = .{
@@ -488,7 +488,7 @@ test "changes repository transition blocker retains page owner and Changes state
     try std.testing.expectEqualStrings("pending.zig", app.pages.repository.incoming.manifestIntent().?.path);
     try std.testing.expect(app.pages.changes.activation.state == .inactive);
     try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqualStrings("finish file search before switching pages", app.status.text());
     try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
 }
@@ -654,7 +654,7 @@ test "changes repository transition common switch maps retained-location outcome
                         .selected_target = .{ .diff_file = case.retained_index },
                         .selected_node = case.retained_index,
                         .diff_cursor = if (case.retained_index == 0) .{ .metadata = 0 } else .{ .metadata = 1 },
-                        .diff_scroll = 9,
+                        .diff_scroll = .{ .logical = 9 },
                     },
                     .review_display = .{ .hide_reviewed_files = case.hide_reviewed },
                 },
@@ -691,7 +691,7 @@ test "changes repository transition common switch maps retained-location outcome
                 diff_view_model.BodyCoordinate{ .metadata = 1 },
             app.pages.changes.viewer.diff_cursor,
         ));
-        try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll.row());
         try std.testing.expectEqual(case.hide_reviewed, app.pages.changes.review_display.hide_reviewed_files);
         try std.testing.expectEqualStrings(case.status, app.status.text());
         try std.testing.expectEqual(@as(usize, 3), ctx.pendingTaskCount());
@@ -717,7 +717,7 @@ test "changes repository transition common switch consumes pending and unavailab
                     .viewer = .{
                         .selected_target = .{ .diff_file = 0 },
                         .selected_node = 0,
-                        .diff_scroll = 6,
+                        .diff_scroll = .{ .logical = 6 },
                     },
                 },
                 .repository = .{
@@ -753,7 +753,7 @@ test "changes repository transition common switch consumes pending and unavailab
         try std.testing.expect(!app.pages.repository.active);
         try std.testing.expect(app.pages.repository.incoming == .none);
         try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
-        try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll.row());
         try std.testing.expectEqualStrings("Repository has no resolved file to open in Changes", app.status.text());
         try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
     }

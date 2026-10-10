@@ -327,7 +327,7 @@ test "Compare retained selection survives page transitions and clears on reposit
     // Repository commitment invalidates the complete Compare owner before
     // page coordination reactivates it. The coordinator must not perform a
     // second candidate-only clear that could preserve stale scroll state.
-    app.pages.compare.diff.viewer.diff_scroll = 9;
+    app.pages.compare.diff.viewer.diff_scroll = .{ .logical = 9 };
     app.pages.compare.deinit(allocator);
     try std.testing.expectEqual(
         page_coordinator.Intent.compare_refresh,
@@ -335,7 +335,7 @@ test "Compare retained selection survives page transitions and clears on reposit
     );
     try std.testing.expect(app.pages.compare.diff.completed_selection == null);
     try std.testing.expect(app.pages.compare.diff.pinned_selection_basis == null);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.compare.diff.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.compare.diff.viewer.diff_scroll.row());
 }
 
 test "changes repository transition commit selects exact retained Changes path" {
@@ -409,7 +409,7 @@ test "changes repository transition commit maps unchanged and unavailable outcom
                     .viewer = .{
                         .selected_target = .{ .diff_file = 1 },
                         .selected_node = 1,
-                        .diff_scroll = 9,
+                        .diff_scroll = .{ .logical = 9 },
                     },
                 },
                 .repository = .{
@@ -431,7 +431,7 @@ test "changes repository transition commit maps unchanged and unavailable outcom
         try std.testing.expect(!app.pages.repository.active);
         try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
         try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
-        try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll.row());
         try std.testing.expectEqualStrings(case.status, app.status.text());
     }
 }
@@ -455,7 +455,7 @@ test "changes repository transition no context dismisses pending and unavailable
                     .viewer = .{
                         .selected_target = .{ .diff_file = 0 },
                         .selected_node = 0,
-                        .diff_scroll = 6,
+                        .diff_scroll = .{ .logical = 6 },
                     },
                 },
                 .repository = .{
@@ -488,7 +488,7 @@ test "changes repository transition no context dismisses pending and unavailable
         try std.testing.expect(!app.pages.repository.active);
         try std.testing.expect(app.pages.repository.incoming == .none);
         try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.selected_node);
-        try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll.row());
         try std.testing.expectEqualStrings("Repository has no resolved file to open in Changes", app.status.text());
     }
 }

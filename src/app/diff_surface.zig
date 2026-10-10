@@ -66,6 +66,34 @@ pub const ViewOptions = struct {
     }
 };
 
+/// One position: OFF and ordinary rows have no independently mutable wrap state.
+pub const ViewportPosition = union(enum) {
+    logical: usize,
+    wrapped: struct {
+        row: usize,
+        target: ?context.SelectedTarget,
+        content: ContentToken,
+        anchor: WrapAnchor,
+    },
+
+    pub fn atRow(value: usize) ViewportPosition {
+        return .{ .logical = value };
+    }
+
+    pub fn row(self: ViewportPosition) usize {
+        return switch (self) {
+            .logical => |value| value,
+            .wrapped => |value| value.row,
+        };
+    }
+};
+
+pub const WrapAnchor = struct {
+    side: ?diff_selection.Side = null,
+    byte: usize = 0,
+    tab_cell: usize = 0,
+};
+
 pub const ViewerState = struct {
     /// Sticky target shown in the diff pane or used by file actions.
     ///
@@ -78,7 +106,7 @@ pub const ViewerState = struct {
     sidebar_hidden: bool = false,
     sidebar_width: ?u16 = null,
     sidebar_horizontal_scroll: usize = 0,
-    diff_scroll: usize = 0,
+    diff_scroll: ViewportPosition = .{ .logical = 0 },
     diff_horizontal_scroll: usize = 0,
     diff_cursor: diff_view_model.BodyCoordinate = .{ .metadata = 0 },
     display_mode: diff_render.DisplayMode = .side_by_side,
@@ -105,8 +133,8 @@ pub const ReloadAnchor = struct {
     visible_sidebar_row: usize,
     diff_cursor: diff_view_model.BodyCoordinate,
     diff_cursor_offset: ?usize,
-    diff_scroll: usize,
-    selection_viewport: ?selection_action.SelectionViewportAnchor = null,
+    diff_scroll: ViewportPosition,
+    selection_viewport: ?navigation.ViewportAnchor = null,
     diff_horizontal_scroll: usize,
     sidebar_horizontal_scroll: usize,
     search_coordinate: ?diff_view_model.BodyCoordinate,
@@ -156,7 +184,7 @@ pub const DisplayNavigationSnapshot = struct {
     selected_target: ?context.SelectedTarget,
     selected_node: usize,
     diff_cursor: diff_view_model.BodyCoordinate,
-    diff_scroll: usize,
+    diff_scroll: ViewportPosition,
     diff_horizontal_scroll: usize,
     sidebar_horizontal_scroll: usize,
     search_coordinate: ?diff_view_model.BodyCoordinate,

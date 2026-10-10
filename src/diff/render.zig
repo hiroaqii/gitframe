@@ -49,6 +49,8 @@ pub const RenderOptions = struct {
     requested_mode: DisplayMode = .unified,
     display_mode_toggle_key: ?[]const u8 = null,
     scroll: usize = 0,
+    /// Derived first fragment of the first logical row; never a source coordinate.
+    wrap_start: usize = 0,
     horizontal_scroll: usize = 0,
     pane_active: bool = true,
     line_numbers: bool = true,
@@ -1156,14 +1158,16 @@ pub fn renderFile(surface: *chasen.Surface, file: diff_parser.FileDiff, options:
         const projections = try admitBodyRow(body_row);
         var wrapping = RowWrap.init(projections, body_surface.size().width, options.line_numbers);
         const row_height = if (options.line_wrap) wrapping.height() else 1;
-        var wrap_row: usize = 0;
+        const wrap_start = if (options.line_wrap and body_offset == options.scroll) @min(options.wrap_start, row_height - 1) else 0;
+        for (0..wrap_start) |_| _ = wrapping.next(options);
+        var wrap_row: usize = wrap_start;
 
         while (wrap_row < row_height) : (wrap_row += 1) {
-            const row = if (wrap_row == 0) first_row else cursor.continuationRow() orelse break;
+            const row = if (wrap_row == wrap_start) first_row else cursor.continuationRow() orelse break;
             const windows = wrapping.next(options);
             const wrap_tail = wrap_row + 1 == row_height;
             presentation.prefill(surface, row, styles);
-            drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
+            if (wrap_row == wrap_start) drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
 
             switch (body_row) {
                 .metadata => |line| {
@@ -1424,12 +1428,14 @@ pub fn renderGeneratedAddedFile(surface: *chasen.Surface, path: []const u8, sour
         const projections: BodyRowProjections = if (mode == .unified) .{ .unified = projection } else .{ .side_by_side = .{ .new = projection } };
         var wrapping = RowWrap.init(projections, body_surface.size().width, options.line_numbers);
         const row_height = if (options.line_wrap) wrapping.height() else 1;
-        var wrap_row: usize = 0;
+        const wrap_start = if (options.line_wrap and body_offset == options.scroll) @min(options.wrap_start, row_height - 1) else 0;
+        for (0..wrap_start) |_| _ = wrapping.next(options);
+        var wrap_row: usize = wrap_start;
         while (wrap_row < row_height) : (wrap_row += 1) {
-            const row = if (wrap_row == 0) first_row else cursor.continuationRow() orelse break;
+            const row = if (wrap_row == wrap_start) first_row else cursor.continuationRow() orelse break;
             const windows = wrapping.next(options);
             presentation.prefill(surface, row, styles);
-            drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
+            if (wrap_row == wrap_start) drawCursorMarker(surface, row, body_offset, options.cursor_offset, presentation, styles);
             const line_spans = options.source_syntax_spans.lineSpans(index);
             if (mode == .side_by_side) {
                 const geometry = sideBySideGeometry(body_surface.size().width);

@@ -458,6 +458,16 @@ pub const View = struct {
         return self.sharedBodyView(&adapter).renderDiffScroll();
     }
 
+    pub fn renderWrapStart(self: View) usize {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).renderWrapStart();
+    }
+
+    pub fn screenRowForOffset(self: View, offset: usize) ?usize {
+        var adapter = self.bodyResolverAdapter();
+        return self.sharedBodyView(&adapter).screenRowForOffset(offset);
+    }
+
     pub fn renderDiffCursorOffset(self: View) ?usize {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).renderDiffCursorOffset();
@@ -468,17 +478,14 @@ pub const View = struct {
         return self.sharedBodyView(&adapter).retainedSelectionActionAvailable();
     }
 
-    pub fn captureSelectionViewportAnchor(self: View) ?diff_surface.selection_action.SelectionViewportAnchor {
+    pub fn captureSelectionViewportAnchor(self: View) ?diff_surface.navigation.ViewportAnchor {
         var adapter = self.bodyResolverAdapter();
         return self.sharedBodyView(&adapter).captureSelectionViewportAnchor();
     }
 
-    pub fn restoredSelectionViewportScroll(
-        self: View,
-        anchor: diff_surface.selection_action.SelectionViewportAnchor,
-    ) usize {
+    pub fn restoredViewport(self: View, anchor: diff_surface.navigation.ViewportAnchor) diff_surface.ViewportPosition {
         var adapter = self.bodyResolverAdapter();
-        return self.sharedBodyView(&adapter).restoreSelectionViewportAnchor(anchor);
+        return self.sharedBodyView(&adapter).restoredViewport(anchor, true);
     }
 
     pub fn selectionActionHit(self: View, point: diff_surface.MousePoint) ?diff_surface.navigation.SelectionActionHit {
@@ -1331,12 +1338,13 @@ pub const Controller = struct {
         return self.sharedController().clearCompletedSelectionAfterCopy(allocator, generation);
     }
 
-    pub fn captureSelectionViewportAnchor(self: Controller) ?diff_surface.selection_action.SelectionViewportAnchor {
+    pub fn captureSelectionViewportAnchor(self: Controller) ?diff_surface.navigation.ViewportAnchor {
         return self.view().captureSelectionViewportAnchor();
     }
 
-    pub fn restoreSelectionViewportAnchor(self: Controller, anchor: diff_surface.selection_action.SelectionViewportAnchor) void {
-        self.page.viewer.diff_scroll = self.view().restoredSelectionViewportScroll(anchor);
+    pub fn restoreSelectionViewportAnchor(self: Controller, anchor: diff_surface.navigation.ViewportAnchor) void {
+        var adapter = self.bodyResolverAdapter();
+        self.sharedBodyController(&adapter).restoreSelectionViewportAnchor(anchor);
     }
 
     pub fn selectFileDelta(self: Controller, allocator: std.mem.Allocator, delta: i2) void {
@@ -2109,7 +2117,7 @@ const TestHarness = struct {
             self.pages.changes.changes_projection.deinit(allocator);
             self.pages.changes.staged_hunks.clear(allocator);
         }
-        self.pages.changes.viewer.diff_scroll = 0;
+        self.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
         self.pages.changes.viewer.diff_horizontal_scroll = 0;
         self.pages.changes.viewer.sidebar_horizontal_scroll = 0;
         self.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
@@ -2176,7 +2184,7 @@ fn initProjectionHunkFoldHarness(allocator: std.mem.Allocator) !TestHarness {
         .viewer = .{
             .selected_target = .{ .diff_file = 0 },
             .diff_cursor = .{ .hunk_header = 0 },
-            .diff_scroll = 2,
+            .diff_scroll = .{ .logical = 2 },
             .diff_horizontal_scroll = 3,
         },
         .search = .{
@@ -2223,7 +2231,7 @@ fn expectProjectionHunkFoldDenied(
     const unified_hunk_lines_before = active.renderedLineIndex(0, .unified).hunkLineCount(0);
     const side_by_side_lines_before = active.renderedLineIndex(0, .side_by_side).lineCount();
     const cursor_before = harness.pages.changes.viewer.diff_cursor;
-    const scroll_before = harness.pages.changes.viewer.diff_scroll;
+    const scroll_before = harness.pages.changes.viewer.diff_scroll.row();
     const horizontal_scroll_before = harness.pages.changes.viewer.diff_horizontal_scroll;
     const search_before = harness.pages.changes.search;
 
@@ -2248,7 +2256,7 @@ fn expectProjectionHunkFoldDenied(
     try std.testing.expectEqual(unified_hunk_lines_before, active.renderedLineIndex(0, .unified).hunkLineCount(0));
     try std.testing.expectEqual(side_by_side_lines_before, active.renderedLineIndex(0, .side_by_side).lineCount());
     try std.testing.expectEqualDeep(cursor_before, harness.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_scroll_before, harness.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expectEqualDeep(search_before, harness.pages.changes.search);
     try std.testing.expect(harness.pages.changes.completed_selection.?.token.eql(retained_token));
@@ -2267,7 +2275,7 @@ fn expectResolverRenderContains(harness: *TestHarness, needle: []const u8) !void
     try harness.view().renderProjectedBody(.{
         .surface = &ts.surface,
         .requested_mode = harness.pages.changes.viewer.display_mode,
-        .scroll = harness.pages.changes.viewer.diff_scroll,
+        .scroll = harness.pages.changes.viewer.diff_scroll.row(),
         .horizontal_scroll = harness.pages.changes.viewer.diff_horizontal_scroll,
         .pane_active = true,
         .line_numbers = harness.pages.changes.viewer.view_options.line_numbers,
@@ -2287,7 +2295,7 @@ fn expectResolverRenderOmits(harness: *TestHarness, needle: []const u8) !void {
     try harness.view().renderProjectedBody(.{
         .surface = &ts.surface,
         .requested_mode = harness.pages.changes.viewer.display_mode,
-        .scroll = harness.pages.changes.viewer.diff_scroll,
+        .scroll = harness.pages.changes.viewer.diff_scroll.row(),
         .horizontal_scroll = harness.pages.changes.viewer.diff_horizontal_scroll,
         .pane_active = true,
         .line_numbers = harness.pages.changes.viewer.view_options.line_numbers,
@@ -2413,7 +2421,7 @@ fn retainCombinedHorizontalScrollProjection(
 
 fn expectDisplayedBodyHorizontalScrollGeometry(harness: *TestHarness) !void {
     harness.terminal_size = .{ .width = 140, .height = 16 };
-    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     inline for ([_]diff_render.DisplayMode{ .unified, .side_by_side }) |mode| {
         harness.pages.changes.viewer.display_mode = mode;
         harness.pages.changes.viewer.view_options.line_numbers = true;
@@ -2601,7 +2609,7 @@ test "Changes navigation keeps diff position at file selection boundary" {
     var harness = TestHarness.init(.{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{
-            .diff_scroll = 4,
+            .diff_scroll = .{ .logical = 4 },
             .diff_cursor = .{ .hunk_header = 1 },
         },
     }, .{ .width = 100, .height = 8 });
@@ -2609,11 +2617,11 @@ test "Changes navigation keeps diff position at file selection boundary" {
     harness.controller().selectFileDelta(std.testing.allocator, -1);
     const loaded = harness.controller().activeLoadedDiff().?;
     try std.testing.expectEqual(@as(?usize, 0), harness.view().selectedFileIndex(loaded));
-    try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 
     harness.controller().selectFileAbsolute(std.testing.allocator, 0);
-    try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(?usize, 1), harness.view().selectedHunkIndex());
 }
 
@@ -2627,7 +2635,7 @@ test "Changes navigation keeps diff cursor visible across mode changes" {
     }, .{ .width = 100, .height = 9 });
 
     harness.controller().placeDiffCursorInComfortBand();
-    try std.testing.expect(harness.pages.changes.viewer.diff_scroll > 0);
+    try std.testing.expect(harness.pages.changes.viewer.diff_scroll.row() > 0);
 
     harness.pages.changes.viewer.display_mode = .side_by_side;
     harness.controller().clampDiffNavigationKeepingHunkVisible();
@@ -2638,8 +2646,8 @@ test "Changes navigation keeps diff cursor visible across mode changes" {
         harness.view().selectedHunkIndex().?,
     );
     const visible_rows = harness.view().diffVisibleRows();
-    try std.testing.expect(target >= harness.pages.changes.viewer.diff_scroll);
-    try std.testing.expect(target < harness.pages.changes.viewer.diff_scroll + visible_rows);
+    try std.testing.expect(target >= harness.pages.changes.viewer.diff_scroll.row());
+    try std.testing.expect(target < harness.pages.changes.viewer.diff_scroll.row() + visible_rows);
 }
 
 test "Changes navigation initializes cursor at first rendered body row" {
@@ -2651,7 +2659,7 @@ test "Changes navigation initializes cursor at first rendered body row" {
     try std.testing.expectEqual(@as(?usize, 0), metadata.view().visibleDiffCursorOffset());
     const metadata_cursor = metadata.pages.changes.viewer.diff_cursor;
     metadata.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 0), metadata.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), metadata.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(metadata_cursor, metadata.pages.changes.viewer.diff_cursor);
 
     var binary = TestHarness.init(.{
@@ -2674,7 +2682,7 @@ test "Changes navigation initializes cursor at first rendered body row" {
         try std.testing.expectEqualDeep(binary_snapshot, binary.view().displayNavigationSnapshot());
     }
     binary.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 0), binary.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), binary.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(binary_cursor, binary.pages.changes.viewer.diff_cursor);
 }
 
@@ -2731,14 +2739,14 @@ test "document navigation applies first last half and full page on rendered rows
     harness.pages.changes.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(band_last - 1) orelse
         return error.ExpectedCoordinate;
     harness.controller().moveDiffCursorRows(.down);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(?usize, band_last), harness.view().selectedDiffCursorOffset());
 
     harness.controller().moveDiffCursorRows(.down);
-    try std.testing.expectEqual(@as(usize, 1), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(?usize, band_last + 1), harness.view().selectedDiffCursorOffset());
 
-    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     harness.pages.changes.viewer.diff_cursor = harness.view().selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCoordinate;
     _ = try applySharedNavigation(&harness, .page_diff_down);
@@ -2746,29 +2754,29 @@ test "document navigation applies first last half and full page on rendered rows
     try std.testing.expectEqual(@as(usize, visible_rows), page_offset);
     try std.testing.expectEqual(
         @min(page_offset -| (visible_rows / 2), line_count -| visible_rows),
-        harness.pages.changes.viewer.diff_scroll,
+        harness.pages.changes.viewer.diff_scroll.row(),
     );
 
-    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     harness.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
     harness.controller().selectHunkDelta(1);
     const hunk_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    const hunk_row = hunk_offset - harness.pages.changes.viewer.diff_scroll;
+    const hunk_row = hunk_offset - harness.pages.changes.viewer.diff_scroll.row();
     try std.testing.expect(hunk_row >= margin and hunk_row <= band_last);
 
-    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     setDiffSearchQuery(&harness, "new");
     harness.controller().submitSearch(std.testing.allocator);
     const search_offset = harness.view().selectedDiffCursorOffset() orelse return error.ExpectedCursorOffset;
-    const search_row = search_offset - harness.pages.changes.viewer.diff_scroll;
+    const search_row = search_offset - harness.pages.changes.viewer.diff_scroll.row();
     try std.testing.expect(search_row >= margin and search_row <= band_last);
 
     harness.terminal_size.height = 8;
-    harness.pages.changes.viewer.diff_scroll = 1;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 1 };
     harness.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
     const zero_height_cursor = harness.pages.changes.viewer.diff_cursor;
     harness.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 2), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 2), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(zero_height_cursor, harness.pages.changes.viewer.diff_cursor);
 }
 
@@ -2796,7 +2804,7 @@ test "reload search fallback resyncs match without interactive cursor placement"
         .visible_sidebar_row = 0,
         .diff_cursor = harness.pages.changes.viewer.diff_cursor,
         .diff_cursor_offset = 0,
-        .diff_scroll = 0,
+        .diff_scroll = .{ .logical = 0 },
         .diff_horizontal_scroll = 0,
         .sidebar_horizontal_scroll = 0,
         .search_coordinate = invalid_coordinate,
@@ -2806,7 +2814,7 @@ test "reload search fallback resyncs match without interactive cursor placement"
     harness.controller().restoreSearchFromReloadAnchor(std.testing.allocator, &anchor);
 
     try std.testing.expectEqual(cursor_before, harness.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll.row());
     const match = harness.pages.changes.search.match orelse return error.ExpectedSearchMatch;
     try std.testing.expect(!std.meta.eql(invalid_coordinate, match.coordinate));
     try std.testing.expect(harness.pages.changes.search.match_offset != null);
@@ -3033,11 +3041,11 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
     try std.testing.expect(harness.view().selectedHunkIndex() == null);
     try std.testing.expect(harness.view().displayedDiffFile() == null);
     try std.testing.expect(harness.view().unsupportedSearchMessage() != null);
-    harness.pages.changes.viewer.diff_scroll = 99;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 99 };
     harness.pages.changes.viewer.diff_horizontal_scroll = 99;
     harness.controller().clampDiffNavigation();
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     const inert_snapshot = harness.view().displayNavigationSnapshot();
     for ([_]diff_surface.message.Msg{
@@ -3057,7 +3065,7 @@ test "invalid primary file is inert while its valid sibling remains selectable" 
     harness.controller().selectHunkDelta(1);
     harness.controller().toggleSelectedHunkFold(std.testing.allocator);
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(harness.pages.changes.selection_owner == .none);
@@ -3127,16 +3135,16 @@ test "invalid cached projection cannot fall through to primary hunk authority" {
     try std.testing.expect(harness.view().activeCachedDiffProjection() == null);
     try std.testing.expect(harness.view().displayedDiffFile() == null);
     try std.testing.expect(harness.view().selectedHunkIndex() == null);
-    harness.pages.changes.viewer.diff_scroll = 99;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 99 };
     harness.pages.changes.viewer.diff_horizontal_scroll = 99;
     harness.controller().clampDiffNavigation();
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     harness.controller().moveDiffCursorPage(.down);
     harness.controller().scrollDiff(.down);
     harness.controller().scrollDiffHorizontal(.right);
-    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     harness.controller().pressDiffMouse(.{ .col = 12, .row = diff_render.body_start_row + 1 });
     try std.testing.expect(harness.pages.changes.selection_owner == .none);
@@ -3174,7 +3182,7 @@ test "either invalid combined component remains inert without primary navigation
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } },
-                .diff_scroll = 99,
+                .diff_scroll = .{ .logical = 99 },
                 .diff_horizontal_scroll = 99,
                 .display_mode = .unified,
                 .sidebar_hidden = true,
@@ -3217,7 +3225,7 @@ test "either invalid combined component remains inert without primary navigation
         harness.controller().selectHunkDelta(1);
         harness.controller().toggleSelectedHunkFold(std.testing.allocator);
         try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 0 }, harness.pages.changes.viewer.diff_cursor);
-        try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_scroll.row());
         try std.testing.expectEqual(@as(usize, 0), harness.pages.changes.viewer.diff_horizontal_scroll);
     }
 }
@@ -3363,7 +3371,7 @@ test "Changes navigation snapshot and reload restore share the page owner" {
             .selected_node = 0,
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_header = 1 },
-            .diff_scroll = 4,
+            .diff_scroll = .{ .logical = 4 },
             .diff_horizontal_scroll = 3,
             .sidebar_horizontal_scroll = 2,
         },
@@ -3374,7 +3382,7 @@ test "Changes navigation snapshot and reload restore share the page owner" {
     }, .{ .width = 100, .height = 9 });
 
     const snapshot = harness.view().displayNavigationSnapshot();
-    try std.testing.expectEqual(@as(usize, 4), snapshot.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 4), snapshot.diff_scroll.row());
     try std.testing.expectEqual(@as(?usize, 6), snapshot.search_match_offset);
 
     var anchor: changes_page.ReloadAnchor = .{
@@ -3384,7 +3392,7 @@ test "Changes navigation snapshot and reload restore share the page owner" {
         .visible_sidebar_row = 0,
         .diff_cursor = snapshot.diff_cursor,
         .diff_cursor_offset = harness.view().selectedDiffCursorOffset(),
-        .diff_scroll = snapshot.diff_scroll,
+        .diff_scroll = .{ .logical = snapshot.diff_scroll.row() },
         .diff_horizontal_scroll = snapshot.diff_horizontal_scroll,
         .sidebar_horizontal_scroll = snapshot.sidebar_horizontal_scroll,
         .search_coordinate = snapshot.search_coordinate,
@@ -3392,7 +3400,7 @@ test "Changes navigation snapshot and reload restore share the page owner" {
     defer anchor.deinit(allocator);
 
     harness.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
-    harness.pages.changes.viewer.diff_scroll = 0;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     harness.pages.changes.viewer.diff_horizontal_scroll = 0;
     harness.pages.changes.viewer.sidebar_horizontal_scroll = 0;
     harness.pages.changes.search.match = null;
@@ -3401,7 +3409,7 @@ test "Changes navigation snapshot and reload restore share the page owner" {
     const loaded = harness.controller().activeLoadedDiff() orelse return error.ExpectedLoadedDiff;
     try std.testing.expect(harness.controller().restoreReloadAnchor(std.testing.allocator, loaded, &anchor));
     try std.testing.expectEqual(snapshot.diff_cursor, harness.pages.changes.viewer.diff_cursor);
-    try std.testing.expect(harness.pages.changes.viewer.diff_scroll >= snapshot.diff_scroll);
+    try std.testing.expect(harness.pages.changes.viewer.diff_scroll.row() >= snapshot.diff_scroll.row());
     try std.testing.expect(harness.view().visibleDiffCursorOffset() != null);
     try std.testing.expect(harness.pages.changes.viewer.diff_horizontal_scroll <= snapshot.diff_horizontal_scroll);
     try std.testing.expect(harness.pages.changes.viewer.sidebar_horizontal_scroll <= snapshot.sidebar_horizontal_scroll);
@@ -3719,7 +3727,7 @@ test "displayed body horizontal scroll follows generated visible rows" {
     try std.testing.expect(harness.view().diffVisibleRows() < 12);
     try std.testing.expectEqual(@as(usize, 0), harness.view().visibleBodyTextMaxHorizontalScroll());
 
-    harness.pages.changes.viewer.diff_scroll = 12;
+    harness.pages.changes.viewer.diff_scroll = .{ .logical = 12 };
     const visible_max = harness.view().visibleBodyTextMaxHorizontalScroll();
     try std.testing.expect(visible_max > 0);
     harness.pages.changes.viewer.diff_horizontal_scroll = std.math.maxInt(usize);
@@ -3821,7 +3829,7 @@ test "displayed body horizontal scroll keeps non-scrollable terminals at zero" {
     try std.testing.expectEqual(@as(usize, 0), status.view().visibleBodyTextMaxHorizontalScroll());
     const status_cursor = status.pages.changes.viewer.diff_cursor;
     status.controller().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 0), status.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), status.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(status_cursor, status.pages.changes.viewer.diff_cursor);
 
     const invalid_patch =
@@ -3962,7 +3970,7 @@ test "diff wheel scroll brings an invisible cursor into the moved viewport" {
             .viewer = .{
                 .display_mode = .unified,
                 .sidebar_hidden = true,
-                .diff_scroll = 2,
+                .diff_scroll = .{ .logical = 2 },
                 .diff_cursor = .{ .hunk_header = 0 },
             },
         } },
@@ -3984,15 +3992,15 @@ test "diff wheel keeps every visible cursor screen position stable in both displ
         }, .{ .width = 140, .height = 10 });
         const view = app.changesNavigationView();
         for (0..view.diffVisibleRows()) |screen_row| {
-            app.pages.changes.viewer.diff_scroll = 1;
+            app.pages.changes.viewer.diff_scroll = .{ .logical = 1 };
             app.pages.changes.viewer.diff_cursor = view.selectedCoordinateAtOffset(1 + screen_row) orelse return error.ExpectedCoordinate;
 
             app.changesNavigation().scrollDiff(.down);
-            try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.diff_scroll);
+            try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.diff_scroll.row());
             try std.testing.expectEqual(2 + screen_row, view.selectedDiffCursorOffset().?);
 
             app.changesNavigation().scrollDiff(.up);
-            try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+            try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll.row());
             try std.testing.expectEqual(1 + screen_row, view.selectedDiffCursorOffset().?);
         }
     }
@@ -4012,25 +4020,25 @@ test "diff wheel clamps offscreen cursors to the nearest edge only after viewpor
     const line_count = app.changesNavigationView().selectedFileLineIndex(app.changesNavigationView().effectiveDisplayMode()).lineCount();
     const visible_rows = app.changesNavigationView().diffVisibleRows();
 
-    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
     app.changesNavigation().scrollDiff(.up);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(line_count - 2, app.changesNavigationView().selectedDiffCursorOffset().?);
 
     app.changesNavigation().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(
-        @min(line_count - 2, app.pages.changes.viewer.diff_scroll + visible_rows - 1),
+        @min(line_count - 2, app.pages.changes.viewer.diff_scroll.row() + visible_rows - 1),
         app.changesNavigationView().selectedDiffCursorOffset().?,
     );
 
-    app.pages.changes.viewer.diff_scroll = line_count - visible_rows;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = line_count - visible_rows };
     app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(0) orelse return error.ExpectedCoordinate;
     app.changesNavigation().scrollDiff(.up);
-    try std.testing.expectEqual(line_count - visible_rows - 1, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(line_count - visible_rows - 1, app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(
-        app.pages.changes.viewer.diff_scroll,
+        app.pages.changes.viewer.diff_scroll.row(),
         app.changesNavigationView().selectedDiffCursorOffset().?,
     );
 }
@@ -4049,12 +4057,12 @@ test "diff wheel steps to both content edges in long and short viewports" {
                 var expected = rows / 2;
                 app.pages.changes.viewer.diff_cursor = view.selectedCoordinateAtOffset(expected).?;
                 const scroll = if (direction == .up) 0 else max_scroll;
-                app.pages.changes.viewer.diff_scroll = scroll;
+                app.pages.changes.viewer.diff_scroll = .{ .logical = scroll };
                 for (0..rows + 2) |_| {
                     expected = if (direction == .up) expected -| 1 else @min(expected + 1, rows - 1);
                     app.controller().scrollDiff(direction);
                     try std.testing.expectEqual(expected, view.selectedDiffCursorOffset().?);
-                    try std.testing.expectEqual(scroll, app.pages.changes.viewer.diff_scroll);
+                    try std.testing.expectEqual(scroll, app.pages.changes.viewer.diff_scroll.row());
                 }
             }
         }
@@ -4073,7 +4081,7 @@ test "diff row movement continues from wheel-synced visible cursor" {
         .terminal_size = .{ .width = 140, .height = 15 },
     };
     const line_count = app.changesNavigationView().selectedFileLineIndex(app.changesNavigationView().effectiveDisplayMode()).lineCount();
-    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     app.pages.changes.viewer.diff_cursor = app.changesNavigationView().selectedCoordinateAtOffset(line_count - 1) orelse return error.ExpectedCoordinate;
 
     app.changesNavigation().scrollDiff(.down);
@@ -4159,7 +4167,7 @@ test "diff scroll cursor sync keeps search state" {
             .viewer = .{
                 .display_mode = .unified,
                 .sidebar_hidden = true,
-                .diff_scroll = 12,
+                .diff_scroll = .{ .logical = 12 },
                 .diff_cursor = .{ .hunk_header = 0 },
             },
         } },
@@ -4225,8 +4233,8 @@ test "mode change resyncs search match to rendered body offsets" {
 
     try expectSearchCoordinate(&app, .{ .hunk_line = .{ .hunk_index = 1, .line_index = 2 } });
     try std.testing.expectEqual(@as(?usize, 7), app.pages.changes.search.match_offset);
-    try std.testing.expect(app.pages.changes.search.match_offset.? >= app.pages.changes.viewer.diff_scroll);
-    try std.testing.expect(app.pages.changes.search.match_offset.? < app.pages.changes.viewer.diff_scroll + app.changesNavigationView().diffVisibleRows());
+    try std.testing.expect(app.pages.changes.search.match_offset.? >= app.pages.changes.viewer.diff_scroll.row());
+    try std.testing.expect(app.pages.changes.search.match_offset.? < app.pages.changes.viewer.diff_scroll.row() + app.changesNavigationView().diffVisibleRows());
 }
 
 test "mode change keeps search near later matches" {
@@ -4496,7 +4504,7 @@ test "body file navigation preserves boundaries and resets only a successful mov
         setFileSearchInput(&app, "retained file filter");
         app.changesNavigation().refreshSearchForSelectedFile(allocator);
         const token = try installDisplayedCompletedSelection(&app, allocator);
-        app.pages.changes.viewer.diff_scroll = 3;
+        app.pages.changes.viewer.diff_scroll = .{ .logical = 3 };
         app.pages.changes.viewer.diff_horizontal_scroll = 7;
         const before = app.view().displayNavigationSnapshot();
         var adapter = app.controller().updateAdapter();
@@ -4512,7 +4520,7 @@ test "body file navigation preserves boundaries and resets only a successful mov
         try std.testing.expect(moved.explicit_sidebar_selection_changed);
         try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
         try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
-        try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
         try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_horizontal_scroll);
         try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
         try std.testing.expectEqual(mode, app.pages.changes.viewer.display_mode);
@@ -4602,7 +4610,7 @@ test "file change resyncs retained search query to selected file" {
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try expectSearchCoordinate(&app, .{ .metadata = 0 });
     try std.testing.expectEqual(@as(?usize, 0), app.pages.changes.search.match_offset);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
 }
 
 test "sidebar navigation can select directories without changing selected file" {
@@ -5136,7 +5144,7 @@ test "changes transition exact reveal expands only target ancestors and selects 
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 3,
                 .focus = .diff,
-                .diff_scroll = 8,
+                .diff_scroll = .{ .logical = 8 },
                 .diff_horizontal_scroll = 3,
                 .sidebar_horizontal_scroll = 2,
                 .diff_cursor = .{ .hunk_header = 0 },
@@ -5167,7 +5175,7 @@ test "changes transition exact reveal expands only target ancestors and selects 
     try std.testing.expectEqual(@as(?usize, 4), loaded.visibleNodeAt(3));
     try std.testing.expectEqual(@as(usize, 4), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.sidebar_horizontal_scroll);
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
@@ -5215,12 +5223,12 @@ test "changes transition exact reveal selects status-only and reports unchanged"
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expectEqual(diff_render.DisplayMode.unified, app.pages.changes.viewer.display_mode);
 
-    app.pages.changes.viewer.diff_scroll = 9;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 9 };
     try expectExactPathRevealUnchanged(
         try app.changesNavigation().revealExactPath(std.testing.allocator, exactChangesIntent(&app, "new.zig")),
         1,
     );
-    try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 9), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(context.SelectedTarget{ .status_only = 0 }, app.pages.changes.viewer.selected_target.?);
 }
 
@@ -5302,7 +5310,7 @@ test "changes transition unavailable exact reveal preserves navigation folds and
             .viewer = .{
                 .selected_target = .{ .diff_file = 1 },
                 .selected_node = 2,
-                .diff_scroll = 6,
+                .diff_scroll = .{ .logical = 6 },
                 .diff_horizontal_scroll = 2,
                 .diff_cursor = .{ .metadata = 1 },
             },
@@ -5323,7 +5331,7 @@ test "changes transition unavailable exact reveal preserves navigation folds and
     try std.testing.expect(app.pages.changes.review_display.hide_reviewed_files);
     try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 6), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expect(std.meta.eql(
         diff_view_model.BodyCoordinate{ .metadata = 1 },
@@ -5340,7 +5348,7 @@ test "changes transition exact reveal allocation failure rolls back before ances
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 1,
                 .focus = .diff,
-                .diff_scroll = 7,
+                .diff_scroll = .{ .logical = 7 },
                 .diff_horizontal_scroll = 4,
                 .sidebar_horizontal_scroll = 3,
                 .diff_cursor = .{ .hunk_header = 0 },
@@ -5374,7 +5382,7 @@ test "changes transition exact reveal allocation failure rolls back before ances
     try std.testing.expectEqual(visible_before, loaded.visibleNodeCount());
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 0 }, app.pages.changes.viewer.selected_target.?);
-    try std.testing.expectEqual(@as(usize, 7), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 7), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 4), app.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.sidebar_horizontal_scroll);
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
@@ -5803,10 +5811,10 @@ test "generated preview uses metadata cursor rows and ignores hunk movement" {
         app.visibleDiffCursorOffset(),
     );
 
-    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     app.pages.changes.viewer.diff_cursor = .{ .metadata = 0 };
     app.changesNavigation().scrollDiff(.down);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll.row());
     // The cursor stays on the first visible row after scrolling.
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .metadata = 1 }, app.pages.changes.viewer.diff_cursor);
 }

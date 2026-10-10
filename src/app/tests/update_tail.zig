@@ -369,7 +369,7 @@ test "repo switch clears pending reload anchor" {
                     .visible_sidebar_row = 0,
                     .diff_cursor = .{ .metadata = 0 },
                     .diff_cursor_offset = 0,
-                    .diff_scroll = 0,
+                    .diff_scroll = .{ .logical = 0 },
                     .diff_horizontal_scroll = 0,
                     .sidebar_horizontal_scroll = 0,
                     .search_coordinate = null,
@@ -1241,7 +1241,7 @@ test "changes repository transition unavailable path is not replayed after reloa
                     .selected_target = .{ .diff_file = 0 },
                     .selected_node = 0,
                     .diff_cursor = .{ .metadata = 0 },
-                    .diff_scroll = 5,
+                    .diff_scroll = .{ .logical = 5 },
                 },
             },
             .repository = .{

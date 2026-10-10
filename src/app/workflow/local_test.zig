@@ -866,7 +866,7 @@ test "selectedHunkUnstageTarget requires a visible session-staged hunk" {
         else => return error.ExpectedReadyHunkUnstageTarget,
     }
 
-    app.pages.changes.viewer.diff_scroll = 100;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 100 };
     switch (app.changesOperations().selectedHunkUnstageTarget(std.testing.allocator)) {
         .offscreen_cursor => {},
         else => return error.ExpectedOffscreenHunkUnstageTarget,

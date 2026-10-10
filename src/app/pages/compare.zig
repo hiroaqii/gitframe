@@ -555,10 +555,10 @@ test "Compare activation and retained diff state are independent" {
     var state: ComparePageState = .{};
     defer state.deinit(allocator);
     const first = state.activate(9);
-    state.diff.viewer.diff_scroll = 7;
+    state.diff.viewer.diff_scroll = .{ .logical = 7 };
     state.deactivate();
     const second = state.activate(9);
     try std.testing.expect(first != second);
-    try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll.row());
     try std.testing.expectEqual(page.Id.compare, state.activation.currentIdentity().?.origin);
 }
