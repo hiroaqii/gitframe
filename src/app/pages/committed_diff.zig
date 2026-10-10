@@ -236,7 +236,7 @@ pub const State = struct {
     }
 
     pub fn resetAcceptedDisplayNavigation(self: *State) void {
-        self.viewer.diff_scroll = 0;
+        self.viewer.diff_scroll = .{ .logical = 0 };
         self.viewer.diff_horizontal_scroll = 0;
         self.viewer.sidebar_horizontal_scroll = 0;
         self.viewer.diff_cursor = .{ .metadata = 0 };
@@ -523,10 +523,10 @@ test "committed diff state owns shared navigation without page target authority"
         .current_target = null,
         .live_drag_deferred_source = false,
     });
-    surface.viewer.diff_scroll = 7;
+    surface.viewer.diff_scroll = .{ .logical = 7 };
     surface.search.mode = true;
 
-    try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll.row());
     try std.testing.expect(state.search.mode);
     try std.testing.expect(surface.viewer == &state.viewer);
 }
@@ -602,6 +602,8 @@ test "committed diff exact reload preserves folds selection pin and indexes for 
     for (cases) |case| {
         var state: State = .{};
         defer state.deinit(allocator);
+        try std.testing.expect(!state.viewer.view_options.line_wrap);
+        state.viewer.view_options.line_wrap = true;
 
         var initial: app_load.CommittedDiffBundle = .{ .loaded = try app_load.buildLoadedBundle(allocator, patch) };
         defer initial.deinit();
@@ -687,6 +689,7 @@ test "committed diff exact reload preserves folds selection pin and indexes for 
         const clipboard_after = try state.completed_selection.?.clipboardText(allocator);
         defer allocator.free(clipboard_after);
         try std.testing.expectEqualStrings(clipboard_before, clipboard_after);
+        try std.testing.expect(state.viewer.view_options.line_wrap);
 
         transferred.setHunkFolded(0, 1, false);
         const unfolded_unified_rows = transferred.renderedLineIndex(0, .unified).lineCount();
@@ -750,5 +753,8 @@ test "committed diff exact reload preserves folds selection pin and indexes for 
         );
         try std.testing.expect(state.completed_selection == null);
         try std.testing.expect(state.pinned_selection_basis == null);
+        try std.testing.expect(state.viewer.view_options.line_wrap);
+        state.deinit(allocator);
+        try std.testing.expect(!state.viewer.view_options.line_wrap);
     }
 }

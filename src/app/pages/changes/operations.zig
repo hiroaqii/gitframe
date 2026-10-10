@@ -958,9 +958,10 @@ test "Changes raw hunk bytes reach and leave the Git index without collateral ch
         new: []const u8,
         worktree: ?[]const u8 = null,
         textconv: bool = false,
+        wrap: bool = false,
     };
     const cases = [_]Case{
-        .{ .old = "old\n", .new = "new\n" },
+        .{ .old = "old" ** 180 ++ "\n", .new = "new\n", .wrap = true },
         .{ .old = "old\r\n", .new = "new\r\n" },
         .{ .old = "same\r\nold\n", .new = "same\r\nnew\r\n" },
         .{ .old = "old", .new = "new" },
@@ -1030,6 +1031,19 @@ test "Changes raw hunk bytes reach and leave the Git index without collateral ch
         try page.git_status.replace("/repo", &status);
         acceptTestSource(&page);
         const view = testView(&page, .unstaged);
+        if (case.wrap) {
+            page.viewer.sidebar_hidden = true;
+            page.viewer.view_options.line_wrap = true;
+            page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
+            const nav: navigation.Controller = .{ .page = &page, .repo_root = "/repo", .source = .unstaged, .layout = .{ .width = 100, .height = 10 }, .diagnostics = .{ .target = &page.status } };
+            nav.moveDiffCursorPage(.down);
+            try std.testing.expect(page.viewer.diff_scroll == .wrapped);
+            try std.testing.expect(page.viewer.diff_scroll.wrapped.anchor.byte > 0);
+            var adapter = nav.updateAdapter();
+            var reflow = try adapter.shared().apply(allocator, .toggle_display_mode);
+            defer reflow.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 0), nav.view().selectedHunkIndex().?);
+        }
         const stage = view.selectedHunkStageTarget(allocator);
         try std.testing.expect(stage == .ready);
         defer allocator.free(stage.ready.patch);

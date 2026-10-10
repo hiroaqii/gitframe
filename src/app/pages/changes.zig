@@ -438,8 +438,8 @@ test "diffSurface adapter exposes shared field pointers without copying" {
     try std.testing.expectEqual(surface.source, narrowed.source);
     try std.testing.expectEqual(surface.layout, narrowed.layout);
 
-    surface.viewer.diff_scroll = 7;
-    try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll);
+    surface.viewer.diff_scroll = .{ .logical = 7 };
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.diff_scroll.row());
 
     state.pending_reload = .{
         .generation = 1,
@@ -451,7 +451,7 @@ test "diffSurface adapter exposes shared field pointers without copying" {
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .metadata = 0 },
             .diff_cursor_offset = null,
-            .diff_scroll = 0,
+            .diff_scroll = .{ .logical = 0 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -516,7 +516,7 @@ test "ChangesPageState initializes reload policy and owns lifecycle cleanup" {
             .visible_sidebar_row = 3,
             .diff_cursor = .{ .metadata = 0 },
             .diff_cursor_offset = null,
-            .diff_scroll = 0,
+            .diff_scroll = .{ .logical = 0 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -533,7 +533,7 @@ test "ChangesPageState initializes reload policy and owns lifecycle cleanup" {
             .visible_sidebar_row = 4,
             .diff_cursor = .{ .metadata = 0 },
             .diff_cursor_offset = null,
-            .diff_scroll = 1,
+            .diff_scroll = .{ .logical = 1 },
             .diff_horizontal_scroll = 2,
             .sidebar_horizontal_scroll = 3,
             .search_coordinate = null,
@@ -545,7 +545,7 @@ test "ChangesPageState initializes reload policy and owns lifecycle cleanup" {
             .visible_sidebar_row = 5,
             .diff_cursor = .{ .metadata = 0 },
             .diff_cursor_offset = null,
-            .diff_scroll = 4,
+            .diff_scroll = .{ .logical = 4 },
             .diff_horizontal_scroll = 5,
             .sidebar_horizontal_scroll = 6,
             .search_coordinate = null,

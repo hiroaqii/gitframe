@@ -369,7 +369,7 @@ test "repo switch clears pending reload anchor" {
                     .visible_sidebar_row = 0,
                     .diff_cursor = .{ .metadata = 0 },
                     .diff_cursor_offset = 0,
-                    .diff_scroll = 0,
+                    .diff_scroll = .{ .logical = 0 },
                     .diff_horizontal_scroll = 0,
                     .sidebar_horizontal_scroll = 0,
                     .search_coordinate = null,
@@ -1049,9 +1049,9 @@ test "Repository source wheel redraw preserves semantic and pointer owners" {
         .inert => return error.ExpectedRepositorySource,
     };
     app.pages.repository.viewer.source_cursor = source.rowCount() - 1;
-    app.pages.repository.viewer.source_vertical_scroll = std.math.maxInt(usize);
+    app.pages.repository.viewer.source_vertical_scroll.line = std.math.maxInt(usize);
     app.pages.repository.clampForBodySize(body_size);
-    const bottom = app.pages.repository.viewer.source_vertical_scroll;
+    const bottom = app.pages.repository.viewer.source_vertical_scroll.line;
     try std.testing.expect(bottom > 0);
 
     const wheel_down: App.Msg = .{ .repository = .mouse_source_wheel_down };
@@ -1079,14 +1079,14 @@ test "Repository source wheel redraw preserves semantic and pointer owners" {
     const token = repositoryContentTokenForTest(&app.pages.repository);
     app.pages.repository.viewer.focus = .source;
     app.pages.repository.viewer.source_cursor = 3;
-    app.pages.repository.viewer.source_vertical_scroll = bottom - 1;
+    app.pages.repository.viewer.source_vertical_scroll.line = bottom - 1;
     app.pages.repository.selection_owner = .{ .source = repository_selection.DragSelection.initKeyboardLine(token, 3) };
     const endpoint_before = app.pages.repository.selection_owner.activeKeyboardLineSelection().?.focus;
 
     ctx.resetTransient();
     try app.update(wheel_down, &ctx.ctx);
     try std.testing.expect(!ctx.redrawSuppressed());
-    try std.testing.expectEqual(bottom, app.pages.repository.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(bottom, app.pages.repository.viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 3), app.pages.repository.viewer.source_cursor);
     try std.testing.expect(std.meta.eql(endpoint_before, app.pages.repository.selection_owner.activeKeyboardLineSelection().?.focus));
     try std.testing.expect(app.pages.repository.selection_owner.activeKeyboardLineSelection().?.token.eql(token));
@@ -1241,7 +1241,7 @@ test "changes repository transition unavailable path is not replayed after reloa
                     .selected_target = .{ .diff_file = 0 },
                     .selected_node = 0,
                     .diff_cursor = .{ .metadata = 0 },
-                    .diff_scroll = 5,
+                    .diff_scroll = .{ .logical = 5 },
                 },
             },
             .repository = .{

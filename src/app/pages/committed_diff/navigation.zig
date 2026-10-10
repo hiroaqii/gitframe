@@ -397,7 +397,7 @@ test "search unfold mapping cleanup clears retained selection and pin for Compar
         );
         state.viewer.selected_target = .{ .diff_file = 0 };
         state.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } };
-        state.viewer.diff_scroll = 1;
+        state.viewer.diff_scroll = .{ .logical = 1 };
         const loaded = switch (state.load.state) {
             .loaded => |*session| &session.loaded,
             else => return error.ExpectedLoadedDiff,
@@ -451,7 +451,7 @@ test "search unfold mapping cleanup clears retained selection and pin for Compar
         try std.testing.expect(state.completed_selection == null);
         try std.testing.expect(state.pinned_selection_basis == null);
         try std.testing.expectEqual(revision + 1, state.selection_layout_revision);
-        try std.testing.expectEqual(body.view().restoreSelectionViewportAnchor(viewport), state.viewer.diff_scroll);
+        try std.testing.expectEqual(body.view().restoreSelectionViewportAnchor(viewport), state.viewer.diff_scroll.row());
 
         state.completed_selection = try diff_surface.selection.buildParsedFolded(
             allocator,

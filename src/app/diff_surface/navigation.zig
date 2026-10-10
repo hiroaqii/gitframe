@@ -23,6 +23,7 @@ const file_tree = @import("../../file_tree.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
 const sidebar_view_model = @import("../../sidebar/view_model.zig");
 const text_projection = @import("chasen_ui").text_projection;
+const line_wrap = @import("../../line_wrap.zig");
 const selection_action = @import("selection_action.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;
@@ -30,6 +31,19 @@ const HorizontalDirection = app_direction.Horizontal;
 const SizeDirection = app_direction.Size;
 const VerticalDirection = app_direction.Vertical;
 const review_tab_width: usize = 4;
+
+const VisualPosition = struct { row: usize, fragment: usize = 0 };
+
+/// Temporary value-only source anchor. The existing selection mapping remains
+/// the fallback; only the viewport position carries an intra-row source token.
+pub const ViewportAnchor = struct {
+    semantic_source: selection_action.SemanticSource,
+    source_offset_fallback: usize,
+    raw_presentation_scroll: usize,
+    basis: selection_action.ViewportBasis,
+    position: diff_surface.ViewportPosition = .{ .logical = 0 },
+    target: ?context.SelectedTarget = null,
+};
 
 pub const ParsedSelectionTarget = diff_surface.body_resolver.ParsedSelectionTarget;
 
@@ -59,9 +73,35 @@ pub const ParsedMouseLine = struct {
 /// painter. Page adapters may interpret tokens, but shared diff geometry stays
 /// authoritative.
 pub const PresentationCellHit = union(enum) {
-    source: struct { source_offset: usize, local_col: u16 },
+    source: struct { source_offset: usize, local_col: u16, wrap_row: usize = 0 },
     card: struct { token: usize, local_row: usize, local_col: u16 },
     spacer: struct { local_col: u16 },
+};
+
+const WrapLayout = struct {
+    visible_rows: usize,
+    target_screen_row: ?usize,
+    used_rows: usize = 0,
+    hit: ?struct {
+        offset: usize,
+        wrap_row: usize,
+    } = null,
+    first_fragment: usize = 0,
+
+    /// Returns false once the pane is full.
+    fn add(self: *WrapLayout, offset: usize, height: usize) bool {
+        const skip = if (self.used_rows == 0) self.first_fragment else 0;
+        const visible_height = height -| skip;
+        if (self.target_screen_row) |target| {
+            if (target >= self.used_rows and target - self.used_rows < visible_height) {
+                self.hit = .{ .offset = offset, .wrap_row = target - self.used_rows + skip };
+            }
+        }
+
+        self.used_rows +|= visible_height;
+
+        return self.used_rows < self.visible_rows;
+    }
 };
 
 pub const KeyboardLineHit = struct {
@@ -107,29 +147,41 @@ pub const ResidualSelectionOwner = struct {
 
 /// Allocator-bound transaction used by every in-place change to the source-row
 /// mapping. The viewport is captured while the old mapping is still live; all
-/// selection owners are retired before mutation; completion advances exactly
+/// live borrows are retired before mutation; completion advances exactly
 /// one layout revision and restores the semantic viewport in the new mapping.
 pub const SelectionMappingCleanup = struct {
     allocator: std.mem.Allocator,
     residual_owner: ?ResidualSelectionOwner = null,
 
     pub const Prepared = struct {
-        viewport: ?selection_action.SelectionViewportAnchor,
+        viewport: ?ViewportAnchor,
+        retained_token: ?diff_surface.ContentToken = null,
     };
 
     pub fn prepare(self: SelectionMappingCleanup, body: BodyController) Prepared {
         const viewport = body.captureSelectionViewportAnchor();
+        const retained_token = if (body.view().lineWrapActive() and body.view().retainedSelectionPresentation() != null) body.view().currentContentToken() else null;
         body.controller.clearDiffSelection();
-        if (body.controller.surface.completed_selection.*) |*completed| {
+        if (retained_token == null) if (body.controller.surface.completed_selection.*) |*completed| {
             completed.deinit(self.allocator);
             body.controller.surface.completed_selection.* = null;
-        }
-        if (self.residual_owner) |owner| owner.clear();
-        return .{ .viewport = viewport };
+        };
+        if (retained_token == null) if (self.residual_owner) |owner| owner.clear();
+        return .{ .viewport = viewport, .retained_token = retained_token };
     }
 
-    pub fn complete(_: SelectionMappingCleanup, body: BodyController, prepared: Prepared) void {
+    pub fn complete(self: SelectionMappingCleanup, body: BodyController, prepared: Prepared) void {
         body.controller.advanceSelectionLayoutRevision();
+        if (prepared.retained_token) |old_token| if (body.controller.surface.completed_selection.*) |*completed| {
+            const current = body.view().currentContentToken();
+            if (current != null and old_token.eql(current.?) and prepared.viewport != null and std.meta.eql(prepared.viewport.?.target, body.controller.surface.viewer.selected_target)) {
+                completed.selection_layout_revision = body.controller.surface.selection_layout_revision.*;
+            } else {
+                completed.deinit(self.allocator);
+                body.controller.surface.completed_selection.* = null;
+                if (self.residual_owner) |owner| owner.clear();
+            }
+        };
         if (prepared.viewport) |anchor| body.restoreSelectionViewportAnchor(anchor);
     }
 };
@@ -398,7 +450,7 @@ pub const BodyView = struct {
                     parsed.range.end.line_index >= target.file.hunks[parsed.range.end.hunk_index].lines.len) break :blk null;
 
                 break :blk switch (parsed.content) {
-                    .source_side => |source| if (self.view.effectiveDisplayMode() != .side_by_side) null else .{
+                    .source_side => |source| if (!self.lineWrapActive() and self.view.effectiveDisplayMode() != .side_by_side) null else .{
                         .view = .{
                             .identity = target.identity,
                             .content = .{ .source_side = .{ .side = source.side, .mode = source.mode } },
@@ -407,7 +459,7 @@ pub const BodyView = struct {
                         },
                         .line_count = source.fragments.line_count,
                     },
-                    .unified_diff => |unified| if (self.view.effectiveDisplayMode() != .unified) null else .{
+                    .unified_diff => |unified| if (!self.lineWrapActive() and self.view.effectiveDisplayMode() != .unified) null else .{
                         .view = .{
                             .identity = target.identity,
                             .content = .unified_diff,
@@ -426,7 +478,7 @@ pub const BodyView = struct {
                 const source_rows = body.source.rowCount();
                 if (generated.range.start.line_index >= source_rows or generated.range.end.line_index >= source_rows) break :blk null;
                 break :blk switch (generated.content) {
-                    .source_side => |source| if (self.view.effectiveDisplayMode() != .side_by_side) null else .{
+                    .source_side => |source| if (!self.lineWrapActive() and self.view.effectiveDisplayMode() != .side_by_side) null else .{
                         .view = .{
                             .identity = .{ .generated_file = .{ .path_key = body.path } },
                             .content = .{ .source_side = .{ .side = .new, .mode = source.mode } },
@@ -435,7 +487,7 @@ pub const BodyView = struct {
                         },
                         .line_count = source.fragment.line_count,
                     },
-                    .unified_diff => |unified| if (self.view.effectiveDisplayMode() != .unified) null else .{
+                    .unified_diff => |unified| if (!self.lineWrapActive() and self.view.effectiveDisplayMode() != .unified) null else .{
                         .view = .{
                             .identity = .{ .generated_file = .{ .path_key = body.path } },
                             .content = .unified_diff,
@@ -522,7 +574,189 @@ pub const BodyView = struct {
     }
 
     pub fn renderDiffScroll(self: BodyView) usize {
-        return self.view.surface.viewer.diff_scroll;
+        return self.view.surface.viewer.diff_scroll.row();
+    }
+
+    pub fn renderWrapStart(self: BodyView) usize {
+        return if (self.lineWrapActive()) self.visualPosition().fragment else 0;
+    }
+
+    const Row = struct {
+        body: diff_view_model.BodyRow,
+        old: ?diff_view_model.BodyCoordinate = null,
+        new: ?diff_view_model.BodyCoordinate = null,
+    };
+
+    fn rowAt(self: BodyView, offset: usize) ?Row {
+        const mode = self.view.effectiveDisplayMode();
+        if (self.generatedBody()) |body| {
+            const text = body.source.lineBody(offset) orelse return null;
+            return .{ .body = diff_render.generatedBodyRow(.{ .kind = .added, .text = text }, mode) };
+        }
+        const file = self.displayedDiffFile() orelse return null;
+        const index = self.displayedDiffLineIndex(mode);
+        var rows = if (index) |value|
+            diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, value, offset, self.selectedFoldedHunks())
+        else
+            diff_view_model.BodyRowIterator.initWithFolded(file, mode, self.selectedFoldedHunks());
+        if (index == null) {
+            for (0..offset) |_| _ = rows.next() orelse return null;
+        }
+        const body = rows.next() orelse return null;
+        var result: Row = .{ .body = body };
+        const hunk = rows.currentHunkIndex() orelse return result;
+        if (rows.currentUnifiedLineIndex()) |line| {
+            const coordinate: diff_view_model.BodyCoordinate = .{ .hunk_line = .{ .hunk_index = hunk, .line_index = line } };
+            if (body.unified_line.kind != .added) result.old = coordinate;
+            if (body.unified_line.kind != .removed) result.new = coordinate;
+        } else if (rows.currentSideBySideRow()) |pair| switch (pair) {
+            .single => |line| {
+                const coordinate: diff_view_model.BodyCoordinate = .{ .hunk_line = .{ .hunk_index = hunk, .line_index = line.line_index } };
+                if (line.line.kind != .added) result.old = coordinate;
+                if (line.line.kind != .removed) result.new = coordinate;
+            },
+            .paired => |lines| {
+                if (lines.removed) |line| result.old = .{ .hunk_line = .{ .hunk_index = hunk, .line_index = line.line_index } };
+                if (lines.added) |line| result.new = .{ .hunk_line = .{ .hunk_index = hunk, .line_index = line.line_index } };
+            },
+        };
+        return result;
+    }
+
+    fn fragments(self: BodyView, row: Row, side: diff_selection.Side) ?line_wrap.Iterator {
+        const text = switch (row.body) {
+            .unified_line => |line| if ((side == .old and line.kind != .added) or (side == .new and line.kind != .removed)) line.text else return null,
+            .side_by_side => |sides| switch (sides) {
+                .single => |line| if ((side == .old and line.kind != .added) or (side == .new and line.kind != .removed)) line.text else return null,
+                .paired => |pair| if (if (side == .old) pair.removed else pair.added) |line| line.text else return null,
+            },
+            else => return null,
+        };
+        const width = diff_render.bodyWidth(self.view.diffPaneWidth());
+        const mode = self.view.effectiveDisplayMode();
+        const panes = diff_render.sideBySideGeometry(width);
+        const pane_width = if (mode == .unified) width else if (side == .old) panes.old.width else panes.new.width;
+        const projection = text_projection.Projection.init(text, .{ .tab_width = review_tab_width }) catch return null;
+        return line_wrap.Iterator.init(projection, pane_width -| diff_render.lineTextStart(self.view.surface.viewer.view_options.line_numbers, if (mode == .unified) .unified else .side_by_side));
+    }
+
+    fn fragmentAt(self: BodyView, row: Row, side: diff_selection.Side, ordinal: usize) ?line_wrap.Fragment {
+        var iterator = self.fragments(row, side) orelse return null;
+        for (0..ordinal) |_| _ = iterator.next() orelse return null;
+        return iterator.next();
+    }
+
+    fn rowHeight(self: BodyView, offset: usize) usize {
+        const row = self.rowAt(offset) orelse return 1;
+        return diff_render.wrappedRowHeight(row.body, diff_render.bodyWidth(self.view.diffPaneWidth()), self.view.surface.viewer.view_options.line_numbers);
+    }
+
+    fn fragmentForAnchor(self: BodyView, row: Row, anchor: diff_surface.WrapAnchor) usize {
+        const side = anchor.side orelse return 0;
+        var iterator = self.fragments(row, side) orelse return 0;
+        if (iterator.width == 0) return 0;
+        var tokens = iterator.tokens;
+        var cell: usize = 0;
+        while (tokens.next()) |token| {
+            cell = token.cell_end;
+            if (token.byte_end > anchor.byte) {
+                cell = token.cell_start + @min(anchor.tab_cell, token.cell_end - token.cell_start);
+                break;
+            }
+        }
+        var ordinal: usize = 0;
+        var last: usize = 0;
+        while (iterator.next()) |fragment| : (ordinal += 1) {
+            last = ordinal;
+            if (cell < fragment.cells.end) return ordinal;
+        }
+        return last;
+    }
+
+    fn boundWrapAnchor(self: BodyView) ?diff_surface.WrapAnchor {
+        const position = self.view.surface.viewer.diff_scroll;
+        if (position != .wrapped) return null;
+        const token = self.currentContentToken() orelse return null;
+        if (!std.meta.eql(position.wrapped.target, self.view.surface.viewer.selected_target) or !position.wrapped.content.eql(token)) return null;
+        return position.wrapped.anchor;
+    }
+
+    fn visualPosition(self: BodyView) VisualPosition {
+        const row = @min(self.view.surface.viewer.diff_scroll.row(), self.sourceDiffLineCount() -| 1);
+        const anchor = self.boundWrapAnchor() orelse return .{ .row = row };
+        return .{ .row = row, .fragment = self.fragmentForAnchor(self.rowAt(row) orelse return .{ .row = row }, anchor) };
+    }
+
+    fn positionAt(self: BodyView, position: VisualPosition) diff_surface.ViewportPosition {
+        if (!self.lineWrapActive()) return .atRow(position.row);
+        const token = self.currentContentToken() orelse return .atRow(position.row);
+        const row = self.rowAt(position.row) orelse return .atRow(position.row);
+        var anchor: diff_surface.WrapAnchor = .{};
+        const side: diff_selection.Side = if (self.fragmentAt(row, .new, position.fragment) != null) .new else .old;
+        if (self.fragmentAt(row, side, position.fragment)) |fragment| {
+            anchor.side = side;
+            anchor.byte = fragment.bytes.start;
+            var tokens = fragment.tokens;
+            if (tokens.next()) |first| {
+                anchor.byte = first.byte_start;
+                anchor.tab_cell = fragment.cells.start -| first.cell_start;
+            }
+        }
+        return .{ .wrapped = .{ .row = position.row, .target = self.view.surface.viewer.selected_target, .content = token, .anchor = anchor } };
+    }
+
+    fn stepVisual(self: BodyView, start: VisualPosition, direction: VerticalDirection, count: usize) VisualPosition {
+        var position = start;
+        var remaining = count;
+        const rows = self.sourceDiffLineCount();
+        if (rows == 0) return .{ .row = 0 };
+        while (remaining > 0) switch (direction) {
+            .up => {
+                const step = @min(remaining, position.fragment);
+                position.fragment -= step;
+                remaining -= step;
+                if (remaining == 0 or position.row == 0) break;
+                position.row -= 1;
+                position.fragment = self.rowHeight(position.row) - 1;
+                remaining -= 1;
+            },
+            .down => {
+                const last = self.rowHeight(position.row) - 1;
+                const step = @min(remaining, last -| position.fragment);
+                position.fragment += step;
+                remaining -= step;
+                if (remaining == 0 or position.row + 1 >= rows) break;
+                position.row += 1;
+                position.fragment = 0;
+                remaining -= 1;
+            },
+        };
+        return position;
+    }
+
+    fn clampVisual(self: BodyView, position: VisualPosition) VisualPosition {
+        const last = self.sourceDiffLineCount() -| 1;
+        const maximum = self.stepVisual(.{ .row = last, .fragment = self.rowHeight(last) - 1 }, .up, self.view.diffVisibleRows() -| 1);
+        if (position.row > maximum.row or (position.row == maximum.row and position.fragment > maximum.fragment)) return maximum;
+        return position;
+    }
+
+    /// First visible fragment of a logical row. Passive markers never scroll.
+    pub fn screenRowForOffset(self: BodyView, offset: usize) ?usize {
+        if (!self.lineWrapActive()) {
+            const scroll = self.renderDiffScroll();
+            if (offset < scroll or offset - scroll >= self.view.diffVisibleRows()) return null;
+            return offset - scroll;
+        }
+        const start = self.visualPosition();
+        if (offset < start.row) return null;
+        var screen: usize = 0;
+        var row = start.row;
+        while (row <= offset and screen < self.view.diffVisibleRows()) : (row += 1) {
+            if (row == offset) return screen;
+            screen +|= self.rowHeight(row) -| if (row == start.row) start.fragment else @as(usize, 0);
+        }
+        return null;
     }
 
     pub fn renderDiffCursorOffset(self: BodyView) ?usize {
@@ -610,8 +844,20 @@ pub const BodyView = struct {
 
         const visible_body_row: usize = point.row - diff_render.body_start_row;
         if (visible_body_row >= self.view.diffVisibleRows()) return null;
-        const presentation_offset = self.view.surface.viewer.diff_scroll + visible_body_row;
         const source_rows = self.sourceDiffLineCount();
+
+        if (self.lineWrapActive()) {
+            const hit = self.wrapLayoutFrom(self.view.surface.viewer.diff_scroll.row(), visible_body_row).hit orelse return null;
+            return .{
+                .source = .{
+                    .source_offset = hit.offset,
+                    .local_col = local_col,
+                    .wrap_row = hit.wrap_row,
+                },
+            };
+        }
+
+        const presentation_offset = self.view.surface.viewer.diff_scroll.row() + visible_body_row;
         if (self.view.presentation_rows) |rows| {
             if (rows.source_rows != source_rows) return null;
             const mode = self.view.effectiveDisplayMode();
@@ -879,10 +1125,7 @@ pub const BodyView = struct {
             };
             const region = hit.region orelse return null;
             const model_mode = if (locked) |selection_value| selection_value.mode() else region.mode;
-            const point_value = if (region.leading_boundary)
-                diff_selection.pointFromBoundary(hit.hunk_index, hit.line_index, 0)
-            else
-                pointForTextCell(hit.hunk_index, hit.line_index, hit.line.text, model_mode, self.view.surface.viewer.diff_horizontal_scroll, region.text_cell) orelse return null;
+            const point_value = self.pointForBodyText(hit.hunk_index, hit.line_index, hit.line.text, model_mode, region, body_width, source.wrap_row) orelse return null;
             return .{
                 .identity = target.identity,
                 .content = .{ .source_side = .{ .side = region.side, .mode = model_mode } },
@@ -905,10 +1148,7 @@ pub const BodyView = struct {
         return .{
             .identity = .{ .generated_file = .{ .path_key = generated.path } },
             .content = .{ .source_side = .{ .side = .new, .mode = model_mode } },
-            .point = if (region.leading_boundary)
-                diff_selection.pointFromBoundary(0, offset, 0)
-            else
-                pointForTextCell(0, offset, line, model_mode, self.view.surface.viewer.diff_horizontal_scroll, region.text_cell) orelse return null,
+            .point = self.pointForBodyText(0, offset, line, model_mode, region, body_width, source.wrap_row) orelse return null,
         };
     }
 
@@ -917,7 +1157,101 @@ pub const BodyView = struct {
         return generated.source.rowCount();
     }
 
+    pub fn lineWrapActive(self: BodyView) bool {
+        return self.view.surface.viewer.view_options.line_wrap and self.view.presentation_rows == null;
+    }
+
+    pub fn diffVisibleLogicalRows(self: BodyView) usize {
+        const scroll = self.renderDiffScroll();
+        const visible_rows = self.view.diffVisibleRows();
+        if (visible_rows == 0 or !self.lineWrapActive()) return visible_rows;
+        const last = self.wrapLayoutFrom(scroll, visible_rows - 1).hit;
+        return if (last) |hit| hit.offset - scroll + 1 else self.sourceDiffLineCount() -| scroll;
+    }
+
+    fn pointForBodyText(self: BodyView, hunk_index: usize, line_index: usize, text: []const u8, mode: diff_selection.Mode, region: SelectionRegion, body_width: u16, wrap_row: usize) ?diff_selection.Point {
+        if (!self.lineWrapActive()) return if (region.leading_boundary)
+            diff_selection.pointFromBoundary(hunk_index, line_index, 0)
+        else
+            pointForTextCell(hunk_index, line_index, text, mode, self.view.surface.viewer.diff_horizontal_scroll, region.text_cell);
+
+        const geometry = diff_render.sideBySideGeometry(body_width);
+        const pane_width = switch (region.side) {
+            .old => geometry.old.width,
+            .new => geometry.new.width,
+        };
+        const text_col = diff_render.lineTextStart(self.view.surface.viewer.view_options.line_numbers, .side_by_side);
+        const projection = text_projection.Projection.init(text, .{ .tab_width = review_tab_width }) catch return null;
+        var wrapped = line_wrap.Iterator.init(projection, visibleTextWidth(pane_width, text_col));
+        for (0..wrap_row) |_| _ = wrapped.next() orelse return null;
+        const fragment = wrapped.next() orelse return null;
+        if (fragment.placeholder) return null;
+        if (mode == .line) return diff_selection.pointFromLine(hunk_index, line_index);
+        if (region.leading_boundary) return diff_selection.pointFromBoundary(hunk_index, line_index, fragment.bytes.start);
+        return switch (fragment.hitCell(region.text_cell) orelse return null) {
+            .token => |token| diff_selection.pointFromToken(hunk_index, line_index, token),
+            .boundary => |boundary| diff_selection.pointFromBoundary(hunk_index, line_index, boundary.byte_offset),
+        };
+    }
+
+    fn wrapLayoutFrom(self: BodyView, scroll: usize, target_screen_row: ?usize) WrapLayout {
+        const mode = self.view.effectiveDisplayMode();
+        const body_width = diff_render.bodyWidth(self.view.diffPaneWidth());
+        const line_numbers = self.view.surface.viewer.view_options.line_numbers;
+
+        var layout_value: WrapLayout = .{
+            .visible_rows = self.view.diffVisibleRows(),
+            .target_screen_row = target_screen_row,
+            .first_fragment = if (scroll == self.renderDiffScroll()) self.renderWrapStart() else 0,
+        };
+
+        if (self.generatedBody()) |body| {
+            var row_index = scroll;
+
+            while (row_index < body.source.rowCount()) : (row_index += 1) {
+                const line: diff_parser.DiffLine = .{ .kind = .added, .text = body.source.lineBody(row_index) orelse break };
+
+                if (!layout_value.add(row_index, diff_render.wrappedRowHeight(diff_render.generatedBodyRow(line, mode), body_width, line_numbers))) {
+                    break;
+                }
+            }
+
+            return layout_value;
+        }
+
+        const file = self.displayedDiffFile() orelse return layout_value;
+        const line_index = self.displayedDiffLineIndex(mode);
+
+        var rows =
+            if (line_index) |index|
+                diff_view_model.BodyRowIterator.initAtWithFolded(file, mode, index, scroll, self.selectedFoldedHunks())
+            else
+                diff_view_model.BodyRowIterator.initWithFolded(file, mode, self.selectedFoldedHunks());
+
+        var offset: usize =
+            if (line_index != null)
+                scroll
+            else
+                0;
+
+        while (rows.next()) |body_row| : (offset += 1) {
+            if (offset < scroll) {
+                continue;
+            }
+
+            if (!layout_value.add(offset, diff_render.wrappedRowHeight(body_row, body_width, line_numbers))) {
+                break;
+            }
+        }
+
+        return layout_value;
+    }
+
     pub fn visibleBodyTextMaxHorizontalScroll(self: BodyView) usize {
+        if (self.lineWrapActive()) {
+            return 0;
+        }
+
         const mode = self.view.effectiveDisplayMode();
         const visible_rows = self.view.diffVisibleRows();
         if (visible_rows == 0) return 0;
@@ -1134,23 +1468,37 @@ pub const BodyView = struct {
         };
     }
 
-    pub fn captureSelectionViewportAnchor(self: BodyView) ?selection_action.SelectionViewportAnchor {
-        if (self.selectionPresentation() == null) return null;
+    pub fn captureSelectionViewportAnchor(self: BodyView) ?ViewportAnchor {
+        if (!self.lineWrapActive() and self.selectionPresentation() == null) return null;
         const basis = self.selectionViewportBasis();
         if (basis.source_rows == 0) return null;
-        const source_anchor = self.sourceAnchorAtOrBeforePresentation(self.view.surface.viewer.diff_scroll) orelse return null;
+        const source_anchor = self.sourceAnchorAtOrBeforePresentation(self.view.surface.viewer.diff_scroll.row()) orelse return null;
         const position = selection_action.captureAnchorPosition(basis.source_rows, source_anchor);
+        const viewport = if (self.lineWrapActive())
+            if (self.boundWrapAnchor() != null) self.view.surface.viewer.diff_scroll else self.positionAt(self.visualPosition())
+        else
+            self.view.surface.viewer.diff_scroll;
+        var semantic = self.semanticSourceAtOffset(position.source_offset_fallback);
+        if (viewport == .wrapped) {
+            if (self.rowAt(position.source_offset_fallback)) |row| {
+                if (viewport.wrapped.anchor.side) |side| {
+                    if (if (side == .old) row.old else row.new) |coordinate| semantic = .{ .parsed = coordinate };
+                }
+            }
+        }
         return .{
-            .semantic_source = self.semanticSourceAtOffset(position.source_offset_fallback),
+            .semantic_source = semantic,
             .source_offset_fallback = position.source_offset_fallback,
-            .raw_presentation_scroll = self.view.surface.viewer.diff_scroll,
+            .raw_presentation_scroll = self.view.surface.viewer.diff_scroll.row(),
             .basis = basis,
+            .position = viewport,
+            .target = self.view.surface.viewer.selected_target,
         };
     }
 
-    pub fn restoreSelectionViewportAnchor(self: BodyView, anchor: selection_action.SelectionViewportAnchor) usize {
+    pub fn restoreSelectionViewportAnchor(self: BodyView, anchor: ViewportAnchor) usize {
         return selection_action.restoreViewportAnchor(
-            anchor,
+            .{ .semantic_source = anchor.semantic_source, .source_offset_fallback = anchor.source_offset_fallback, .raw_presentation_scroll = anchor.raw_presentation_scroll, .basis = anchor.basis },
             self.selectionViewportBasis(),
             if (self.resolveSemanticSource(anchor.semantic_source)) |source_offset|
                 self.sourceToPresentationOffset(source_offset)
@@ -1161,11 +1509,32 @@ pub const BodyView = struct {
         );
     }
 
+    pub fn restoredViewport(self: BodyView, anchor: ViewportAnchor, rebind_target: bool) diff_surface.ViewportPosition {
+        if (!self.lineWrapActive()) return .atRow(self.restoreSelectionViewportAnchor(anchor));
+        if (!rebind_target and !std.meta.eql(anchor.target, self.view.surface.viewer.selected_target)) return .atRow(0);
+        const row = self.resolveSemanticSource(anchor.semantic_source) orelse @min(anchor.source_offset_fallback, self.sourceDiffLineCount() -| 1);
+        if (anchor.position == .wrapped) {
+            const content = self.currentContentToken() orelse return .atRow(row);
+            if (anchor.position.wrapped.content.eql(content)) {
+                var saved = anchor.position.wrapped;
+                saved.row = row;
+                saved.target = self.view.surface.viewer.selected_target;
+                // Folded/non-text anchors have no source token.
+                if (self.rowAt(row)) |body| if (saved.anchor.side) |side| {
+                    if (self.fragments(body, side) == null) saved.anchor = .{};
+                };
+                return .{ .wrapped = saved };
+            }
+        }
+        return .atRow(row);
+    }
+
     pub fn visibleDiffCursorOffset(self: BodyView) ?usize {
         const offset = self.selectedDiffCursorPresentationOffset() orelse return null;
-        const visible_rows = self.view.diffVisibleRows();
-        if (offset < self.view.surface.viewer.diff_scroll) return null;
-        if (visible_rows == 0 or offset >= self.view.surface.viewer.diff_scroll + visible_rows) return null;
+        if (self.lineWrapActive()) return if (self.screenRowForOffset(offset) != null) offset else null;
+        const visible_rows = self.diffVisibleLogicalRows();
+        if (offset < self.view.surface.viewer.diff_scroll.row()) return null;
+        if (visible_rows == 0 or offset >= self.view.surface.viewer.diff_scroll.row() + visible_rows) return null;
         return offset;
     }
 
@@ -1246,7 +1615,7 @@ pub const Controller = struct {
         self.surface.completed_selection.* = null;
         if (anchor) |value| {
             const incoming = (BodyController{ .controller = self, .resolver = resolver }).view();
-            self.surface.viewer.diff_scroll = incoming.restoreSelectionViewportAnchor(value);
+            self.surface.viewer.diff_scroll = incoming.restoredViewport(value, false);
         }
     }
 
@@ -1372,12 +1741,15 @@ pub const Controller = struct {
     }
 
     pub fn scrollSearchMatchIntoView(self: Controller) void {
+        // This resolver-free legacy entry is used during passive shell reflow.
+        // Wrapped navigation is reconciled by BodyController, never by a marker.
+        if (self.surface.viewer.view_options.line_wrap) return;
         const offset = self.surface.search.match_offset orelse return;
         const visible_rows = self.view().diffVisibleRows();
-        if (offset < self.surface.viewer.diff_scroll) {
-            self.surface.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.surface.viewer.diff_scroll + visible_rows) {
-            self.surface.viewer.diff_scroll = offset + 1 - visible_rows;
+        if (offset < self.surface.viewer.diff_scroll.row()) {
+            self.surface.viewer.diff_scroll = .{ .logical = offset };
+        } else if (visible_rows > 0 and offset >= self.surface.viewer.diff_scroll.row() + visible_rows) {
+            self.surface.viewer.diff_scroll = .{ .logical = offset + 1 - visible_rows };
         }
     }
 
@@ -1463,22 +1835,24 @@ pub const BodyController = struct {
     }
 
     pub fn scrollSearchMatchIntoView(self: BodyController) void {
+        if (self.view().lineWrapActive()) return;
         const source_offset = self.controller.surface.search.match_offset orelse return;
         const offset = self.view().sourceToPresentationOffset(source_offset) orelse return;
-        const visible_rows = self.controller.view().diffVisibleRows();
-        if (offset < self.controller.surface.viewer.diff_scroll) {
-            self.controller.surface.viewer.diff_scroll = offset;
-        } else if (visible_rows > 0 and offset >= self.controller.surface.viewer.diff_scroll + visible_rows) {
-            self.controller.surface.viewer.diff_scroll = offset + 1 - visible_rows;
+        const visible_rows = self.view().diffVisibleLogicalRows();
+
+        if (offset < self.controller.surface.viewer.diff_scroll.row()) {
+            self.controller.surface.viewer.diff_scroll = .{ .logical = offset };
+        } else if (visible_rows > 0 and offset >= self.controller.surface.viewer.diff_scroll.row() + visible_rows) {
+            self.controller.surface.viewer.diff_scroll = .{ .logical = offset + 1 - visible_rows };
         }
     }
 
-    pub fn captureSelectionViewportAnchor(self: BodyController) ?selection_action.SelectionViewportAnchor {
+    pub fn captureSelectionViewportAnchor(self: BodyController) ?ViewportAnchor {
         return self.view().captureSelectionViewportAnchor();
     }
 
-    pub fn restoreSelectionViewportAnchor(self: BodyController, anchor: selection_action.SelectionViewportAnchor) void {
-        self.controller.surface.viewer.diff_scroll = self.view().restoreSelectionViewportAnchor(anchor);
+    pub fn restoreSelectionViewportAnchor(self: BodyController, anchor: ViewportAnchor) void {
+        self.controller.surface.viewer.diff_scroll = self.view().restoredViewport(anchor, false);
     }
 
     pub fn clearCompletedSelectionAfterCopy(
@@ -1717,9 +2091,9 @@ pub const BodyController = struct {
         }
 
         self.controller.surface.viewer.diff_scroll = if (anchor.selection_viewport) |selection_anchor|
-            self.view().restoreSelectionViewportAnchor(selection_anchor)
+            if (selected_same_path) self.view().restoredViewport(selection_anchor, true) else .atRow(anchor.diff_scroll.row())
         else
-            anchor.diff_scroll;
+            .atRow(anchor.diff_scroll.row());
         self.clampDiffNavigation();
         self.keepDiffCursorVisible();
         self.restoreSearchFromReloadAnchor(cleanup, anchor);
@@ -1763,6 +2137,7 @@ pub const BodyController = struct {
     }
 
     pub fn toggleSidebarVisibility(self: BodyController, cleanup: SelectionMappingCleanup) void {
+        const viewport = self.captureSelectionViewportAnchor();
         const previous_width = self.controller.view().diffPaneWidth();
         const previous_mode = self.controller.view().effectiveDisplayMode();
         var prospective = self.controller.surface.viewer.*;
@@ -1774,7 +2149,7 @@ pub const BodyController = struct {
         self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         if (previous_mode != self.controller.view().effectiveDisplayMode()) {
             cleanup.complete(self, prepared.?);
-        }
+        } else if (viewport) |anchor| self.restoreSelectionViewportAnchor(anchor);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
         self.scrollSearchMatchIntoView();
@@ -1782,6 +2157,7 @@ pub const BodyController = struct {
     }
 
     pub fn adjustSidebarWidth(self: BodyController, cleanup: SelectionMappingCleanup, direction: SizeDirection) void {
+        const viewport = self.captureSelectionViewportAnchor();
         const total_width = self.controller.surface.layout.width;
         const previous_width = self.controller.view().diffPaneWidth();
         const previous_mode = self.controller.view().effectiveDisplayMode();
@@ -1801,7 +2177,7 @@ pub const BodyController = struct {
         self.controller.resetDiffHorizontalScrollIfPaneWidthChanged(previous_width);
         if (previous_mode != self.controller.view().effectiveDisplayMode()) {
             cleanup.complete(self, prepared.?);
-        }
+        } else if (viewport) |anchor| self.restoreSelectionViewportAnchor(anchor);
         self.clampDiffNavigationKeepingHunkVisible();
         self.updateSearchMatchOffset();
         self.scrollSearchMatchIntoView();
@@ -1992,7 +2368,7 @@ pub const BodyController = struct {
 
         const old_scroll = self.controller.surface.viewer.diff_scroll;
         self.scrollDiffWithOrigin(if (step.direction == .up) .up else .down, .drag);
-        if (self.controller.surface.viewer.diff_scroll == old_scroll) return .content_edge;
+        if (std.meta.eql(self.controller.surface.viewer.diff_scroll, old_scroll)) return .content_edge;
 
         const endpoint: diff_surface.MousePoint = .{
             .col = step.endpoint.col,
@@ -2209,16 +2585,50 @@ pub const BodyController = struct {
         self.scrollDiffWithOrigin(direction, .pointer);
     }
 
+    fn scrollWrapped(self: BodyController, direction: VerticalDirection, count: usize) void {
+        const body = self.view();
+        const current = body.visualPosition();
+        const next = body.clampVisual(body.stepVisual(current, direction, count));
+        if (!std.meta.eql(current, next)) self.controller.surface.viewer.diff_scroll = body.positionAt(next);
+        if (body.diffCursorIsVisible() or body.view.diffVisibleRows() == 0) return;
+        const cursor = body.selectedDiffCursorOffset() orelse next.row;
+        const last = body.wrapLayoutFrom(next.row, body.view.diffVisibleRows() - 1).hit;
+        const target = if (cursor < next.row) next.row else if (last) |hit| hit.offset else body.sourceDiffLineCount() -| 1;
+        self.controller.surface.viewer.diff_cursor = body.selectedCoordinateAtOffset(target) orelse self.controller.surface.viewer.diff_cursor;
+    }
+
+    fn placeWrappedCursor(self: BodyController, offset: usize, placement: enum { visible, comfort, center }) void {
+        const body = self.view();
+        const height = body.view.diffVisibleRows();
+        if (height == 0) return;
+        const current = body.visualPosition();
+        const band = (cursor_viewport.Bounds{ .content_rows = body.sourceDiffLineCount(), .visible_rows = height }).comfortBand() orelse return;
+        const screen = body.screenRowForOffset(offset);
+        const first_visible = offset != current.row or current.fragment == 0;
+        if (placement == .comfort and first_visible) if (screen) |row| if (band.contains(row)) return;
+        const desired = switch (placement) {
+            .center => height / 2,
+            .visible => if (offset < current.row) @as(usize, 0) else height - 1,
+            .comfort => if (offset < current.row or (screen != null and screen.? < band.first)) band.first else band.last,
+        };
+        const position = body.clampVisual(body.stepVisual(.{ .row = offset }, .up, desired));
+        self.controller.surface.viewer.diff_scroll = body.positionAt(position);
+    }
+
     fn scrollDiffWithOrigin(self: BodyController, direction: VerticalDirection, origin: enum { pointer, drag }) void {
+        if (self.view().lineWrapActive()) {
+            self.scrollWrapped(direction, 1);
+            return;
+        }
         const bounds = self.diffCursorBounds();
-        const old_scroll = bounds.clampScroll(self.controller.surface.viewer.diff_scroll);
+        const old_scroll = bounds.clampScroll(self.controller.surface.viewer.diff_scroll.row());
         const old_cursor_offset = self.view().selectedDiffCursorPresentationOffset();
         const requested_scroll = switch (direction) {
             .up => old_scroll -| 1,
             .down => old_scroll +| 1,
         };
         const new_scroll = bounds.clampScroll(requested_scroll);
-        self.controller.surface.viewer.diff_scroll = new_scroll;
+        self.controller.surface.viewer.diff_scroll = .{ .logical = new_scroll };
         if (bounds.visible_rows == 0) return;
         if (old_scroll == new_scroll) {
             if (origin == .drag or self.controller.surface.selection_owner.activeKeyboardLineSelection()) return;
@@ -2236,7 +2646,8 @@ pub const BodyController = struct {
         }
 
         const target = cursor_viewport.retargetCursorAfterViewportScroll(
-            bounds,
+            // Wrapped row heights differ at the new scroll.
+            self.diffCursorBounds(),
             old_scroll,
             new_scroll,
             old_cursor_offset,
@@ -2286,12 +2697,14 @@ pub const BodyController = struct {
     }
 
     pub fn moveDiffCursorHalfPage(self: BodyController, direction: VerticalDirection) void {
-        const step = @max(self.controller.view().diffVisibleRows() / 2, 1);
+        if (self.view().lineWrapActive()) return self.scrollWrapped(direction, @max(self.view().view.diffVisibleRows() / 2, 1));
+        const step = @max(self.view().diffVisibleLogicalRows() / 2, 1);
         self.moveDiffCursorByDocumentStep(direction, step);
     }
 
     pub fn moveDiffCursorPage(self: BodyController, direction: VerticalDirection) void {
-        const step = @max(self.controller.view().diffVisibleRows(), 1);
+        if (self.view().lineWrapActive()) return self.scrollWrapped(direction, @max(self.view().view.diffVisibleRows(), 1));
+        const step = @max(self.view().diffVisibleLogicalRows(), 1);
         self.moveDiffCursorByDocumentStep(direction, step);
     }
 
@@ -2382,15 +2795,31 @@ pub const BodyController = struct {
     pub fn clampDiffNavigation(self: BodyController) void {
         if (self.view().resolvedTarget().kind == .inert) {
             self.controller.surface.viewer.diff_cursor = .{ .metadata = 0 };
-            self.controller.surface.viewer.diff_scroll = 0;
+            self.controller.surface.viewer.diff_scroll = .{ .logical = 0 };
             self.controller.surface.viewer.diff_horizontal_scroll = 0;
+            return;
+        }
+        if (self.view().lineWrapActive()) {
+            const body = self.view();
+            const current = body.visualPosition();
+            // A zero-width placeholder must not replace the saved token when
+            // bottom clamping temporarily compresses the whole document.
+            const hidden_text = if (body.boundWrapAnchor()) |anchor| blk: {
+                const side = anchor.side orelse break :blk false;
+                const row = body.rowAt(current.row) orelse break :blk false;
+                const iterator = body.fragments(row, side) orelse break :blk false;
+                break :blk iterator.width == 0;
+            } else false;
+            const clamped = if (hidden_text) current else body.clampVisual(current);
+            if (body.boundWrapAnchor() == null or !std.meta.eql(current, clamped)) self.controller.surface.viewer.diff_scroll = body.positionAt(clamped);
+            if (body.selectedDiffCursorOffset() == null) self.initializeDiffCursorForSelectedFile();
             return;
         }
         const bounds = self.diffCursorBounds();
         if (bounds.content_rows > 0 and self.view().selectedDiffCursorOffset() == null) {
             self.initializeDiffCursorForSelectedFile();
         }
-        self.controller.surface.viewer.diff_scroll = bounds.clampScroll(self.controller.surface.viewer.diff_scroll);
+        self.controller.surface.viewer.diff_scroll = .{ .logical = bounds.clampScroll(self.controller.surface.viewer.diff_scroll.row()) };
     }
 
     pub fn clampDiffNavigationKeepingHunkVisible(self: BodyController) void {
@@ -2399,7 +2828,7 @@ pub const BodyController = struct {
     }
 
     pub fn resetDiffPosition(self: BodyController) void {
-        self.controller.surface.viewer.diff_scroll = 0;
+        self.controller.surface.viewer.diff_scroll = .{ .logical = 0 };
         self.initializeDiffCursorForSelectedFile();
         self.controller.clearSearchMatch();
     }
@@ -2519,11 +2948,15 @@ pub const BodyController = struct {
 
     pub fn keepDiffCursorVisible(self: BodyController) void {
         const offset = self.view().selectedDiffCursorPresentationOffset() orelse return;
-        self.controller.surface.viewer.diff_scroll = cursor_viewport.keepCursorVisible(
+        if (self.view().lineWrapActive()) {
+            if (self.view().screenRowForOffset(offset) == null) self.placeWrappedCursor(offset, .visible);
+            return;
+        }
+        self.controller.surface.viewer.diff_scroll = .{ .logical = cursor_viewport.keepCursorVisible(
             self.diffCursorBounds(),
-            self.controller.surface.viewer.diff_scroll,
+            self.controller.surface.viewer.diff_scroll.row(),
             offset,
-        );
+        ) };
     }
 
     pub fn clampSelection(self: BodyController, file_count: usize) void {
@@ -2612,7 +3045,7 @@ pub const BodyController = struct {
     fn diffCursorBounds(self: BodyController) cursor_viewport.Bounds {
         return .{
             .content_rows = self.view().presentationDiffLineCount(),
-            .visible_rows = self.controller.view().diffVisibleRows(),
+            .visible_rows = self.view().diffVisibleLogicalRows(),
         };
     }
 
@@ -2621,11 +3054,12 @@ pub const BodyController = struct {
             self.clampDiffNavigation();
             return;
         };
-        self.controller.surface.viewer.diff_scroll = cursor_viewport.placeCursorInComfortBand(
+        if (self.view().lineWrapActive()) return self.placeWrappedCursor(cursor_offset, .comfort);
+        self.controller.surface.viewer.diff_scroll = .{ .logical = cursor_viewport.placeCursorInComfortBand(
             self.diffCursorBounds(),
-            self.controller.surface.viewer.diff_scroll,
+            self.controller.surface.viewer.diff_scroll.row(),
             cursor_offset,
-        );
+        ) };
     }
 
     pub fn centerDiffCursor(self: BodyController) void {
@@ -2633,11 +3067,12 @@ pub const BodyController = struct {
             self.clampDiffNavigation();
             return;
         };
-        self.controller.surface.viewer.diff_scroll = cursor_viewport.centerCursor(
+        if (self.view().lineWrapActive()) return self.placeWrappedCursor(cursor_offset, .center);
+        self.controller.surface.viewer.diff_scroll = .{ .logical = cursor_viewport.centerCursor(
             self.diffCursorBounds(),
-            self.controller.surface.viewer.diff_scroll,
+            self.controller.surface.viewer.diff_scroll.row(),
             cursor_offset,
-        );
+        ) };
     }
 };
 

@@ -246,7 +246,7 @@ pub const Controller = struct {
                 const old_scroll = self.navigation.view().renderDiffScroll();
                 self.navigation.controller.surface.viewer.display_mode = self.navigation.controller.surface.viewer.display_mode.toggled();
                 const new_mode = self.navigation.controller.view().effectiveDisplayMode();
-                self.navigation.controller.surface.viewer.diff_scroll = self.navigation.view().remapDiffScrollForModeChange(old_mode, new_mode, old_scroll);
+                self.navigation.controller.surface.viewer.diff_scroll = .{ .logical = self.navigation.view().remapDiffScrollForModeChange(old_mode, new_mode, old_scroll) };
                 cleanup.complete(self.navigation, prepared);
                 self.navigation.controller.resetDiffHorizontalScroll();
                 self.navigation.updateSearchMatchOffset();
@@ -255,7 +255,16 @@ pub const Controller = struct {
             },
             .toggle_line_numbers => {
                 self.navigation.controller.surface.viewer.view_options.toggleLineNumbers();
+                if (viewport_anchor) |anchor| self.navigation.restoreSelectionViewportAnchor(anchor);
+                if (self.navigation.view().lineWrapActive()) self.navigation.clampDiffNavigationKeepingHunkVisible();
                 self.navigation.clampDiffHorizontalScrollToVisibleRows();
+            },
+            .toggle_line_wrap => {
+                self.navigation.controller.surface.viewer.view_options.toggleLineWrap();
+                const viewer = self.navigation.controller.surface.viewer;
+                viewer.diff_scroll = .atRow(viewer.diff_scroll.row());
+                self.navigation.controller.resetDiffHorizontalScroll();
+                self.navigation.keepDiffCursorVisible();
             },
             .enter_search => {
                 if (self.navigation.controller.surface.selection_owner.* != .none) {

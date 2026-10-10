@@ -577,7 +577,7 @@ test "changes mouse release retains candidate until explicit copy or clear" {
     }
 
     const retained_token = page.completed_selection.?.token;
-    page.viewer.diff_scroll = 0;
+    page.viewer.diff_scroll = .{ .logical = 0 };
     page.viewer.diff_cursor = .{ .hunk_header = 0 };
     const raw = controller.navigation.view().rawDiffPaneGeometry().?;
     const content_gutter = raw.width - diff_surface_navigation.contentWidth(raw.width);

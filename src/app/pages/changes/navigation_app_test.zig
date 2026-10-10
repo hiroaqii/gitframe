@@ -134,18 +134,18 @@ test "line number toggle clamps horizontal scroll without changing vertical scro
             .viewer = .{
                 .display_mode = .unified,
                 .sidebar_hidden = true,
-                .diff_scroll = 2,
+                .diff_scroll = .{ .logical = 2 },
                 .diff_horizontal_scroll = 999,
             },
         } },
         .terminal_size = .{ .width = 80, .height = 8 },
     };
 
-    const old_scroll = app.pages.changes.viewer.diff_scroll;
+    const old_scroll = app.pages.changes.viewer.diff_scroll.row();
     try app.update(.{ .changes = .toggle_line_numbers }, undefined);
 
     try std.testing.expect(!app.pages.changes.viewer.view_options.line_numbers);
-    try std.testing.expectEqual(old_scroll, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(old_scroll, app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expect(app.pages.changes.viewer.diff_horizontal_scroll <= changesNavigationView(&app).visibleBodyTextMaxHorizontalScroll());
 }
 
@@ -156,19 +156,19 @@ test "display mode toggle keeps nearby vertical scroll position" {
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
             .viewer = .{
                 .display_mode = .unified,
-                .diff_scroll = 8,
+                .diff_scroll = .{ .logical = 8 },
                 .sidebar_hidden = true,
             },
         } },
         .terminal_size = .{ .width = 140, .height = 8 },
     };
-    app.pages.changes.viewer.diff_cursor = changesNavigationView(&app).selectedCoordinateAtOffset(app.pages.changes.viewer.diff_scroll) orelse app.pages.changes.viewer.diff_cursor;
+    app.pages.changes.viewer.diff_cursor = changesNavigationView(&app).selectedCoordinateAtOffset(app.pages.changes.viewer.diff_scroll.row()) orelse app.pages.changes.viewer.diff_cursor;
 
     try app.update(.{ .changes = .toggle_display_mode }, undefined);
 
     try std.testing.expectEqual(diff_render.DisplayMode.side_by_side, changesNavigationView(&app).effectiveDisplayMode());
-    try std.testing.expect(app.pages.changes.viewer.diff_scroll > 0);
-    try std.testing.expect(app.pages.changes.viewer.diff_scroll <= changesNavigationView(&app).selectedFileLineIndex(changesNavigationView(&app).effectiveDisplayMode()).lineCount());
+    try std.testing.expect(app.pages.changes.viewer.diff_scroll.row() > 0);
+    try std.testing.expect(app.pages.changes.viewer.diff_scroll.row() <= changesNavigationView(&app).selectedFileLineIndex(changesNavigationView(&app).effectiveDisplayMode()).lineCount());
 }
 
 test "display mode toggle brings cursor back into view after wheel scroll" {
@@ -179,7 +179,7 @@ test "display mode toggle brings cursor back into view after wheel scroll" {
             .viewer = .{
                 .display_mode = .unified,
                 .sidebar_hidden = true,
-                .diff_scroll = 12,
+                .diff_scroll = .{ .logical = 12 },
                 .diff_cursor = .{ .hunk_header = 0 },
             },
         } },
@@ -201,26 +201,26 @@ test "diff wheel routes through Changes and preserves an edge cursor screen row"
                 .display_mode = .unified,
                 .sidebar_hidden = true,
                 .focus = .sidebar,
-                .diff_scroll = 2,
+                .diff_scroll = .{ .logical = 2 },
             },
         } },
         .terminal_size = .{ .width = 140, .height = 15 },
     };
-    const old_scroll = app.pages.changes.viewer.diff_scroll;
+    const old_scroll = app.pages.changes.viewer.diff_scroll.row();
     app.pages.changes.viewer.diff_cursor = changesNavigationView(&app).selectedCoordinateAtOffset(old_scroll) orelse
         return error.ExpectedCoordinate;
 
     try app.update(.{ .changes = .mouse_diff_wheel_down }, undefined);
 
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
-    try std.testing.expectEqual(old_scroll + 1, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(old_scroll + 1, app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(
-        app.pages.changes.viewer.diff_scroll,
+        app.pages.changes.viewer.diff_scroll.row(),
         changesNavigationView(&app).selectedDiffCursorOffset().?,
     );
 
     try app.update(.{ .changes = .mouse_diff_wheel_up }, undefined);
-    try std.testing.expectEqual(old_scroll, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(old_scroll, app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(old_scroll, changesNavigationView(&app).selectedDiffCursorOffset().?);
 }
 
@@ -426,7 +426,7 @@ test "Changes document navigation updates pending restore only on display change
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .hunk_header = 1 },
             .diff_cursor_offset = 5,
-            .diff_scroll = 4,
+            .diff_scroll = .{ .logical = 4 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -462,19 +462,19 @@ test "Changes document navigation updates pending restore only on display change
     override = restore.override orelse return error.ExpectedNavigationOverride;
     const latest_cursor = app.pages.changes.viewer.diff_cursor;
     const latest_cursor_offset = changesNavigationView(&app).selectedDiffCursorOffset();
-    const latest_scroll = app.pages.changes.viewer.diff_scroll;
+    const latest_scroll = app.pages.changes.viewer.diff_scroll.row();
     try std.testing.expectEqual(latest_cursor, override.diff_cursor);
     try std.testing.expectEqual(latest_cursor_offset, override.diff_cursor_offset);
-    try std.testing.expectEqual(latest_scroll, override.diff_scroll);
+    try std.testing.expectEqual(latest_scroll, override.diff_scroll.row());
 
     // A delayed projection completion restores the latest user override, not
     // the acceptance-time cursor and viewport.
     app.pages.changes.viewer.diff_cursor = restore.original.diff_cursor;
-    app.pages.changes.viewer.diff_scroll = restore.original.diff_scroll;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = restore.original.diff_scroll.row() };
     changesReload(&app).restoreDisplayedNavigation(std.testing.allocator, restore.authoritative());
     try std.testing.expectEqual(latest_cursor, app.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqual(latest_cursor_offset, changesNavigationView(&app).selectedDiffCursorOffset());
-    try std.testing.expectEqual(latest_scroll, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(latest_scroll, app.pages.changes.viewer.diff_scroll.row());
 
     const revision_before_edge = app.pages.changes.display_navigation_input_revision;
     try app.update(.{ .changes = .document_last }, &ctx.ctx);
@@ -504,7 +504,7 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } },
-                .diff_scroll = 1,
+                .diff_scroll = .{ .logical = 1 },
                 .sidebar_hidden = true,
                 .display_mode = .unified,
             },
@@ -537,7 +537,7 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .hunk_header = 1 },
             .diff_cursor_offset = 5,
-            .diff_scroll = 4,
+            .diff_scroll = .{ .logical = 4 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -553,11 +553,11 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
         .endpoint = .{ .col = 20, .row = diff_render.body_start_row },
     } } }, &ctx.ctx);
 
-    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(u64, 1), app.pages.changes.display_navigation_input_revision);
     const restore = app.pages.changes.pending_display_navigation_restore orelse return error.ExpectedPendingDisplayRestore;
     const override = restore.override orelse return error.ExpectedNavigationOverride;
-    try std.testing.expectEqual(@as(usize, 0), override.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), override.diff_scroll.row());
 
     // A further timer tick at BOF cannot retarget the cursor or endpoint.
     app.pages.changes.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 1 } };
@@ -567,7 +567,129 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
         .direction = .up,
         .endpoint = .{ .col = 20, .row = diff_render.body_start_row },
     } } }, &ctx.ctx);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqualDeep(edge_cursor, app.pages.changes.viewer.diff_cursor);
     try std.testing.expectEqualDeep(edge_owner, app.pages.changes.selection_owner);
+}
+
+test "wrap viewport reaches a tall line tail and keeps search and j k line based" {
+    const allocator = std.testing.allocator;
+    const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,4 +1,4 @@\n " ++
+        "needle" ++ "x" ** 400 ++ "needle END\n needle next\n third\n fourth\n";
+    var bundle = try app_load.buildLoadedBundle(allocator, patch);
+    var app: App = .{
+        .allocator = allocator,
+        .pages = .{ .changes = .{
+            .load = app_test_support.loadStateWithArena(bundle.takeArena(), bundle.loaded),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .sidebar_hidden = true, .display_mode = .unified, .view_options = .{ .line_wrap = true }, .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } } },
+        } },
+        .terminal_size = .{ .width = 40, .height = 14 },
+    };
+    defer app.pages.changes.deinit(allocator);
+    setDiffSearchQuery(&app, "needle");
+    changesNavigation(&app).submitSearch(allocator);
+    const first_match = app.pages.changes.search.match.?.coordinate;
+    try app.update(.{ .changes = .page_diff_down }, undefined);
+    try std.testing.expect(app.pages.changes.viewer.diff_scroll == .wrapped);
+    try std.testing.expect(app.pages.changes.viewer.diff_scroll.wrapped.anchor.byte > 0);
+    try std.testing.expectEqualDeep(first_match, app.pages.changes.viewer.diff_cursor);
+
+    var found_tail = false;
+    for (0..12) |_| {
+        const nav = changesNavigationView(&app);
+        const changes_view = @import("view.zig");
+        const ctx = changes_view.Context.init(&app.pages.changes, nav, .default(), .{}, "working tree", .unstaged, null, .{});
+        var ts: chasen.testing.TestSurface = undefined;
+        try ts.init(nav.diffPaneWidth(), nav.layout.height);
+        defer ts.deinit();
+        const before = app.pages.changes.viewer.diff_scroll;
+        try changes_view.viewDiffPane(ctx, &ts.surface, app.pages.changes.load.state.loaded.loaded);
+        try std.testing.expectEqualDeep(before, app.pages.changes.viewer.diff_scroll);
+        // The marker follows this source row's first visible continuation.
+        try ts.expectCellText(0, diff_render.body_start_row, "»");
+        const snapshot = try ts.snapshot(allocator);
+        defer allocator.free(snapshot);
+        if (std.mem.indexOf(u8, snapshot, "END") != null) {
+            found_tail = true;
+            break;
+        }
+        try app.update(.{ .changes = .page_diff_down }, undefined);
+    }
+    try std.testing.expect(found_tail);
+    try app.update(.{ .changes = .scroll_diff_down }, undefined);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_cursor.hunk_line.line_index);
+    try app.update(.{ .changes = .scroll_diff_up }, undefined);
+    try std.testing.expectEqualDeep(first_match, app.pages.changes.viewer.diff_cursor);
+    try std.testing.expectEqual(@as(usize, 0), changesNavigationView(&app).renderWrapStart());
+    changesNavigation(&app).selectSearchMatch(allocator, .forward);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.search.match.?.coordinate.hunk_line.line_index);
+    changesNavigation(&app).selectSearchMatch(allocator, .forward);
+    try std.testing.expectEqualDeep(first_match, app.pages.changes.search.match.?.coordinate);
+}
+
+test "wrap source anchor survives reflow and exact reload and drops on content change" {
+    const allocator = std.testing.allocator;
+    const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-" ++ "old" ** 180 ++ "\n+short\n next\n";
+    var bundle = try app_load.buildLoadedBundle(allocator, patch);
+    var app: App = .{
+        .allocator = allocator,
+        .pages = .{ .changes = .{
+            .load = app_test_support.loadStateWithArena(bundle.takeArena(), bundle.loaded),
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .sidebar_hidden = true, .display_mode = .side_by_side, .view_options = .{ .line_wrap = true }, .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 0 } } },
+        } },
+        .terminal_size = .{ .width = 100, .height = 14 },
+    };
+    defer app.pages.changes.deinit(allocator);
+    try app.update(.{ .changes = .page_diff_down }, undefined);
+    const saved = app.pages.changes.viewer.diff_scroll.wrapped.anchor;
+    try std.testing.expectEqual(@import("../../../diff/selection.zig").Side.old, saved.side.?);
+    try std.testing.expect(saved.byte > 0);
+    const initial_nav = changesNavigationView(&app);
+    const raw = initial_nav.rawDiffPaneGeometry().?;
+    const text_col = raw.col + raw.width - initial_nav.diffPaneWidth() + diff_render.cursor_gutter_width + diff_render.lineTextStart(true, .side_by_side);
+    changesNavigation(&app).pressDiffMouse(.{ .col = text_col, .row = diff_render.body_start_row });
+    changesNavigation(&app).dragDiffMouse(.{ .col = text_col + 4, .row = diff_render.body_start_row });
+    var release_adapter = changesNavigation(&app).updateAdapter();
+    var released = try release_adapter.shared().apply(allocator, .{ .mouse_diff_release = null });
+    defer released.deinit(allocator);
+    const selected_bytes = try app.pages.changes.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(selected_bytes);
+    // All existing reflow routes preserve the actual old-side token, even
+    // through narrow unified fallback. Cursor and action coordinates stay source based.
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 14 } }, undefined);
+    try std.testing.expectEqualDeep(saved, app.pages.changes.viewer.diff_scroll.wrapped.anchor);
+    try app.update(.{ .terminal_resized = .{ .width = 1, .height = 14 } }, undefined);
+    try std.testing.expectEqualDeep(saved, app.pages.changes.viewer.diff_scroll.wrapped.anchor);
+    try app.update(.{ .terminal_resized = .{ .width = 80, .height = 14 } }, undefined);
+    try std.testing.expectEqualDeep(saved, app.pages.changes.viewer.diff_scroll.wrapped.anchor);
+    try app.update(.{ .changes = .toggle_line_numbers }, undefined);
+    try std.testing.expectEqualDeep(saved, app.pages.changes.viewer.diff_scroll.wrapped.anchor);
+    try app.update(.{ .changes = .toggle_display_mode }, undefined);
+    try std.testing.expectEqualDeep(saved, app.pages.changes.viewer.diff_scroll.wrapped.anchor);
+    try std.testing.expect(changesNavigationView(&app).visibleDiffCursorOffset() != null);
+    const retained_bytes = try app.pages.changes.completed_selection.?.clipboardText(allocator);
+    defer allocator.free(retained_bytes);
+    try std.testing.expectEqualStrings(selected_bytes, retained_bytes);
+    const nav = changesNavigationView(&app);
+    var resolver = nav.contentResolverAdapter();
+    var copied = (try nav.contentView(&resolver).currentLineCopyText(allocator)).?;
+    defer copied.deinit(allocator);
+    try std.testing.expectEqualStrings("-" ++ "old" ** 180, copied.text());
+
+    var anchor = (try changesReload(&app).view().captureAnchor(allocator)).?;
+    defer anchor.deinit(allocator);
+    var exact = try app_load.buildLoadedBundle(allocator, patch);
+    app.pages.changes.load.clearCurrent(allocator);
+    app.pages.changes.load = app_test_support.loadStateWithArena(exact.takeArena(), exact.loaded);
+    try std.testing.expect(changesNavigation(&app).restoreReloadAnchor(allocator, changesNavigation(&app).activeLoadedDiff().?, &anchor));
+    try std.testing.expectEqualDeep(saved, app.pages.changes.viewer.diff_scroll.wrapped.anchor);
+    var changed = try app_load.buildLoadedBundle(allocator, "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-" ++ "OLD" ** 180 ++ "\n+short\n next\n");
+    app.pages.changes.load.clearCurrent(allocator);
+    app.pages.changes.load = app_test_support.loadStateWithArena(changed.takeArena(), changed.loaded);
+    try std.testing.expect(changesNavigation(&app).restoreReloadAnchor(allocator, changesNavigation(&app).activeLoadedDiff().?, &anchor));
+    try std.testing.expectEqual(@as(usize, 0), changesNavigationView(&app).renderWrapStart());
+    try app.update(.{ .changes = .toggle_hunk_fold }, undefined);
+    try std.testing.expect(app.pages.changes.viewer.diff_cursor == .hunk_header);
+    try std.testing.expectEqual(@as(usize, 0), changesNavigationView(&app).renderWrapStart());
+    try std.testing.expect(changesNavigationView(&app).visibleDiffCursorOffset() != null);
 }

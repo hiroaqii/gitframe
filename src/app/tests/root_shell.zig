@@ -300,12 +300,12 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
     // A queued firing from the canceled timer is inert. B performs exactly
     // one row of semantic scroll and remains the repeating owner.
     tc.resetTransient();
-    app.pages.changes.viewer.diff_scroll = 1;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 1 };
     app.status.set("root diagnostic", .{});
     app.pages.changes.status.set("changes diagnostic", .{});
     const selection_before_stale = app.pages.changes.selection_owner;
     try app.update(.{ .drag_auto_scroll_tick = first_generation }, &tc.ctx);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expect(std.meta.eql(selection_before_stale, app.pages.changes.selection_owner));
     try std.testing.expectEqualStrings("root diagnostic", app.status.text());
     try std.testing.expectEqualStrings("changes diagnostic", app.pages.changes.status.text());
@@ -313,7 +313,7 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
 
     tc.resetTransient();
     try app.update(.{ .drag_auto_scroll_tick = second_generation }, &tc.ctx);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expect(app.drag_auto_scroll.active != null);
 
     // Reversing once more admits C. Repeated firings from that one accepted
@@ -412,12 +412,12 @@ test "root drag auto-scroll replaces generations and rejects stale ticks" {
         .anchor_cell = .{ .col = 12, .row = diff_render.body_start_row },
     } };
     const focus_before_action = app.pages.changes.selection_owner.activeDiff().?.focus;
-    app.pages.changes.viewer.diff_scroll = 2;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 2 };
     try app.update(.{ .changes = .{ .mouse_diff_auto_scroll_step = .{
         .direction = .up,
         .endpoint = .{ .col = 12, .row = 1 },
     } } }, &tc.ctx);
-    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expect(std.meta.eql(focus_before_action, app.pages.changes.selection_owner.activeDiff().?.focus));
 }
 
@@ -479,7 +479,7 @@ test "root drag auto-scroll timer failures retain only retryable authority" {
     tc.resetTransient();
     var adapter = changesNavigation(&app).updateAdapter();
     const body_view = adapter.shared().navigation.view();
-    app.pages.changes.viewer.diff_scroll = body_view.presentationDiffLineCount() -| body_view.view.diffVisibleRows();
+    app.pages.changes.viewer.diff_scroll = .{ .logical = body_view.presentationDiffLineCount() -| body_view.view.diffVisibleRows() };
     try app.update(.{ .drag_auto_scroll_tick = 12 }, &tc.ctx);
     try std.testing.expect(app.drag_auto_scroll.active == null);
     try std.testing.expect(app.drag_auto_scroll.scheduled_generation == null);
@@ -915,7 +915,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     const after_keyboard_body = after_keyboard_view.bodyView(&after_keyboard_resolver);
     const expected_keyboard_scroll = after_keyboard_body.restoreSelectionViewportAnchor(keyboard_anchor);
     try std.testing.expectEqual(keyboard_anchor.raw_presentation_scroll, expected_keyboard_scroll);
-    try std.testing.expectEqual(expected_keyboard_scroll, app.pages.compare.diff.viewer.diff_scroll);
+    try std.testing.expectEqual(expected_keyboard_scroll, app.pages.compare.diff.viewer.diff_scroll.row());
 
     try installRootCompareSelection(&app, allocator);
     var mouse_clear_view = compareNavigation(&app).view();
@@ -933,7 +933,7 @@ test "Compare retained actions route keyboard and mouse through App after narrow
     const after_mouse_body = after_mouse_view.bodyView(&after_mouse_resolver);
     const expected_mouse_scroll = after_mouse_body.restoreSelectionViewportAnchor(mouse_anchor);
     try std.testing.expectEqual(mouse_anchor.raw_presentation_scroll, expected_mouse_scroll);
-    try std.testing.expectEqual(expected_mouse_scroll, app.pages.compare.diff.viewer.diff_scroll);
+    try std.testing.expectEqual(expected_mouse_scroll, app.pages.compare.diff.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 0), app.shell_effects_state.clipboard_copies.count());
 }
 
@@ -1078,7 +1078,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     accepted_loaded.toggleHunkFold(0, 0);
     app.pages.history.diff.viewer.display_mode = .side_by_side;
     app.pages.history.diff.viewer.diff_cursor = .{ .hunk_header = 1 };
-    app.pages.history.diff.viewer.diff_scroll = 4;
+    app.pages.history.diff.viewer.diff_scroll = .{ .logical = 4 };
     const retained_target = app.pages.history.diff.viewer.selected_target;
     const retained_node = app.pages.history.diff.viewer.selected_node;
     try std.testing.expect(file_tree.isCollapsed(&accepted_loaded.collapsed_dirs, "src"));
@@ -1095,7 +1095,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     try std.testing.expectEqual(@as(usize, 2), app.pages.history.catalog.cursor);
     try std.testing.expectEqual(@as(?usize, 1), app.pages.history.draft.anchor());
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.scroll);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll.row());
 
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 32 } }, &ctx.ctx);
     try std.testing.expectEqual(chasen.Size{ .width = 120, .height = 32 }, app.terminal_size);
@@ -1108,7 +1108,7 @@ test "History accepted diff runs one root interaction and transition sequence" {
     try std.testing.expectEqual(@as(usize, 2), app.pages.history.catalog.cursor);
     try std.testing.expectEqual(@as(?usize, 1), app.pages.history.draft.anchor());
     try std.testing.expectEqual(@as(usize, 0), app.pages.history.catalog.scroll);
-    try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.history.diff.viewer.diff_scroll.row());
     accepted_loaded.toggleHunkFold(0, 0);
     try app.update(.{ .terminal_resized = .{ .width = 120, .height = 12 } }, &ctx.ctx);
     layout = shellLayout(&app);
@@ -1548,7 +1548,7 @@ test "mouse wheel scrolls the pane under the pointer" {
     const diff_msg = app.handleEvent(app_test_support.mouseEvent(diff_col, content.row + 2, .wheel_down)) orelse return error.ExpectedDiffWheelMessage;
     try app.update(diff_msg, undefined);
     try std.testing.expectEqual(changes_page.Focus.diff, app.pages.changes.viewer.focus);
-    try std.testing.expect(app.pages.changes.viewer.diff_scroll > 0);
+    try std.testing.expect(app.pages.changes.viewer.diff_scroll.row() > 0);
 }
 
 test "wheel redraw reaches root for meaningful sidebar transition complete noop and reverse" {
@@ -1619,13 +1619,13 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
     vertical.pages.changes.viewer.diff_cursor = changesNavigation(&vertical).view().selectedCoordinateAtOffset(0) orelse
         return error.ExpectedCursorOffset;
     const vertical_owner = vertical.pages.changes.selection_owner;
-    const vertical_scroll_before = vertical.pages.changes.viewer.diff_scroll;
+    const vertical_scroll_before = vertical.pages.changes.viewer.diff_scroll.row();
     const vertical_cursor_before = changesNavigation(&vertical).view().selectedDiffCursorOffset();
     vertical_ctx.resetTransient();
     try vertical.update(.{ .changes = .mouse_diff_wheel_down }, &vertical_ctx.ctx);
     try std.testing.expect(!vertical_ctx.redrawSuppressed());
     try std.testing.expect(
-        vertical.pages.changes.viewer.diff_scroll != vertical_scroll_before or
+        vertical.pages.changes.viewer.diff_scroll.row() != vertical_scroll_before or
             changesNavigation(&vertical).view().selectedDiffCursorOffset() != vertical_cursor_before,
     );
     try std.testing.expectEqual(changes_page.Focus.diff, vertical.pages.changes.viewer.focus);
@@ -1644,14 +1644,14 @@ test "wheel redraw reaches root for semantic vertical and horizontal edges" {
     try std.testing.expect(reached_vertical_noop);
     const vertical_edge = changesNavigation(&vertical).view().selectedDiffCursorOffset() orelse
         return error.ExpectedCursorOffset;
-    const vertical_edge_scroll = vertical.pages.changes.viewer.diff_scroll;
+    const vertical_edge_scroll = vertical.pages.changes.viewer.diff_scroll.row();
     try std.testing.expect(vertical_edge > 1);
     try std.testing.expectEqualDeep(vertical_owner, vertical.pages.changes.selection_owner);
     vertical_ctx.resetTransient();
     try vertical.update(.{ .changes = .mouse_diff_wheel_up }, &vertical_ctx.ctx);
     try std.testing.expect(!vertical_ctx.redrawSuppressed());
     try std.testing.expect(
-        vertical.pages.changes.viewer.diff_scroll != vertical_edge_scroll or
+        vertical.pages.changes.viewer.diff_scroll.row() != vertical_edge_scroll or
             changesNavigation(&vertical).view().selectedDiffCursorOffset().? != vertical_edge,
     );
     try std.testing.expectEqualDeep(vertical_owner, vertical.pages.changes.selection_owner);
@@ -1724,13 +1724,13 @@ test "Compare wheel redraw reaches root for meaningful complete noop and reverse
     }
     try std.testing.expect(reached_noop);
     const edge_cursor = body.selectedDiffCursorOffset();
-    const edge_scroll = app.pages.compare.diff.viewer.diff_scroll;
+    const edge_scroll = app.pages.compare.diff.viewer.diff_scroll.row();
 
     ctx.resetTransient();
     try app.update(.{ .compare = .{ .common = .{ .shared = .mouse_diff_wheel_up } } }, &ctx.ctx);
     try std.testing.expect(!ctx.redrawSuppressed());
     try std.testing.expect(
-        app.pages.compare.diff.viewer.diff_scroll != edge_scroll or
+        app.pages.compare.diff.viewer.diff_scroll.row() != edge_scroll or
             body.selectedDiffCursorOffset() != edge_cursor,
     );
 }

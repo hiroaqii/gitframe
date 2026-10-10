@@ -72,19 +72,6 @@ pub const SourceGeometry = struct {
         if (col >= self.text_col) return .text;
         return null;
     }
-
-    /// Returns only real content rows. `Document.rowCount()` deliberately has
-    /// one synthetic row for an empty viewer, which is not selectable text.
-    pub fn contentLineAt(
-        self: SourceGeometry,
-        row: u16,
-        vertical_scroll: usize,
-        document: *const source.Document,
-    ) ?usize {
-        if (row < self.body_first_row or row >= self.height) return null;
-        const line_index = vertical_scroll + @as(usize, row - self.body_first_row);
-        return if (line_index < document.contentLineCount()) line_index else null;
-    }
 };
 
 fn decimalDigits(value: usize) usize {
@@ -112,12 +99,6 @@ test "repository selection geometry shares narrow line number and body boundarie
     try std.testing.expectEqual(Region.line_number, numbered.regionAt(3).?);
     try std.testing.expectEqual(Region.separator, numbered.regionAt(4).?);
     try std.testing.expectEqual(Region.text, numbered.regionAt(5).?);
-    try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_path_row, 0, &document));
-    try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_search_or_rule_row, 0, &document));
-    try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(source_spacer_row, 0, &document));
-    try std.testing.expectEqual(@as(?usize, 0), numbered.contentLineAt(numbered.body_first_row, 0, &document));
-    try std.testing.expectEqual(@as(?usize, 1), numbered.contentLineAt(numbered.body_first_row + 1, 0, &document));
-    try std.testing.expectEqual(@as(?usize, null), numbered.contentLineAt(numbered.height, 0, &document));
 
     const unnumbered = SourceGeometry.init(.{ .width = 10, .height = 5 }, &document, false);
     try std.testing.expectEqual(@as(?u16, null), unnumbered.separator_col);
@@ -133,15 +114,4 @@ test "repository selection geometry shares narrow line number and body boundarie
     try std.testing.expectEqual(@as(usize, 1), narrow.navigationRows());
     try std.testing.expectEqual(Region.gutter, narrow.regionAt(0).?);
     try std.testing.expectEqual(@as(?Region, null), narrow.regionAt(1));
-}
-
-test "repository selection geometry rejects the empty document synthetic row" {
-    const allocator = std.testing.allocator;
-    const bytes = try allocator.dupe(u8, "");
-    var document = try source.Document.initOwned(allocator, bytes, .init(bytes));
-    defer document.deinit(allocator);
-    const geometry = SourceGeometry.init(.{ .width = 20, .height = 4 }, &document, true);
-    try std.testing.expectEqual(@as(usize, 1), document.rowCount());
-    try std.testing.expectEqual(@as(usize, 0), document.contentLineCount());
-    try std.testing.expectEqual(@as(?usize, null), geometry.contentLineAt(geometry.body_first_row, 0, &document));
 }

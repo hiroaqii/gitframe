@@ -5,6 +5,7 @@
 //! effects; it deliberately has no `App`, `Ctx`, overlay, or process access.
 
 const std = @import("std");
+const diff_surface = @import("../../diff_surface.zig");
 const context = @import("../../../context.zig");
 const content_fingerprint = @import("../../../content_fingerprint.zig");
 const builtin = @import("builtin");
@@ -4084,9 +4085,9 @@ pub const Controller = struct {
         }
         if (self.navigation.view().selectedDiffCursorOffset() == null) self.navigation.initializeDiffCursorForSelectedFile();
         self.page.viewer.diff_scroll = if (anchor.selection_viewport) |viewport|
-            self.navigation.view().restoredSelectionViewportScroll(viewport)
+            self.navigation.view().restoredViewport(viewport)
         else
-            anchor.diff_scroll;
+            .atRow(anchor.diff_scroll.row());
         self.page.viewer.diff_horizontal_scroll = anchor.diff_horizontal_scroll;
         self.page.viewer.sidebar_horizontal_scroll = anchor.sidebar_horizontal_scroll;
         self.navigation.clampDiffNavigation();
@@ -4167,7 +4168,7 @@ pub const Controller = struct {
             self.page.staged_hunks.clear(owned_allocator);
             self.clearDisplayRestore(owned_allocator);
         }
-        self.page.viewer.diff_scroll = 0;
+        self.page.viewer.diff_scroll = .{ .logical = 0 };
         self.page.viewer.diff_horizontal_scroll = 0;
         self.page.viewer.sidebar_horizontal_scroll = 0;
         self.page.viewer.diff_cursor = .{ .metadata = 0 };
@@ -4728,7 +4729,7 @@ const TestSelectionViewportTop = enum {
 fn captureTestSelectionViewportTop(
     controller: Controller,
     top: TestSelectionViewportTop,
-) !selection_action.SelectionViewportAnchor {
+) !diff_surface.navigation.ViewportAnchor {
     const view = controller.navigation.view();
     const max_scroll = view.displayedDiffLineCount() -| view.diffVisibleRows();
     const raw_scroll = switch (top) {
@@ -4737,7 +4738,7 @@ fn captureTestSelectionViewportTop(
         .source_late => max_scroll / 2,
         .source_end => max_scroll,
     };
-    controller.page.viewer.diff_scroll = raw_scroll;
+    controller.page.viewer.diff_scroll = .{ .logical = raw_scroll };
     const anchor = controller.navigation.captureSelectionViewportAnchor() orelse
         return error.ExpectedSelectionViewportAnchor;
     try std.testing.expectEqual(raw_scroll, anchor.raw_presentation_scroll);
@@ -4756,14 +4757,14 @@ fn captureTestSelectionViewportTop(
     return anchor;
 }
 
-fn expectParsedTestSelectionViewport(anchor: selection_action.SelectionViewportAnchor) !void {
+fn expectParsedTestSelectionViewport(anchor: diff_surface.navigation.ViewportAnchor) !void {
     switch (anchor.semantic_source) {
         .parsed => {},
         .none, .generated_row => return error.ExpectedParsedSelectionViewportSource,
     }
 }
 
-fn expectGeneratedTestSelectionViewport(anchor: selection_action.SelectionViewportAnchor) !void {
+fn expectGeneratedTestSelectionViewport(anchor: diff_surface.navigation.ViewportAnchor) !void {
     switch (anchor.semantic_source) {
         .generated_row => {},
         .none, .parsed => return error.ExpectedGeneratedSelectionViewportSource,
@@ -4772,20 +4773,20 @@ fn expectGeneratedTestSelectionViewport(anchor: selection_action.SelectionViewpo
 
 fn expectTestSelectionViewportRestored(
     controller: Controller,
-    anchor: selection_action.SelectionViewportAnchor,
+    anchor: diff_surface.navigation.ViewportAnchor,
 ) !void {
-    const expected = controller.navigation.view().restoredSelectionViewportScroll(anchor);
-    try std.testing.expectEqual(expected, controller.page.viewer.diff_scroll);
+    const expected = controller.navigation.view().restoredViewport(anchor).row();
+    try std.testing.expectEqual(expected, controller.page.viewer.diff_scroll.row());
 }
 
 fn expectTestSelectionViewportRawReuse(
     controller: Controller,
-    anchor: selection_action.SelectionViewportAnchor,
+    anchor: diff_surface.navigation.ViewportAnchor,
 ) !void {
     const current = controller.navigation.captureSelectionViewportAnchor() orelse
         return error.ExpectedRetainedSelectionViewportAnchor;
     try std.testing.expect(anchor.basis.eql(current.basis));
-    try std.testing.expectEqual(anchor.raw_presentation_scroll, controller.page.viewer.diff_scroll);
+    try std.testing.expectEqual(anchor.raw_presentation_scroll, controller.page.viewer.diff_scroll.row());
 }
 
 fn testMultiFileProjectionSelectionScope(
@@ -4821,7 +4822,7 @@ fn testMultiFileProjectionSelectionScope(
     defer allocator.free(original_clipboard);
     controller.navigation.setSelectedDiffFile(1);
 
-    var viewport_anchor: ?selection_action.SelectionViewportAnchor = null;
+    var viewport_anchor: ?diff_surface.navigation.ViewportAnchor = null;
     if (owner == .target_path and terminal != .cache_hit) {
         viewport_anchor = try captureTestSelectionViewportTop(controller, switch (terminal) {
             .normal_ready => .source_start,
@@ -4966,7 +4967,7 @@ fn testMultiFileProjectionSelectionScope(
         if (terminal == .failed or terminal == .failed_static) {
             try std.testing.expect(controller.navigation.view().displayedChangesBody() == .status);
             try std.testing.expectEqual(@as(usize, 1), controller.navigation.view().displayedDiffLineCount());
-            try std.testing.expectEqual(@as(usize, 0), page.viewer.diff_scroll);
+            try std.testing.expectEqual(@as(usize, 0), page.viewer.diff_scroll.row());
         }
     }
 }
@@ -6939,6 +6940,7 @@ test "source session replacement clears populated projection cache" {
     defer status_bundle.deinit();
     var page: changes_page.ChangesPageState = .{};
     defer page.deinit(allocator);
+    page.viewer.view_options.line_wrap = true;
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
@@ -6950,6 +6952,7 @@ test "source session replacement clears populated projection cache" {
     try std.testing.expectEqual(@as(u64, 1), page.source_session_revision);
     try std.testing.expectEqual(@as(usize, 0), page.changes_projection.cacheLen());
     try std.testing.expect(!page.changes_projection.cacheHas(.{}, "/repo", "a", .generated_added_file, .unstaged, 0, 0));
+    try std.testing.expect(page.viewer.view_options.line_wrap);
 }
 
 fn testPageWithOwnedFileSearchCandidate(allocator: std.mem.Allocator) !changes_page.ChangesPageState {
@@ -8208,7 +8211,7 @@ test "ordinary primary exact combined reuse retains active search match and curs
     controller.navigation.refreshSearchForSelectedFile(allocator);
     const search_before = page.search.match orelse return error.ExpectedSearchMatch;
     page.viewer.diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } };
-    page.viewer.diff_scroll = 1;
+    page.viewer.diff_scroll = .{ .logical = 1 };
     page.viewer.diff_horizontal_scroll = 2;
     const search_offset_before = page.search.match_offset;
     const cursor_before = page.viewer.diff_cursor;
@@ -8243,7 +8246,7 @@ test "ordinary primary exact combined reuse retains active search match and curs
     try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
-    try std.testing.expectEqual(@as(usize, 1), page.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 1), page.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 2), page.viewer.diff_horizontal_scroll);
 }
 
@@ -8356,7 +8359,7 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
             .selected_target = .{ .diff_file = 0 },
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 0, .line_index = 2 } },
-            .diff_scroll = 2,
+            .diff_scroll = .{ .logical = 2 },
             .diff_horizontal_scroll = 3,
         },
     };
@@ -8386,12 +8389,12 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
     try page.staged_hunks.addExact(allocator, "/repo", "a", mark_key);
     try page.search.query.insertSlice("new");
     controller.navigation.refreshSearchForSelectedFile(allocator);
-    page.viewer.diff_scroll = 2;
+    page.viewer.diff_scroll = .{ .logical = 2 };
     page.viewer.diff_horizontal_scroll = 3;
     const search_before = page.search.match.?;
     const search_offset_before = page.search.match_offset;
     const cursor_before = page.viewer.diff_cursor;
-    const scroll_before = page.viewer.diff_scroll;
+    const scroll_before = page.viewer.diff_scroll.row();
     const horizontal_before = page.viewer.diff_horizontal_scroll;
 
     try std.testing.expect(controller.view().projectionTarget() == null);
@@ -8413,7 +8416,7 @@ test "ordinary primary staged-only status does not enter final-hunk projection b
     try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
-    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
 }
 
@@ -8425,7 +8428,7 @@ test "final hunk stage retains owned combined presentation with staged-only auth
             .selected_target = .{ .diff_file = 0 },
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } },
-            .diff_scroll = 5,
+            .diff_scroll = .{ .logical = 5 },
             .diff_horizontal_scroll = 4,
         },
     };
@@ -8451,12 +8454,12 @@ test "final hunk stage retains owned combined presentation with staged-only auth
     // non-empty query without silently starting its first match when the same
     // presentation crosses into staged-only.
     try std.testing.expect(page.search.match == null);
-    page.viewer.diff_scroll = 5;
+    page.viewer.diff_scroll = .{ .logical = 5 };
     page.viewer.diff_horizontal_scroll = 4;
     const search_before = page.search.match;
     const search_offset_before = page.search.match_offset;
     const cursor_before = page.viewer.diff_cursor;
-    const scroll_before = page.viewer.diff_scroll;
+    const scroll_before = page.viewer.diff_scroll.row();
     const horizontal_before = page.viewer.diff_horizontal_scroll;
 
     controller.advanceStatusSnapshotRevision(allocator);
@@ -8502,7 +8505,7 @@ test "final hunk stage retains owned combined presentation with staged-only auth
     try std.testing.expect(std.meta.eql(search_before, page.search.match));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
-    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
     try std.testing.expectEqualStrings("a", controller.navigation.view().selectedStagePathKey().?);
     try std.testing.expect(controller.navigation.view().displayedSearchTarget(.unified) != null);
@@ -8523,7 +8526,7 @@ test "final hunk stage retains primary presentation with staged-only authority" 
             .selected_target = .{ .diff_file = 0 },
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } },
-            .diff_scroll = 6,
+            .diff_scroll = .{ .logical = 6 },
             .diff_horizontal_scroll = 2,
         },
     };
@@ -8577,12 +8580,12 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     try page.search.query.insertSlice("gamma");
     controller.navigation.refreshSearchForSelectedFile(allocator);
     controller.navigation.selectSearchMatch(allocator, .forward);
-    page.viewer.diff_scroll = 6;
+    page.viewer.diff_scroll = .{ .logical = 6 };
     page.viewer.diff_horizontal_scroll = 2;
     const search_before = page.search.match.?;
     const search_offset_before = page.search.match_offset;
     const cursor_before = page.viewer.diff_cursor;
-    const scroll_before = page.viewer.diff_scroll;
+    const scroll_before = page.viewer.diff_scroll.row();
     const horizontal_before = page.viewer.diff_horizontal_scroll;
 
     controller.advanceStatusSnapshotRevision(allocator);
@@ -8635,7 +8638,7 @@ test "final hunk stage retains primary presentation with staged-only authority" 
     try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
-    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
     try std.testing.expect(controller.navigation.view().displayedSearchTarget(.unified) != null);
     try std.testing.expect(page.completed_selection != null);
@@ -9138,7 +9141,7 @@ test "one hunk unstage restores combined authority over retained owned presentat
             .selected_target = .{ .diff_file = 0 },
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } },
-            .diff_scroll = 5,
+            .diff_scroll = .{ .logical = 5 },
             .diff_horizontal_scroll = 4,
         },
     };
@@ -9164,10 +9167,10 @@ test "one hunk unstage restores combined authority over retained owned presentat
     // must not convert the retained query into a new first match while authority changes underneath
     // the same rendered coordinates.
     try std.testing.expect(page.search.match == null);
-    page.viewer.diff_scroll = 5;
+    page.viewer.diff_scroll = .{ .logical = 5 };
     page.viewer.diff_horizontal_scroll = 4;
     const cursor_before = page.viewer.diff_cursor;
-    const scroll_before = page.viewer.diff_scroll;
+    const scroll_before = page.viewer.diff_scroll.row();
     const horizontal_before = page.viewer.diff_horizontal_scroll;
 
     controller.advanceStatusSnapshotRevision(allocator);
@@ -9218,7 +9221,7 @@ test "one hunk unstage restores combined authority over retained owned presentat
     try std.testing.expect(combined.authority.projection.hunk_action_origins[2] == .unstaged);
     try std.testing.expect(page.search.match == null);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
-    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
     try std.testing.expect(page.completed_selection != null);
     try expectTestSessionHunkMarks(&page, "/repo", "a", retained_content, &.{ 0, 1 });
@@ -9235,7 +9238,7 @@ test "one hunk unstage restores combined authority over retained primary present
             .selected_target = .{ .diff_file = 0 },
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } },
-            .diff_scroll = 6,
+            .diff_scroll = .{ .logical = 6 },
             .diff_horizontal_scroll = 2,
         },
     };
@@ -9264,12 +9267,12 @@ test "one hunk unstage restores combined authority over retained primary present
     try page.search.query.insertSlice("gamma");
     controller.navigation.refreshSearchForSelectedFile(allocator);
     controller.navigation.selectSearchMatch(allocator, .forward);
-    page.viewer.diff_scroll = 6;
+    page.viewer.diff_scroll = .{ .logical = 6 };
     page.viewer.diff_horizontal_scroll = 2;
     const search_before = page.search.match.?;
     const search_offset_before = page.search.match_offset;
     const cursor_before = page.viewer.diff_cursor;
-    const scroll_before = page.viewer.diff_scroll;
+    const scroll_before = page.viewer.diff_scroll.row();
     const horizontal_before = page.viewer.diff_horizontal_scroll;
 
     controller.advanceStatusSnapshotRevision(allocator);
@@ -9316,7 +9319,7 @@ test "one hunk unstage restores combined authority over retained primary present
     try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
-    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
     try std.testing.expect(page.completed_selection != null);
     const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
@@ -9332,7 +9335,7 @@ test "final staged hunk unstage returns owned combined display to exact ordinary
             .selected_target = .{ .diff_file = 0 },
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 2, .line_index = 1 } },
-            .diff_scroll = 5,
+            .diff_scroll = .{ .logical = 5 },
             .diff_horizontal_scroll = 3,
         },
     };
@@ -9381,7 +9384,7 @@ test "final staged hunk unstage returns owned combined display to exact ordinary
     const cursor_offset_after = controller.navigation.view().selectedDiffCursorOffset() orelse
         return error.ExpectedRestoredPrimaryCursorOffset;
     try std.testing.expect(cursor_offset_after < ordinary_line_count);
-    try std.testing.expect(page.viewer.diff_scroll < ordinary_line_count);
+    try std.testing.expect(page.viewer.diff_scroll.row() < ordinary_line_count);
     try std.testing.expect(page.viewer.diff_horizontal_scroll <= horizontal_before);
     try std.testing.expect(page.search.match != null);
     try std.testing.expect(page.search.match_offset != null);
@@ -9430,7 +9433,7 @@ test "owned combined to folded primary remaps hidden cursor and clamps scroll" {
     try std.testing.expect(unfolded_line_count > folded_line_count);
     const unfolded_cursor_offset = controller.navigation.view().selectedDiffCursorOffset() orelse
         return error.ExpectedCombinedCursorOffset;
-    page.viewer.diff_scroll = unfolded_line_count;
+    page.viewer.diff_scroll = .{ .logical = unfolded_line_count };
 
     controller.advanceStatusSnapshotRevision(allocator);
     var unstaged_status = try git_status.StatusBundle.parseOwned(allocator, " M a\x00");
@@ -9453,7 +9456,7 @@ test "owned combined to folded primary remaps hidden cursor and clamps scroll" {
         .hunk_line => |line| try std.testing.expect(line.hunk_index != 2),
         else => {},
     }
-    try std.testing.expect(page.viewer.diff_scroll < ordinary_line_count);
+    try std.testing.expect(page.viewer.diff_scroll.row() < ordinary_line_count);
 }
 
 test "final staged hunk unstage removes primary combined authority without replacing primary" {
@@ -9464,7 +9467,7 @@ test "final staged hunk unstage removes primary combined authority without repla
             .selected_target = .{ .diff_file = 0 },
             .display_mode = .unified,
             .diff_cursor = .{ .hunk_line = .{ .hunk_index = 1, .line_index = 1 } },
-            .diff_scroll = 4,
+            .diff_scroll = .{ .logical = 4 },
             .diff_horizontal_scroll = 2,
         },
     };
@@ -9493,12 +9496,12 @@ test "final staged hunk unstage removes primary combined authority without repla
     try page.search.query.insertSlice("beta");
     controller.navigation.refreshSearchForSelectedFile(allocator);
     controller.navigation.selectSearchMatch(allocator, .forward);
-    page.viewer.diff_scroll = 4;
+    page.viewer.diff_scroll = .{ .logical = 4 };
     page.viewer.diff_horizontal_scroll = 2;
     const search_before = page.search.match.?;
     const search_offset_before = page.search.match_offset;
     const cursor_before = page.viewer.diff_cursor;
-    const scroll_before = page.viewer.diff_scroll;
+    const scroll_before = page.viewer.diff_scroll.row();
     const horizontal_before = page.viewer.diff_horizontal_scroll;
 
     var candidate = try testCombinedReuseCandidate(
@@ -9544,7 +9547,7 @@ test "final staged hunk unstage removes primary combined authority without repla
     try std.testing.expect(std.meta.eql(search_before, page.search.match.?));
     try std.testing.expectEqual(search_offset_before, page.search.match_offset);
     try std.testing.expect(std.meta.eql(cursor_before, page.viewer.diff_cursor));
-    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, page.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_before, page.viewer.diff_horizontal_scroll);
     const accepted_clipboard = try page.completed_selection.?.clipboardText(allocator);
     defer allocator.free(accepted_clipboard);
@@ -10594,7 +10597,7 @@ test "projection candidate survives exact rebuild and clears on changed content 
     changed_owned = false;
     try std.testing.expect(page.completed_selection == null);
     try expectTestSelectionViewportRestored(controller, changed_viewport);
-    try std.testing.expectEqual(@as(usize, 0), page.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), page.viewer.diff_scroll.row());
 }
 
 test "deferred source terminals consume blocked and accepted ownership" {

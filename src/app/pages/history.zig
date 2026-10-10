@@ -1540,7 +1540,7 @@ test "History picker revalidates accepted context and repository replacement fen
     state.diff.viewer = .{
         .selected_node = 3,
         .focus = .diff,
-        .diff_scroll = 7,
+        .diff_scroll = .{ .logical = 7 },
         .display_mode = .unified,
     };
     const accepted_origin = state.accepted.?.origin.branch.ptr;
@@ -1552,7 +1552,7 @@ test "History picker revalidates accepted context and repository replacement fen
     try std.testing.expectEqual(CurrentView.diff, state.current_view);
     try std.testing.expectEqual(accepted_origin, state.accepted.?.origin.branch.ptr);
     try std.testing.expectEqual(@as(usize, 3), state.diff.viewer.selected_node);
-    try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll.row());
     try std.testing.expect(state.diff.viewer.display_mode == .unified);
     state.cancelLoad();
 
@@ -1964,11 +1964,11 @@ test "History branch switch resets picker only on success and preserves accepted
         try std.testing.expectEqual(case.policy, state.nextRequest().?.initial);
         // The accepted range is an immutable selection, separate from the new picker draft.
         state.current_view = .diff;
-        state.diff.viewer.diff_scroll = 7;
+        state.diff.viewer.diff_scroll = .{ .logical = 7 };
         state.branchSwitchFinished(allocator, case.success);
         try std.testing.expectEqual(CurrentView.diff, state.current_view);
         try std.testing.expectEqualDeep(accepted_request, state.accepted.?.request);
         try std.testing.expectEqual(@as(usize, 2), state.accepted.?.request.intent.commitCount());
-        try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll);
+        try std.testing.expectEqual(@as(usize, 7), state.diff.viewer.diff_scroll.row());
     }
 }

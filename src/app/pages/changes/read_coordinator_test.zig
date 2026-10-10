@@ -571,7 +571,7 @@ fn canonicalPublicationTestApp(
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
-                .diff_scroll = 1,
+                .diff_scroll = .{ .logical = 1 },
                 .diff_horizontal_scroll = 2,
                 .sidebar_horizontal_scroll = 1,
             },
@@ -624,7 +624,7 @@ fn canonicalPublicationPrimaryTestApp(
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
-                .diff_scroll = 1,
+                .diff_scroll = .{ .logical = 1 },
                 .diff_horizontal_scroll = 2,
                 .sidebar_horizontal_scroll = 1,
             },
@@ -688,7 +688,7 @@ fn ordinaryPrimaryPublicationTestApp(
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 0 },
-                .diff_scroll = 1,
+                .diff_scroll = .{ .logical = 1 },
                 .diff_horizontal_scroll = 2,
                 .sidebar_horizontal_scroll = 1,
             },
@@ -1054,7 +1054,7 @@ fn expectFreshCanonicalActionCapabilities(
         else => return error.ExpectedFreshFileUnstageCapability,
     }
 
-    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     app.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
     switch (app.changesOperations().selectedHunkUnstageTarget(allocator)) {
         .ready => |target| {
@@ -1187,7 +1187,7 @@ fn expectFreshCanonicalCachedPublication(
         else => return error.ExpectedFreshFileUnstageCapability,
     }
 
-    app.pages.changes.viewer.diff_scroll = 0;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = 0 };
     app.pages.changes.viewer.diff_cursor = .{ .hunk_header = 0 };
     switch (app.changesOperations().selectedHunkToggleOperation()) {
         .operation => |operation| try std.testing.expectEqual(
@@ -1337,7 +1337,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
     const source_revision_before = app.pages.changes.source_session_revision;
     const status_revision_before = app.pages.changes.status_snapshot_revision;
     const cursor_before = app.pages.changes.viewer.diff_cursor;
-    const scroll_before = app.pages.changes.viewer.diff_scroll;
+    const scroll_before = app.pages.changes.viewer.diff_scroll.row();
     const horizontal_before = app.pages.changes.viewer.diff_horizontal_scroll;
     const sidebar_horizontal_before =
         app.pages.changes.viewer.sidebar_horizontal_scroll;
@@ -1379,7 +1379,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
         app.pages.changes.viewer.selected_target.?,
     );
     try std.testing.expectEqual(cursor_before, app.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(
         horizontal_before,
         app.pages.changes.viewer.diff_horizontal_scroll,
@@ -1500,7 +1500,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
         ));
         try std.testing.expect(app.pages.changes.search.match != null);
         try std.testing.expect(
-            app.pages.changes.viewer.diff_scroll <
+            app.pages.changes.viewer.diff_scroll.row() <
                 app.changesNavigationView().displayedDiffLineCount(),
         );
         try std.testing.expect(
@@ -1523,7 +1523,7 @@ fn expectOrdinaryPrimaryNoTargetPublication(
             .{ .content = token_before, .display_hunk_index = 1 },
         ));
         try std.testing.expectEqual(cursor_before, app.pages.changes.viewer.diff_cursor);
-        try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll);
+        try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll.row());
         try std.testing.expectEqual(
             horizontal_before,
             app.pages.changes.viewer.diff_horizontal_scroll,
@@ -2850,7 +2850,7 @@ test "Changes ordinary primary publication retains primary until cached result" 
         try std.testing.expectEqualStrings("new", app.pages.changes.search.query.slice());
         try std.testing.expect(app.pages.changes.search.match != null);
         try std.testing.expect(
-            app.pages.changes.viewer.diff_scroll <
+            app.pages.changes.viewer.diff_scroll.row() <
                 app.changesNavigationView().displayedDiffLineCount(),
         );
         try std.testing.expect(
@@ -2965,7 +2965,7 @@ test "Changes canonical publication exact acceptance retains navigation search a
     );
     const selected_tail = app.changesNavigationView().displayedDiffLineCount() -|
         app.changesNavigationView().diffVisibleRows();
-    app.pages.changes.viewer.diff_scroll = selected_tail;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = selected_tail };
     const selection_viewport_before = app.changesNavigationView().captureSelectionViewportAnchor() orelse
         return error.ExpectedSelectionViewportAnchor;
     try std.testing.expectEqual(selected_tail, selection_viewport_before.raw_presentation_scroll);
@@ -2974,7 +2974,7 @@ test "Changes canonical publication exact acceptance retains navigation search a
         .none, .generated_row => return error.ExpectedParsedSelectionViewportSource,
     }
     const cursor_before = app.pages.changes.viewer.diff_cursor;
-    const scroll_before = app.pages.changes.viewer.diff_scroll;
+    const scroll_before = app.pages.changes.viewer.diff_scroll.row();
     const token_before = app.pages.changes.completed_selection.?.token;
     const clipboard_before = try app.pages.changes.completed_selection.?.clipboardText(allocator);
     defer allocator.free(clipboard_before);
@@ -3009,7 +3009,7 @@ test "Changes canonical publication exact acceptance retains navigation search a
     try finishCanonicalPublicationBranch(&app, &ctx.ctx, allocator, roots.a, reads);
 
     try std.testing.expectEqual(cursor_before, app.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(horizontal_before, app.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expectEqual(sidebar_horizontal_before, app.pages.changes.viewer.sidebar_horizontal_scroll);
     try std.testing.expectEqualStrings("staged", app.pages.changes.search.query.slice());
@@ -3023,7 +3023,7 @@ test "Changes canonical publication exact acceptance retains navigation search a
     try std.testing.expect(selection_viewport_before.basis.eql(selection_viewport_after.basis));
     try std.testing.expectEqual(
         selection_viewport_before.raw_presentation_scroll,
-        app.pages.changes.viewer.diff_scroll,
+        app.pages.changes.viewer.diff_scroll.row(),
     );
     const token_after = app.changesNavigationView().currentContentToken() orelse
         return error.ExpectedContentToken;
@@ -3458,7 +3458,7 @@ test "Changes canonical publication projection failure publishes failure body at
     _ = try installCanonicalPublicationLineageOwners(&app, allocator, roots.a);
     const selected_tail = app.changesNavigationView().displayedDiffLineCount() -|
         app.changesNavigationView().diffVisibleRows();
-    app.pages.changes.viewer.diff_scroll = selected_tail;
+    app.pages.changes.viewer.diff_scroll = .{ .logical = selected_tail };
     const selection_viewport_before = app.changesNavigationView().captureSelectionViewportAnchor() orelse
         return error.ExpectedSelectionViewportAnchor;
     try std.testing.expectEqual(selected_tail, selection_viewport_before.raw_presentation_scroll);
@@ -3513,9 +3513,9 @@ test "Changes canonical publication projection failure publishes failure body at
     try std.testing.expect(app.pages.changes.completed_selection == null);
     try std.testing.expectEqual(
         @as(usize, 0),
-        app.changesNavigationView().restoredSelectionViewportScroll(selection_viewport_before),
+        app.changesNavigationView().restoredViewport(selection_viewport_before).row(),
     );
-    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expect(!changes_read.testing.readBusy(app.changesRead()));
 }
 
@@ -3939,7 +3939,7 @@ test "unchanged full cycle preserves projection semantic identity" {
             .load = .{ .generation = 7, .state = .{ .loaded = app_test_support.loadedSession(app_test_support.loadedDiffOne()) } },
             .source_session_revision = 17,
             .status_snapshot_revision = 19,
-            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 2 },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = .{ .logical = 2 } },
         } },
         .allocator = std.testing.allocator,
         .terminal_size = .{ .width = 100, .height = 40 },
@@ -3976,7 +3976,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     const projection_before = app.changesNavigationView().activeCombinedProjection() orelse return error.ExpectedCombinedProjection;
     const hunks_before = projection_before.displayFile().hunks.ptr;
     const cursor_before = app.pages.changes.viewer.diff_cursor;
-    const scroll_before = app.pages.changes.viewer.diff_scroll;
+    const scroll_before = app.pages.changes.viewer.diff_scroll.row();
 
     const status_generation = app.pages.changes.status_load.prepare(true);
     app.pages.changes.status_load.begin(1, .{});
@@ -3999,7 +3999,7 @@ test "unchanged full cycle preserves projection semantic identity" {
     try std.testing.expectEqual(@as(u64, 17), app.pages.changes.source_session_revision);
     try std.testing.expectEqual(@as(u64, 19), app.pages.changes.status_snapshot_revision);
     try std.testing.expectEqual(cursor_before, app.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(scroll_before, app.pages.changes.viewer.diff_scroll.row());
 }
 
 test "final projection prefers explicit interim navigation override" {
@@ -4050,7 +4050,7 @@ test "final projection prefers explicit interim navigation override" {
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .hunk_header = 1 },
             .diff_cursor_offset = 5,
-            .diff_scroll = 4,
+            .diff_scroll = .{ .logical = 4 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -4062,7 +4062,7 @@ test "final projection prefers explicit interim navigation override" {
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .hunk_header = 0 },
             .diff_cursor_offset = 0,
-            .diff_scroll = 0,
+            .diff_scroll = .{ .logical = 0 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -4101,7 +4101,7 @@ test "empty watch source carries combined navigation into cached projection" {
             .status_load = .{ .generation = 7, .pending = .{ .generation = 7, .origin = .background, .background_cycle_id = 1 } },
             .source_session_revision = 37,
             .status_snapshot_revision = 41,
-            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = 3 },
+            .viewer = .{ .selected_target = .{ .diff_file = 0 }, .diff_cursor = .{ .hunk_header = 1 }, .diff_scroll = .{ .logical = 3 } },
             .pending_reload = .{ .generation = 2, .kind = .watch },
         } },
         .allocator = std.testing.allocator,
@@ -4404,7 +4404,7 @@ test "selected path change supersedes pending display restore" {
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .hunk_header = 0 },
             .diff_cursor_offset = 0,
-            .diff_scroll = 0,
+            .diff_scroll = .{ .logical = 0 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -4466,7 +4466,7 @@ test "file search selection remains authoritative through successor projection a
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .hunk_header = 0 },
             .diff_cursor_offset = 0,
-            .diff_scroll = 0,
+            .diff_scroll = .{ .logical = 0 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -5316,7 +5316,7 @@ test "stale diff result does not clear newer pending reload metadata" {
             .visible_sidebar_row = 0,
             .diff_cursor = .{ .hunk_header = 0 },
             .diff_cursor_offset = 0,
-            .diff_scroll = 0,
+            .diff_scroll = .{ .logical = 0 },
             .diff_horizontal_scroll = 0,
             .sidebar_horizontal_scroll = 0,
             .search_coordinate = null,
@@ -5344,7 +5344,7 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
-                .diff_scroll = 3,
+                .diff_scroll = .{ .logical = 3 },
                 .diff_horizontal_scroll = 4,
                 .sidebar_horizontal_scroll = 2,
             },
@@ -5371,7 +5371,7 @@ test "watch no-op diff load preserves session view state and staged hunk marks" 
     });
 
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 3), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expectEqual(@as(usize, 4), app.pages.changes.viewer.diff_horizontal_scroll);
     try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.sidebar_horizontal_scroll);
     try std.testing.expect(app.pages.changes.staged_hunks.containsExact("/repo", "a", mark_key));
@@ -5399,7 +5399,7 @@ test "changed watch reload restores acceptance-time navigation instead of launch
                     .visible_sidebar_row = 0,
                     .diff_cursor = .{ .metadata = 0 },
                     .diff_cursor_offset = 0,
-                    .diff_scroll = 0,
+                    .diff_scroll = .{ .logical = 0 },
                     .diff_horizontal_scroll = 0,
                     .sidebar_horizontal_scroll = 0,
                     .search_coordinate = null,
@@ -5454,7 +5454,7 @@ test "unchanged recovery clears its source failure and redraws" {
                     .visible_sidebar_row = 0,
                     .diff_cursor = .{ .hunk_header = 0 },
                     .diff_cursor_offset = 0,
-                    .diff_scroll = 0,
+                    .diff_scroll = .{ .logical = 0 },
                     .diff_horizontal_scroll = 0,
                     .sidebar_horizontal_scroll = 0,
                     .search_coordinate = null,
@@ -5948,7 +5948,7 @@ test "anchored reload keeps cursor when search query is present" {
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
                 .diff_cursor = .{ .hunk_header = 1 },
-                .diff_scroll = 2,
+                .diff_scroll = .{ .logical = 2 },
             },
         } },
         .allocator = std.testing.allocator,
@@ -5980,7 +5980,7 @@ test "anchored reload keeps cursor when search query is present" {
     });
 
     try std.testing.expectEqual(diff_view_model.BodyCoordinate{ .hunk_header = 1 }, app.pages.changes.viewer.diff_cursor);
-    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.diff_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.pages.changes.viewer.diff_scroll.row());
     try std.testing.expect(app.pages.changes.search.match != null);
 }
 
@@ -5994,7 +5994,7 @@ test "manual reload restores anchor after visible state is cleared" {
                 .selected_target = .{ .diff_file = 1 },
                 .selected_node = 1,
                 .diff_cursor = .{ .metadata = 0 },
-                .diff_scroll = 2,
+                .diff_scroll = .{ .logical = 2 },
             },
         } },
         .allocator = std.testing.allocator,
