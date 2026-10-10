@@ -3268,21 +3268,23 @@ test "help preserves configured keys and aligned wrapped descriptions while scro
     }
 }
 
-test "diff Help displays the effective line wrap key" {
+test "source Help displays the effective line wrap key" {
     var harness: ShellViewTestHarness = .{};
     for ([_][]const u8{ "W", "x" }) |binding| {
         var config: keymap.Config = .{};
         if (std.mem.eql(u8, binding, "x")) config.set(.toggle_line_wrap, keymap.parseKeySpec(binding).?);
         harness.keymap = .fromConfig(config);
         const context = harness.context();
-        var surface: chasen.testing.TestSurface = undefined;
-        try surface.init(60, 1);
-        defer surface.deinit();
-        _ = try drawHelpItem(helpContext(context), context.theme, &surface.surface, 0, 0, help_diff_items[6]);
-        try surface.expectCellText(0, 0, binding);
-        const snapshot = try surface.snapshot(std.testing.allocator);
-        defer std.testing.allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "toggle line wrap") != null);
+        for ([_]HelpItem{ help_diff_items[6], help_repository_source_items[5] }) |item| {
+            var surface: chasen.testing.TestSurface = undefined;
+            try surface.init(60, 1);
+            defer surface.deinit();
+            _ = try drawHelpItem(helpContext(context), context.theme, &surface.surface, 0, 0, item);
+            try surface.expectCellText(0, 0, binding);
+            const snapshot = try surface.snapshot(std.testing.allocator);
+            defer std.testing.allocator.free(snapshot);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot, "toggle line wrap") != null);
+        }
     }
 }
 
@@ -3979,6 +3981,7 @@ const help_repository_source_items = [_]HelpItem{
     .{ .key = .{ .text = "Y" }, .description = "copy selected code with context" },
     .{ .key = .{ .action = .search }, .description = "search source" },
     .{ .key = .{ .action = .toggle_line_numbers }, .description = "toggle line numbers" },
+    .{ .key = .{ .action = .toggle_line_wrap }, .description = "toggle line wrap" },
     help_group_separator,
     .{ .kind = .navigation, .key = .{ .pair = .{ .left = .previous_file, .right = .next_file } }, .description = "previous / next file (source)" },
     .{ .kind = .navigation, .key = .{ .text = "↑/↓ j/k" }, .description = "move one source row" },

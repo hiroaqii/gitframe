@@ -23,7 +23,7 @@ const file_tree = @import("../../file_tree.zig");
 const loaded_diff = @import("../../loaded_diff.zig");
 const sidebar_view_model = @import("../../sidebar/view_model.zig");
 const text_projection = @import("chasen_ui").text_projection;
-const line_wrap = @import("../../diff/line_wrap.zig");
+const line_wrap = @import("../../line_wrap.zig");
 const selection_action = @import("selection_action.zig");
 
 const LoadedDiff = loaded_diff.LoadedDiff;

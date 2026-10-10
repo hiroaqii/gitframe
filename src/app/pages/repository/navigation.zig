@@ -3,6 +3,7 @@
 const std = @import("std");
 const cursor_viewport = @import("../../cursor_viewport.zig");
 const model = @import("model.zig");
+const source_layout = @import("source_layout.zig");
 const source_geometry = @import("source_geometry.zig");
 const source = @import("../../../repository/source.zig");
 const selected_document = @import("../../../repository/document.zig");
@@ -27,10 +28,16 @@ fn moveSourceCursor(viewer: *model.ViewerState, document: *const source.Document
 
 pub fn moveSource(viewer: *model.ViewerState, document: *const source.Document, delta: isize, geometry: source_geometry.SourceGeometry) void {
     moveSourceCursor(viewer, document, delta);
+    if (viewer.line_wrap) {
+        viewer.source_cursor = @min(viewer.source_cursor, document.rowCount() - 1);
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        viewer.source_vertical_scroll = layout.reveal(viewer.source_vertical_scroll, .{ .line = viewer.source_cursor }, geometry.visible_source_rows, false);
+        return;
+    }
     clampSource(viewer, document, geometry);
-    viewer.source_vertical_scroll = cursor_viewport.placeCursorInComfortBand(
+    viewer.source_vertical_scroll.line = cursor_viewport.placeCursorInComfortBand(
         sourceBounds(document, geometry),
-        viewer.source_vertical_scroll,
+        viewer.source_vertical_scroll.line,
         viewer.source_cursor,
     );
 }
@@ -51,12 +58,18 @@ fn pageSourceByRows(
     step: usize,
     geometry: source_geometry.SourceGeometry,
 ) void {
+    if (viewer.line_wrap) {
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        viewer.source_vertical_scroll = layout.scroll(viewer.source_vertical_scroll, direction, step, geometry.visible_source_rows);
+        retainVisibleCursor(viewer, layout, geometry.visible_source_rows);
+        return;
+    }
     const target = if (direction < 0) viewer.source_cursor -| step else viewer.source_cursor +| step;
     viewer.source_cursor = @min(target, document.rowCount() - 1);
     clampSource(viewer, document, geometry);
-    viewer.source_vertical_scroll = cursor_viewport.centerCursor(
+    viewer.source_vertical_scroll.line = cursor_viewport.centerCursor(
         sourceBounds(document, geometry),
-        viewer.source_vertical_scroll,
+        viewer.source_vertical_scroll.line,
         viewer.source_cursor,
     );
 }
@@ -74,8 +87,19 @@ pub fn autoScrollSource(viewer: *model.ViewerState, document: *const source.Docu
 }
 
 fn scrollSource(viewer: *model.ViewerState, document: *const source.Document, direction: isize, geometry: source_geometry.SourceGeometry, origin: enum { pointer, drag }) void {
+    if (viewer.line_wrap) {
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        const old = layout.clamp(viewer.source_vertical_scroll, geometry.visible_source_rows);
+        viewer.source_vertical_scroll = layout.scroll(old, direction, 1, geometry.visible_source_rows);
+        if (std.meta.eql(old, viewer.source_vertical_scroll)) {
+            if (origin == .pointer and direction != 0 and geometry.visible_source_rows != 0 and
+                document.contentLineCount() != 0 and viewer.source_cursor < document.rowCount())
+                moveSourceCursor(viewer, document, if (direction < 0) -1 else 1);
+        } else retainVisibleCursor(viewer, layout, geometry.visible_source_rows);
+        return;
+    }
     const bounds = sourceBounds(document, geometry);
-    const old_scroll = bounds.clampScroll(viewer.source_vertical_scroll);
+    const old_scroll = bounds.clampScroll(viewer.source_vertical_scroll.line);
     const requested_scroll = if (direction < 0)
         old_scroll -| 1
     else if (direction > 0)
@@ -83,7 +107,7 @@ fn scrollSource(viewer: *model.ViewerState, document: *const source.Document, di
     else
         old_scroll;
     const new_scroll = bounds.clampScroll(requested_scroll);
-    viewer.source_vertical_scroll = new_scroll;
+    viewer.source_vertical_scroll.line = new_scroll;
     if (old_scroll == new_scroll) {
         if (origin == .drag or bounds.visible_rows == 0 or direction == 0 or document.contentLineCount() == 0) return;
         if (viewer.source_cursor >= document.rowCount()) return;
@@ -108,24 +132,38 @@ pub fn scrollSourceViewport(
     direction: isize,
     geometry: source_geometry.SourceGeometry,
 ) void {
+    if (viewer.line_wrap) {
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        viewer.source_vertical_scroll = layout.scroll(viewer.source_vertical_scroll, direction, 1, geometry.visible_source_rows);
+        return;
+    }
     const bounds = sourceBounds(document, geometry);
-    const current = bounds.clampScroll(viewer.source_vertical_scroll);
+    const current = bounds.clampScroll(viewer.source_vertical_scroll.line);
     const requested = if (direction < 0)
         current -| 1
     else if (direction > 0)
         current +| 1
     else
         current;
-    viewer.source_vertical_scroll = bounds.clampScroll(requested);
+    viewer.source_vertical_scroll.line = bounds.clampScroll(requested);
 }
 
 pub fn firstSource(viewer: *model.ViewerState, document: *const source.Document, geometry: source_geometry.SourceGeometry) void {
     viewer.source_cursor = 0;
+    if (viewer.line_wrap) {
+        viewer.source_vertical_scroll = .{};
+        return;
+    }
     clampSource(viewer, document, geometry);
 }
 
 pub fn lastSource(viewer: *model.ViewerState, document: *const source.Document, geometry: source_geometry.SourceGeometry) void {
     viewer.source_cursor = document.rowCount() - 1;
+    if (viewer.line_wrap) {
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        viewer.source_vertical_scroll = layout.reveal(viewer.source_vertical_scroll, .{ .line = viewer.source_cursor }, geometry.visible_source_rows, false);
+        return;
+    }
     clampSource(viewer, document, geometry);
 }
 
@@ -141,15 +179,21 @@ pub fn gotoSourceLine(
     std.debug.assert(line_index < document.contentLineCount());
     viewer.focus = .source;
     viewer.source_cursor = line_index;
+    if (viewer.line_wrap) {
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        viewer.source_vertical_scroll = layout.reveal(viewer.source_vertical_scroll, .{ .line = line_index }, geometry.visible_source_rows, true);
+        return;
+    }
     clampSource(viewer, document, geometry);
-    viewer.source_vertical_scroll = cursor_viewport.centerCursor(
+    viewer.source_vertical_scroll.line = cursor_viewport.centerCursor(
         sourceBounds(document, geometry),
-        viewer.source_vertical_scroll,
+        viewer.source_vertical_scroll.line,
         viewer.source_cursor,
     );
 }
 
 pub fn scrollSourceHorizontal(viewer: *model.ViewerState, document: *const source.Document, delta: isize, geometry: source_geometry.SourceGeometry) void {
+    if (viewer.line_wrap) return;
     if (delta < 0)
         viewer.source_horizontal_scroll -|= @intCast(-delta)
     else
@@ -163,11 +207,23 @@ pub fn clampSource(
     document: *const source.Document,
     geometry: source_geometry.SourceGeometry,
 ) void {
+    if (viewer.line_wrap) {
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        viewer.source_cursor = @min(viewer.source_cursor, document.rowCount() - 1);
+        viewer.source_vertical_scroll = layout.clamp(viewer.source_vertical_scroll, geometry.visible_source_rows);
+        if (geometry.visible_source_rows > 0) {
+            const visible = layout.visibleLines(viewer.source_vertical_scroll, geometry.visible_source_rows);
+            if (viewer.source_cursor < visible.first or viewer.source_cursor > visible.last)
+                viewer.source_vertical_scroll = layout.reveal(viewer.source_vertical_scroll, .{ .line = viewer.source_cursor }, geometry.visible_source_rows, false);
+        }
+        return;
+    }
+    viewer.source_vertical_scroll.intra = null;
     const bounds = sourceBounds(document, geometry);
     viewer.source_cursor = @min(viewer.source_cursor, document.rowCount() - 1);
-    viewer.source_vertical_scroll = cursor_viewport.keepCursorVisible(
+    viewer.source_vertical_scroll.line = cursor_viewport.keepCursorVisible(
         bounds,
-        viewer.source_vertical_scroll,
+        viewer.source_vertical_scroll.line,
         viewer.source_cursor,
     );
     const maximum = document.maxDisplayWidth() -| @as(usize, geometry.text_width);
@@ -182,17 +238,31 @@ pub fn revealMatch(
 ) void {
     viewer.focus = .source;
     viewer.source_cursor = match.line;
+    if (viewer.line_wrap) {
+        const layout = source_layout.Layout.init(document, viewer.*, geometry);
+        viewer.source_vertical_scroll = layout.reveal(viewer.source_vertical_scroll, .{ .line = match.line, .intra = .{
+            .byte = match.start,
+            .fingerprint = document.fingerprint,
+        } }, geometry.visible_source_rows, false);
+        return;
+    }
     const match_col = document.displayColumnForByte(match.line, match.start) orelse 0;
     if (match_col < viewer.source_horizontal_scroll) viewer.source_horizontal_scroll = match_col;
     if (geometry.text_width > 0 and match_col >= viewer.source_horizontal_scroll + geometry.text_width) {
         viewer.source_horizontal_scroll = match_col - geometry.text_width + 1;
     }
     clampSource(viewer, document, geometry);
-    viewer.source_vertical_scroll = cursor_viewport.placeCursorInComfortBand(
+    viewer.source_vertical_scroll.line = cursor_viewport.placeCursorInComfortBand(
         sourceBounds(document, geometry),
-        viewer.source_vertical_scroll,
+        viewer.source_vertical_scroll.line,
         viewer.source_cursor,
     );
+}
+
+fn retainVisibleCursor(viewer: *model.ViewerState, layout: source_layout.Layout, visible_rows: usize) void {
+    if (visible_rows == 0) return;
+    const visible = layout.visibleLines(viewer.source_vertical_scroll, visible_rows);
+    viewer.source_cursor = std.math.clamp(viewer.source_cursor, visible.first, visible.last);
 }
 
 fn sourceDocumentWithRowsForTest(allocator: std.mem.Allocator, rows: usize) !source.Document {
@@ -200,6 +270,47 @@ fn sourceDocumentWithRowsForTest(allocator: std.mem.Allocator, rows: usize) !sou
     errdefer allocator.free(bytes);
     @memset(bytes, '\n');
     return source.Document.initOwned(allocator, bytes, .init(bytes));
+}
+
+test "repository wrap navigation reaches tall line tail and reveals same-line occurrences" {
+    const allocator = std.testing.allocator;
+    const line = "x" ** 40 ++ "needle" ++ "y" ** 40 ++ "needleEND";
+    const bytes = try allocator.dupe(u8, line ++ "\nnext\n");
+    var document = try source.Document.initOwnedOrFree(allocator, bytes, .init(bytes));
+    defer document.deinit(allocator);
+    const geometry = source_geometry.SourceGeometry.init(.{ .width = 12, .height = 6 }, &document, false);
+    var viewer: model.ViewerState = .{ .line_wrap = true, .focus = .source };
+    pageSource(&viewer, &document, 1, geometry);
+    try std.testing.expectEqual(@as(usize, 30), viewer.source_vertical_scroll.intra.?.byte);
+    try std.testing.expectEqual(@as(usize, 0), viewer.source_cursor);
+    wheelSource(&viewer, &document, 1, geometry);
+    try std.testing.expectEqual(@as(usize, 40), viewer.source_vertical_scroll.intra.?.byte);
+    const first_match = document.findNext("needle", null).?;
+    const second_match = document.findNext("needle", first_match).?;
+    try std.testing.expectEqual(@as(usize, 86), second_match.start);
+    revealMatch(&viewer, &document, second_match, geometry);
+    const layout = source_layout.Layout.init(&document, viewer, geometry);
+    const match_row = layout.contentRowAt(geometry, viewer.source_vertical_scroll, geometry.body_first_row + 1).?;
+    try std.testing.expect(match_row.fragment.?.bytes.start <= second_match.start);
+    try std.testing.expect(match_row.fragment.?.bytes.end > second_match.start);
+    revealMatch(&viewer, &document, document.findPrevious("needle", second_match).?, geometry);
+    try std.testing.expectEqual(@as(usize, 30), viewer.source_vertical_scroll.intra.?.byte);
+    for (0..20) |_| wheelSource(&viewer, &document, 1, geometry);
+    try std.testing.expectEqual(@as(usize, 80), viewer.source_vertical_scroll.intra.?.byte);
+    const bottom = viewer.source_vertical_scroll;
+    autoScrollSource(&viewer, &document, 1, geometry);
+    try std.testing.expectEqualDeep(bottom, viewer.source_vertical_scroll);
+    // Wheel reaches the next source line at the edge; explicit k returns to
+    // the first fragment of the preceding logical line.
+    try std.testing.expectEqual(@as(usize, 1), viewer.source_cursor);
+    moveSource(&viewer, &document, -1, geometry);
+    try std.testing.expectEqual(@as(usize, 0), viewer.source_cursor);
+    try std.testing.expect(viewer.source_vertical_scroll.intra == null);
+    moveSource(&viewer, &document, 1, geometry);
+    try std.testing.expectEqual(@as(usize, 1), viewer.source_cursor);
+    try std.testing.expectEqualDeep(bottom, viewer.source_vertical_scroll);
+    scrollSourceHorizontal(&viewer, &document, 8, geometry);
+    try std.testing.expectEqual(@as(usize, 0), viewer.source_horizontal_scroll);
 }
 
 test "repository source comfort keeps single row navigation in band and permits content edges" {
@@ -212,35 +323,35 @@ test "repository source comfort keeps single row navigation in band and permits 
     var viewer: model.ViewerState = .{
         .focus = .source,
         .source_cursor = 23,
-        .source_vertical_scroll = 20,
+        .source_vertical_scroll = .{ .line = 20 },
     };
     moveSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
     moveSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 25), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
     moveSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 26), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll.line);
 
     viewer.source_cursor = 23;
-    viewer.source_vertical_scroll = 20;
+    viewer.source_vertical_scroll.line = 20;
     moveSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 22), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
 
     viewer.source_cursor = 20;
-    viewer.source_vertical_scroll = 20;
+    viewer.source_vertical_scroll.line = 20;
     halfPageSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
 
     firstSource(&viewer, &document, geometry);
     try std.testing.expectEqual(@as(usize, 0), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll.line);
     lastSource(&viewer, &document, geometry);
     try std.testing.expectEqual(@as(usize, 99), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll.line);
 }
 
 test "repository source wheel preserves visible screen rows and clamps offscreen cursors" {
@@ -251,43 +362,43 @@ test "repository source wheel preserves visible screen rows and clamps offscreen
     var viewer: model.ViewerState = .{
         .focus = .source,
         .source_cursor = 20,
-        .source_vertical_scroll = 20,
+        .source_vertical_scroll = .{ .line = 20 },
         .source_horizontal_scroll = 7,
     };
 
     for (0..geometry.visible_source_rows) |screen_row| {
         viewer.source_cursor = 20 + screen_row;
-        viewer.source_vertical_scroll = 20;
+        viewer.source_vertical_scroll.line = 20;
         wheelSource(&viewer, &document, 1, geometry);
-        try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+        try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll.line);
         try std.testing.expectEqual(21 + screen_row, viewer.source_cursor);
 
         wheelSource(&viewer, &document, -1, geometry);
-        try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+        try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
         try std.testing.expectEqual(20 + screen_row, viewer.source_cursor);
         try std.testing.expectEqual(@as(usize, 7), viewer.source_horizontal_scroll);
     }
 
     viewer.source_cursor = 0;
     wheelSource(&viewer, &document, 1, geometry);
-    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 21), viewer.source_cursor);
 
     viewer.source_cursor = 29;
     wheelSource(&viewer, &document, -1, geometry);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 27), viewer.source_cursor);
 
     viewer.source_cursor = 4;
-    viewer.source_vertical_scroll = 0;
+    viewer.source_vertical_scroll.line = 0;
     wheelSource(&viewer, &document, -1, geometry);
-    try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 3), viewer.source_cursor);
 
     viewer.source_cursor = 95;
-    viewer.source_vertical_scroll = 92;
+    viewer.source_vertical_scroll.line = 92;
     wheelSource(&viewer, &document, 1, geometry);
-    try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 92), viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 96), viewer.source_cursor);
 }
 
@@ -301,16 +412,16 @@ test "repository wheel reaches both content edges for long short and exact-fit d
         for ([_]isize{ -1, 1 }) |direction| {
             var viewer: model.ViewerState = .{
                 .source_cursor = rows / 2,
-                .source_vertical_scroll = if (direction < 0) 0 else max_scroll,
+                .source_vertical_scroll = .{ .line = if (direction < 0) 0 else max_scroll },
                 .source_horizontal_scroll = 7,
             };
-            const edge_scroll = viewer.source_vertical_scroll;
+            const edge_scroll = viewer.source_vertical_scroll.line;
             var expected = viewer.source_cursor;
             for (0..rows + 2) |_| {
                 expected = if (direction < 0) expected -| 1 else @min(expected + 1, rows - 1);
                 wheelSource(&viewer, &document, direction, geometry);
                 try std.testing.expectEqual(expected, viewer.source_cursor);
-                try std.testing.expectEqual(edge_scroll, viewer.source_vertical_scroll);
+                try std.testing.expectEqual(edge_scroll, viewer.source_vertical_scroll.line);
                 try std.testing.expectEqual(@as(usize, 7), viewer.source_horizontal_scroll);
             }
         }
@@ -327,13 +438,13 @@ test "repository wheel edge leaves drag viewport-only zero-height and zero inten
         autoScrollSource(&viewer, &document, direction, geometry);
         scrollSourceViewport(&viewer, &document, direction, geometry);
         try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
-        try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll);
+        try std.testing.expectEqual(@as(usize, 0), viewer.source_vertical_scroll.line);
     }
     wheelSource(&viewer, &document, 0, geometry);
     try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
     const zero = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 2 }, &document, true);
     for ([_]isize{ -1, 1 }) |direction| {
-        viewer.source_vertical_scroll = if (direction < 0) 0 else sourceBounds(&document, zero).maxScroll();
+        viewer.source_vertical_scroll.line = if (direction < 0) 0 else sourceBounds(&document, zero).maxScroll();
         wheelSource(&viewer, &document, direction, zero);
         try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
     }
@@ -347,25 +458,25 @@ test "repository source comfort centers pages and places explicit search in band
     var viewer: model.ViewerState = .{
         .focus = .source,
         .source_cursor = 24,
-        .source_vertical_scroll = 20,
+        .source_vertical_scroll = .{ .line = 20 },
     };
 
     pageSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 33), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 29), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 29), viewer.source_vertical_scroll.line);
     pageSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
 
     halfPageSource(&viewer, &document, 1, geometry);
     try std.testing.expectEqual(@as(usize, 28), viewer.source_cursor);
     halfPageSource(&viewer, &document, -1, geometry);
     try std.testing.expectEqual(@as(usize, 24), viewer.source_cursor);
 
-    viewer.source_vertical_scroll = 0;
+    viewer.source_vertical_scroll.line = 0;
     revealMatch(&viewer, &document, .{ .line = 50, .start = 0, .end = 0 }, geometry);
     try std.testing.expectEqual(@as(usize, 50), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 45), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 45), viewer.source_vertical_scroll.line);
 }
 
 test "repository source line jump centers real rows and preserves horizontal scroll" {
@@ -380,7 +491,7 @@ test "repository source line jump centers real rows and preserves horizontal scr
     var viewer: model.ViewerState = .{
         .focus = .source,
         .source_cursor = 1,
-        .source_vertical_scroll = 0,
+        .source_vertical_scroll = .{ .line = 0 },
         .source_horizontal_scroll = 5,
     };
 
@@ -390,7 +501,7 @@ test "repository source line jump centers real rows and preserves horizontal scr
     try std.testing.expectEqual(@as(usize, 5), viewer.source_horizontal_scroll);
     try std.testing.expectEqual(
         cursor_viewport.centerCursor(sourceBounds(&document, geometry), 0, 14),
-        viewer.source_vertical_scroll,
+        viewer.source_vertical_scroll.line,
     );
 }
 
@@ -403,50 +514,50 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
     var viewer: model.ViewerState = .{
         .focus = .source,
         .source_cursor = 24,
-        .source_vertical_scroll = 20,
+        .source_vertical_scroll = .{ .line = 20 },
     };
     clampSource(&viewer, &document, regular);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
 
     const two_rows = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 5 }, &document, true);
     clampSource(&viewer, &document, two_rows);
-    try std.testing.expectEqual(@as(usize, 23), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 23), viewer.source_vertical_scroll.line);
 
     const zero_rows = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 2 }, &document, true);
     viewer.source_cursor = 5;
-    viewer.source_vertical_scroll = 20;
+    viewer.source_vertical_scroll.line = 20;
     moveSource(&viewer, &document, 1, zero_rows);
     try std.testing.expectEqual(@as(usize, 6), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
     wheelSource(&viewer, &document, 1, zero_rows);
     try std.testing.expectEqual(@as(usize, 6), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll.line);
     halfPageSource(&viewer, &document, 1, zero_rows);
     try std.testing.expectEqual(@as(usize, 7), viewer.source_cursor);
 
     const spacer_only = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 3 }, &document, true);
     viewer.source_cursor = 20;
-    viewer.source_vertical_scroll = 20;
+    viewer.source_vertical_scroll.line = 20;
     moveSource(&viewer, &document, 1, spacer_only);
-    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 20), viewer.source_vertical_scroll.line);
 
     const one_row = source_geometry.SourceGeometry.init(.{ .width = 80, .height = 4 }, &document, true);
     viewer.source_cursor = 21;
-    viewer.source_vertical_scroll = 20;
+    viewer.source_vertical_scroll.line = 20;
     moveSource(&viewer, &document, 1, one_row);
-    try std.testing.expectEqual(@as(usize, 22), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 22), viewer.source_vertical_scroll.line);
 
     viewer.source_cursor = 21;
-    viewer.source_vertical_scroll = 20;
+    viewer.source_vertical_scroll.line = 20;
     moveSource(&viewer, &document, 1, two_rows);
-    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 21), viewer.source_vertical_scroll.line);
 
     var empty = try sourceDocumentWithRowsForTest(allocator, 0);
     defer empty.deinit(allocator);
     var empty_viewer: model.ViewerState = .{
         .focus = .source,
         .source_cursor = 99,
-        .source_vertical_scroll = 99,
+        .source_vertical_scroll = .{ .line = 99 },
     };
     clampSource(&empty_viewer, &empty, two_rows);
     wheelSource(&empty_viewer, &empty, 1, two_rows);
@@ -455,7 +566,7 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
     firstSource(&empty_viewer, &empty, two_rows);
     lastSource(&empty_viewer, &empty, two_rows);
     try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_vertical_scroll.line);
 }
 
 /// File search follows the active tree projection even though it scans raw
@@ -493,7 +604,7 @@ test "repository selection navigation clamps cursor scroll and horizontal cells"
     var viewer: model.ViewerState = .{ .focus = .source };
     moveSource(&viewer, &document, 20, geometry);
     try std.testing.expectEqual(@as(usize, 2), viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 2), viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 2), viewer.source_vertical_scroll.line);
     scrollSourceHorizontal(&viewer, &document, 8, geometry);
     // Two gutter columns, a line number, and a separator leave three text cells.
     try std.testing.expectEqual(@as(usize, 7), viewer.source_horizontal_scroll);

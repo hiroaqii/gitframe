@@ -1,4 +1,4 @@
-//! Borrowed diff fragments. Projection owns grapheme, byte and source TAB geometry.
+//! Borrowed line fragments. Projection owns grapheme, byte and source TAB geometry.
 const std = @import("std");
 const projection = @import("chasen_ui").text_projection;
 

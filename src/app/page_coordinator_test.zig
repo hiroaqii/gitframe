@@ -183,7 +183,7 @@ test "repository keyboard line selection page exits preserve semantic viewport" 
 
         const viewport_before = app.pages.repository.captureSelectionViewportAnchor() orelse
             return error.ExpectedSelectionViewportAnchor;
-        try std.testing.expectEqual(@as(usize, 5), viewport_before.semantic_source);
+        try std.testing.expectEqual(@as(usize, 5), viewport_before.line);
 
         try requestPageSwitchForTest(&app, &ctx.ctx, target);
 
@@ -194,11 +194,11 @@ test "repository keyboard line selection page exits preserve semantic viewport" 
         if (retain_prior) {
             const viewport_after = app.pages.repository.captureSelectionViewportAnchor() orelse
                 return error.ExpectedRetainedViewportAnchor;
-            try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+            try std.testing.expectEqual(viewport_before.line, viewport_after.line);
         } else {
             try std.testing.expectEqual(
-                viewport_before.semantic_source,
-                app.pages.repository.viewer.source_vertical_scroll,
+                viewport_before.line,
+                app.pages.repository.viewer.source_vertical_scroll.line,
             );
         }
     };
@@ -853,7 +853,7 @@ fn repositorySelectionViewportStateForTest(
         .viewer = .{
             .focus = .source,
             .source_cursor = 2,
-            .source_vertical_scroll = 5,
+            .source_vertical_scroll = .{ .line = 5 },
         },
     };
     errdefer state.deinit(allocator);

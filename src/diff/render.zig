@@ -15,7 +15,7 @@ const syntax_style = @import("../syntax/style.zig");
 const syntax_token = @import("../syntax/token.zig");
 const theme = @import("theme");
 const text_projection = @import("chasen_ui").text_projection;
-const line_wrap = @import("line_wrap.zig");
+const line_wrap = @import("../line_wrap.zig");
 
 pub const DisplayMode = diff_view_model.DisplayMode;
 

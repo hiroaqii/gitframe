@@ -8,6 +8,25 @@ pub const max_file_search_matches: usize = 512;
 
 pub const Focus = enum { tree, source };
 
+/// The source viewport's only retained position. Fragment rows are derived.
+pub const SourcePosition = struct {
+    line: usize = 0,
+    intra: ?struct {
+        byte: usize,
+        tab_cells: usize = 0,
+        fingerprint: @import("../../../content_fingerprint.zig").Fingerprint,
+    } = null,
+
+    pub fn admitted(self: SourcePosition, document: *const source.Document) SourcePosition {
+        var result = self;
+        result.line = @min(result.line, document.rowCount() - 1);
+        if (result.intra) |intra| {
+            if (result.line != self.line or !intra.fingerprint.eql(document.fingerprint)) result.intra = null;
+        }
+        return result;
+    }
+};
+
 pub const ViewerState = struct {
     focus: Focus = .tree,
     /// Optional user preference. Effective width is always clamped against the
@@ -25,13 +44,14 @@ pub const ViewerState = struct {
     tree_vertical_scroll: usize = 0,
     tree_horizontal_scroll: usize = 0,
     source_cursor: usize = 0,
-    source_vertical_scroll: usize = 0,
+    source_vertical_scroll: SourcePosition = .{},
     source_horizontal_scroll: usize = 0,
     line_numbers: bool = true,
+    line_wrap: bool = false,
 
     pub fn resetSource(self: *ViewerState) void {
         self.source_cursor = 0;
-        self.source_vertical_scroll = 0;
+        self.source_vertical_scroll = .{};
         self.source_horizontal_scroll = 0;
     }
 };

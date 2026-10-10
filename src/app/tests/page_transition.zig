@@ -253,17 +253,18 @@ test "Repository active pointer owner blocks wheel redraw until release" {
     try std.testing.expect(!app.pages.repository.activeMouseOwner());
 }
 
-test "line wrap routes to diff pages while text and overlays retain input" {
+test "line wrap routes to source pages while text and overlays retain input" {
     const key: chasen.Key = .{ .codepoint = 'W' };
-    for ([_]page.Id{ .changes, .compare, .history }) |active_page| {
+    for ([_]page.Id{ .changes, .compare, .history, .repository }) |active_page| {
         var input_context: app_input.KeyContext = .{ .active_page = active_page, .history = .{ .diff_view = true } };
         const expected: App.Msg = switch (active_page) {
             .changes => .{ .changes = .toggle_line_wrap },
             .compare => .{ .compare = .{ .common = .{ .shared = .toggle_line_wrap } } },
             .history => .{ .history = .{ .common = .{ .shared = .toggle_line_wrap } } },
-            .repository => unreachable,
+            .repository => .{ .repository = .toggle_line_wrap },
         };
         try std.testing.expectEqual(expected, app_input.keyToMsg(input_context, key).?);
+        input_context.repository.source_search_mode = true;
         input_context.changes.search_mode = true;
         input_context.compare.common.search_mode = true;
         input_context.history.common.search_mode = true;
@@ -271,11 +272,15 @@ test "line wrap routes to diff pages while text and overlays retain input" {
             .changes => .{ .changes = .{ .search_insert = 'W' } },
             .compare => .{ .compare = .{ .common = .{ .shared = .{ .search_insert = 'W' } } } },
             .history => .{ .history = .{ .common = .{ .shared = .{ .search_insert = 'W' } } } },
-            .repository => unreachable,
+            .repository => .{ .repository = .{ .source_search_insert = 'W' } },
         };
         try std.testing.expectEqual(search, app_input.keyToMsg(input_context, key).?);
     }
-    try std.testing.expectEqual(App.Msg{ .command_line = .owned_noop }, app_input.keyToMsg(.{ .active_page = .repository }, key).?);
+    const keymap = @import("keymap");
+    var config: keymap.Config = .{};
+    config.set(.toggle_line_wrap, .{ .plain_codepoint = 'x' });
+    try std.testing.expectEqual(App.Msg{ .repository = .toggle_line_wrap }, app_input.keyToMsg(.{ .active_page = .repository, .keymap = .fromConfig(config), .repository = .{ .keymap = .fromConfig(config) } }, .{ .codepoint = 'x' }).?);
+    try std.testing.expectEqual(App.Msg{ .repository = .{ .file_search_insert = 'W' } }, app_input.keyToMsg(.{ .active_page = .repository, .repository = .{ .file_search_mode = true } }, key).?);
     try std.testing.expect(app_input.keyToMsg(.{ .help_mode = true }, key) == null);
     try std.testing.expectEqual(App.Msg{ .commit_panel_insert = 'W' }, app_input.keyToMsg(.{ .commit_panel_mode = true }, key).?);
 }
@@ -428,6 +433,7 @@ test "changes repository transition common switch commits exact path before reva
                 .active = true,
                 .repo_epoch = 7,
                 .selected_path = "b",
+                .viewer = .{ .line_wrap = true },
             },
         },
     };
@@ -445,6 +451,7 @@ test "changes repository transition common switch commits exact path before reva
 
     try std.testing.expectEqual(page.Id.changes, app.active_page);
     try std.testing.expect(!app.pages.repository.active);
+    try std.testing.expect(app.pages.repository.viewer.line_wrap);
     try std.testing.expectEqual(@as(usize, 1), app.pages.changes.viewer.selected_node);
     try std.testing.expectEqual(context.SelectedTarget{ .diff_file = 1 }, app.pages.changes.viewer.selected_target.?);
     try std.testing.expect(app.pages.changes.viewer.view_options.line_wrap);

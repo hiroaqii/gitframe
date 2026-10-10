@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const chasen = @import("chasen");
-const text_projection = @import("chasen_ui").text_projection;
 const keymap = @import("keymap");
 const app_direction = @import("../direction.zig");
 const git_ops = @import("../git_ops.zig");
@@ -42,10 +41,10 @@ const repository_navigation = @import("repository/navigation.zig");
 const repository_selection = @import("repository/selection.zig");
 const repository_source_header = @import("repository/source_header.zig");
 const repository_source_geometry = @import("repository/source_geometry.zig");
+const repository_source_layout = @import("repository/source_layout.zig");
 const repository_tree_projection = @import("repository/tree_projection.zig");
 
-const repository_tab_width: usize = 4;
-pub const SelectionViewportAnchor = selection_action.ViewportAnchor(usize);
+pub const SelectionViewportAnchor = repository_model.SourcePosition;
 
 pub const SourceSelectionPresentation = struct {
     pub const Owner = enum { active_keyboard, completed };
@@ -185,6 +184,7 @@ pub const Msg = union(enum) {
     source_last,
     toggle_changed_filter,
     toggle_line_numbers,
+    toggle_line_wrap,
     enter_source_search,
     cancel_source_search,
     submit_source_search,
@@ -660,7 +660,7 @@ pub const RepositoryPageState = struct {
                     // The next frame clamps this against the real viewport;
                     // keeping the cursor as the provisional top row makes the
                     // accepted location visible even before that geometry pass.
-                    self.viewer.source_vertical_scroll = line_index;
+                    self.viewer.source_vertical_scroll = .{ .line = line_index };
                 } else if (accepted_generation != null) {
                     // A newly accepted target opens its source. Reusing an
                     // already displayed path with no line is intentionally a
@@ -1426,9 +1426,9 @@ pub const RepositoryPageState = struct {
         self.reconcileNoSourceFocus();
         if (viewport_anchor) |anchor| if (self.currentSource()) |document| {
             // Coordinator clamps against the real frame geometry after this
-            // allocation-free semantic restore. Zero visible rows deliberately
+            // allocation-free semantic restore. Absent geometry deliberately
             // avoid inventing a terminal height inside the page owner.
-            self.restoreSourceViewportAnchor(anchor, document, 0);
+            self.restoreSourceViewportAnchor(anchor, document, null);
         };
         self.source_search.clear();
         self.needs_syntax_request = source_syntax_runtime.enabled and self.currentSource() != null;
@@ -1775,6 +1775,7 @@ pub const RepositoryPageState = struct {
                     .decrease_tree_width,
                     .increase_tree_width,
                     .toggle_line_numbers,
+                    .toggle_line_wrap,
                     .enter_source_search,
                     .cancel_source_search,
                     .clear_source_search,
@@ -1948,6 +1949,11 @@ pub const RepositoryPageState = struct {
                     self.sourceGeometry(body_size, document),
                 );
             },
+            .toggle_line_wrap => {
+                self.viewer.line_wrap = !self.viewer.line_wrap;
+                self.viewer.source_vertical_scroll.intra = null;
+                if (source) |document| repository_navigation.clampSource(&self.viewer, document, source_geometry.?);
+            },
             .enter_source_search => if (source != null) {
                 if (self.selection_owner != .none or self.completed_selection != null) {
                     self.clearLiveAndCompletedSelectionPreservingViewport(allocator, body_size);
@@ -2019,7 +2025,7 @@ pub const RepositoryPageState = struct {
             self.clearLiveSelection();
             if (document) |value| if (viewport_anchor) |anchor| {
                 const geometry = self.sourceGeometry(body_size, value);
-                self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+                self.restoreSourceViewportAnchor(anchor, value, geometry);
             };
         };
         if (viewer_before) |before| {
@@ -2067,7 +2073,7 @@ pub const RepositoryPageState = struct {
             // This page-level authority boundary has no frame geometry. Match
             // document replacement by preserving the semantic top without
             // inventing a terminal height; the coordinator clamps next frame.
-            self.restoreSourceViewportAnchor(anchor, document, 0);
+            self.restoreSourceViewportAnchor(anchor, document, null);
         };
     }
 
@@ -2610,7 +2616,7 @@ pub const RepositoryPageState = struct {
         self.clearLiveSelection();
         if (viewport_anchor) |anchor| if (document) |value| {
             const geometry = self.sourceGeometry(body_size, value);
-            self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+            self.restoreSourceViewportAnchor(anchor, value, geometry);
         };
     }
 
@@ -2657,46 +2663,25 @@ pub const RepositoryPageState = struct {
         return .{ .range = completed.range, .line_count = completed.line_count, .owner = .completed };
     }
 
-    fn sourceViewportBasis(
-        self: *const RepositoryPageState,
-        document: *const source_document.Document,
-    ) selection_action.ViewportBasis {
-        return .{
-            .layout_revision = self.source_revision,
-            .source_rows = document.rowCount(),
-            .presentation_rows = document.rowCount(),
-        };
-    }
-
     fn captureSourceViewportAnchor(
         self: *const RepositoryPageState,
         document: *const source_document.Document,
     ) SelectionViewportAnchor {
-        const position = selection_action.captureAnchorPosition(
-            document.rowCount(),
-            self.viewer.source_vertical_scroll,
-        );
-        return .{
-            .semantic_source = position.source_offset_fallback,
-            .source_offset_fallback = position.source_offset_fallback,
-            .raw_presentation_scroll = self.viewer.source_vertical_scroll,
-            .basis = self.sourceViewportBasis(document),
-        };
+        return self.viewer.source_vertical_scroll.admitted(document);
     }
 
     fn restoreSourceViewportAnchor(
         self: *RepositoryPageState,
         anchor: SelectionViewportAnchor,
         document: *const source_document.Document,
-        visible_rows: usize,
+        geometry: ?repository_source_geometry.SourceGeometry,
     ) void {
-        self.viewer.source_vertical_scroll = selection_action.restoreViewportAnchor(
-            anchor,
-            self.sourceViewportBasis(document),
-            @min(anchor.semantic_source, document.rowCount() - 1),
-            @min(anchor.source_offset_fallback, document.rowCount() - 1),
-            visible_rows,
-        );
+        var position = anchor.admitted(document);
+        if (!self.viewer.line_wrap) position.intra = null;
+        self.viewer.source_vertical_scroll = if (geometry) |pane|
+            repository_source_layout.Layout.init(document, self.viewer, pane).clamp(position, pane.visible_source_rows)
+        else
+            position;
     }
 
     pub fn captureSelectionViewportAnchor(
@@ -2717,7 +2702,7 @@ pub const RepositoryPageState = struct {
         self.clampForBodySize(body_size);
         const document = self.currentSource() orelse return;
         const geometry = self.sourceGeometry(body_size, document);
-        self.restoreSourceViewportAnchor(anchor, document, geometry.visible_source_rows);
+        self.restoreSourceViewportAnchor(anchor, document, geometry);
     }
 
     fn clearCompletedSelectionPreservingViewport(
@@ -2730,7 +2715,7 @@ pub const RepositoryPageState = struct {
         self.clearCompletedSelection(allocator);
         if (document) |value| if (anchor) |captured| {
             const geometry = self.sourceGeometry(body_size, value);
-            self.restoreSourceViewportAnchor(captured, value, geometry.visible_source_rows);
+            self.restoreSourceViewportAnchor(captured, value, geometry);
         };
     }
 
@@ -2745,7 +2730,7 @@ pub const RepositoryPageState = struct {
         self.clearCompletedSelection(allocator);
         if (document) |value| if (anchor) |captured| {
             const geometry = self.sourceGeometry(body_size, value);
-            self.restoreSourceViewportAnchor(captured, value, geometry.visible_source_rows);
+            self.restoreSourceViewportAnchor(captured, value, geometry);
         };
     }
 
@@ -2840,7 +2825,7 @@ pub const RepositoryPageState = struct {
         }
         if (document) |value| if (viewport_anchor) |anchor| {
             const geometry = self.sourceGeometry(body_size, value);
-            self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+            self.restoreSourceViewportAnchor(anchor, value, geometry);
         };
         self.status.set("{s}", .{message});
     }
@@ -2955,7 +2940,7 @@ pub const RepositoryPageState = struct {
         self.selection_owner = .{ .source_header = .{ .identity = identity } };
         if (viewport_anchor) |anchor| if (document) |value| {
             const geometry = self.sourceGeometry(body_size, value);
-            self.restoreSourceViewportAnchor(anchor, value, geometry.visible_source_rows);
+            self.restoreSourceViewportAnchor(anchor, value, geometry);
         };
     }
 
@@ -3018,16 +3003,13 @@ pub const RepositoryPageState = struct {
     }
 
     fn pointAtTextCell(
-        document: *const source_document.Document,
-        line_index: usize,
+        row: repository_source_layout.Row,
         horizontal_scroll: usize,
         viewport_cell: usize,
     ) ?repository_selection.Point {
-        const line = document.lineBody(line_index) orelse return null;
-        const projection = text_projection.Projection.init(line, .{ .tab_width = repository_tab_width }) catch return null;
-        return switch (projection.hitViewportCell(horizontal_scroll, viewport_cell)) {
-            .token => |token| repository_selection.pointFromToken(line_index, token),
-            .boundary => |boundary| repository_selection.pointFromBoundary(line_index, boundary.byte_offset),
+        return switch (row.hit(horizontal_scroll, viewport_cell) orelse return null) {
+            .token => |token| repository_selection.pointFromToken(row.line, token),
+            .boundary => |boundary| repository_selection.pointFromBoundary(row.line, boundary.byte_offset),
         };
     }
 
@@ -3035,11 +3017,12 @@ pub const RepositoryPageState = struct {
         if (self.source_search.mode or self.file_search.mode) return;
         const document = self.acceptedCurrentSourceForSelection() orelse return;
         const geometry = self.sourceGeometry(body_size, document);
-        const line_index = geometry.contentLineAt(
-            point.row,
+        const row = repository_source_layout.Layout.init(document, self.viewer, geometry).contentRowAt(
+            geometry,
             self.viewer.source_vertical_scroll,
-            document,
+            point.row,
         ) orelse return;
+        const line_index = row.line;
         const region = geometry.regionAt(point.col) orelse return;
         const token = self.currentContentToken() orelse return;
         const mode: repository_selection.Mode = switch (region) {
@@ -3050,8 +3033,7 @@ pub const RepositoryPageState = struct {
         const logical_point = switch (mode) {
             .line => repository_selection.pointFromLine(line_index),
             .character => pointAtTextCell(
-                document,
-                line_index,
+                row,
                 self.viewer.source_horizontal_scroll,
                 @as(usize, point.col - geometry.text_col),
             ) orelse return,
@@ -3069,7 +3051,7 @@ pub const RepositoryPageState = struct {
             .{ .col = point.col, .row = point.row },
         ) };
         if (viewport_anchor) |anchor| {
-            self.restoreSourceViewportAnchor(anchor, document, geometry.visible_source_rows);
+            self.restoreSourceViewportAnchor(anchor, document, geometry);
         }
     }
 
@@ -3089,20 +3071,20 @@ pub const RepositoryPageState = struct {
             return;
         }
         const geometry = self.sourceGeometry(body_size, document);
-        const line_index = geometry.contentLineAt(
-            local.row,
+        const row = repository_source_layout.Layout.init(document, self.viewer, geometry).contentRowAt(
+            geometry,
             self.viewer.source_vertical_scroll,
-            document,
+            local.row,
         ) orelse return;
+        const line_index = row.line;
         const region = geometry.regionAt(local.col) orelse return;
         const logical_point: repository_selection.Point = switch (live.mode) {
             .line => repository_selection.pointFromLine(line_index),
             .character => switch (region) {
-                .gutter, .line_number => repository_selection.pointFromBoundary(line_index, 0),
+                .gutter, .line_number => repository_selection.pointFromBoundary(line_index, row.leadingByte()),
                 .separator => return,
                 .text => pointAtTextCell(
-                    document,
-                    line_index,
+                    row,
                     self.viewer.source_horizontal_scroll,
                     @as(usize, local.col - geometry.text_col),
                 ) orelse return,
@@ -3143,7 +3125,7 @@ pub const RepositoryPageState = struct {
             if (step.direction == .up) -1 else 1,
             geometry,
         );
-        if (self.viewer.source_vertical_scroll == old_scroll) return .content_edge;
+        if (std.meta.eql(self.viewer.source_vertical_scroll, old_scroll)) return .content_edge;
 
         self.dragSourceSelection(.{
             .col = step.endpoint.col,
@@ -3228,7 +3210,7 @@ pub const RepositoryPageState = struct {
         candidate = undefined;
         self.cancelMouseOwner();
         const geometry = self.sourceGeometry(body_size, admitted_document);
-        self.restoreSourceViewportAnchor(anchor, admitted_document, geometry.visible_source_rows);
+        self.restoreSourceViewportAnchor(anchor, admitted_document, geometry);
         self.status.clear();
         return null;
     }
@@ -3354,7 +3336,7 @@ pub const RepositoryPageState = struct {
             owned.deinit(allocator);
         }
         const geometry = self.sourceGeometry(body_size, admitted_document);
-        self.restoreSourceViewportAnchor(viewport_anchor, admitted_document, geometry.visible_source_rows);
+        self.restoreSourceViewportAnchor(viewport_anchor, admitted_document, geometry);
 
         return self.completed_selection.?.clipboardText(allocator) catch error.OutOfMemory;
     }
@@ -3409,6 +3391,7 @@ fn navigationDismissesIncoming(msg: Msg) bool {
         .previous_file,
         .next_file,
         .toggle_line_numbers,
+        .toggle_line_wrap,
         .toggle_tree_visibility,
         .decrease_tree_width,
         .increase_tree_width,
@@ -4262,7 +4245,7 @@ test "repository source line jump is 1 based bounded centered and target fenced"
     try std.testing.expect(state.applySourceLineCommand(target, 8, size) == .moved);
     try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
     try std.testing.expectEqual(@as(usize, 3), state.viewer.source_horizontal_scroll);
-    try std.testing.expect(state.viewer.source_vertical_scroll > 0);
+    try std.testing.expect(state.viewer.source_vertical_scroll.line > 0);
 
     const before = state.viewer;
     const out_of_range = state.applySourceLineCommand(target, 99, size);
@@ -4634,10 +4617,10 @@ test "repository keyboard line selection document revalidation clears borrow acr
         state.viewer.focus = .source;
         state.viewer.source_cursor = 2;
         _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
-        state.viewer.source_vertical_scroll = 5;
+        state.viewer.source_vertical_scroll.line = 5;
         try std.testing.expect(state.activeBorrowedSourceRange());
         const viewport_before = state.captureSourceViewportAnchor(state.currentSource().?);
-        try std.testing.expectEqual(@as(usize, 5), viewport_before.semantic_source);
+        try std.testing.expectEqual(@as(usize, 5), viewport_before.line);
 
         const generation: u64 = if (fingerprint_mismatch) 42 else 41;
         state.change_map_generation = generation;
@@ -4676,7 +4659,7 @@ test "repository keyboard line selection document revalidation clears borrow acr
         try std.testing.expect(state.needs_document_revalidation);
         try std.testing.expectEqualStrings("zero", state.completed_selection.?.text);
         const viewport_after = state.captureSourceViewportAnchor(state.currentSource().?);
-        try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+        try std.testing.expectEqual(viewport_before.line, viewport_after.line);
 
         const pending_context = state.inputContext(.{});
         try std.testing.expect(pending_context.selection_owner == .none);
@@ -4772,9 +4755,9 @@ test "repository keyboard line selection document revalidation clears borrow acr
         state.viewer.focus = .source;
         state.viewer.source_cursor = 2;
         _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, size);
-        state.viewer.source_vertical_scroll = 5;
+        state.viewer.source_vertical_scroll.line = 5;
         const viewport_before = state.captureSourceViewportAnchor(state.currentSource().?);
-        try std.testing.expectEqual(@as(usize, 5), viewport_before.semantic_source);
+        try std.testing.expectEqual(@as(usize, 5), viewport_before.line);
 
         const generation: u64 = if (fingerprint_mismatch) 52 else 51;
         state.change_map_generation = generation;
@@ -4807,7 +4790,7 @@ test "repository keyboard line selection document revalidation clears borrow acr
         try std.testing.expect(!state.activeBorrowedSourceRange());
         try std.testing.expect(state.completed_selection == null);
         const viewport_after = state.captureSourceViewportAnchor(state.currentSource().?);
-        try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+        try std.testing.expectEqual(viewport_before.line, viewport_after.line);
     }
 }
 
@@ -4856,10 +4839,10 @@ test "repository mouse and header owners keep prior candidate until all-owner cl
         replaced.viewer.source_cursor = 2;
         _ = replaced.applyNavigation(allocator, .begin_keyboard_line_selection, size);
         const selection_geometry = replaced.sourceGeometry(size, replaced.currentSource().?);
-        replaced.viewer.source_vertical_scroll = replaced.currentSource().?.rowCount() -|
+        replaced.viewer.source_vertical_scroll.line = replaced.currentSource().?.rowCount() -|
             selection_geometry.visible_source_rows;
         const viewport_before = replaced.captureSourceViewportAnchor(replaced.currentSource().?);
-        try std.testing.expectEqual(@as(usize, 4), viewport_before.semantic_source);
+        try std.testing.expectEqual(@as(usize, 4), viewport_before.line);
 
         if (header_press) {
             const page_layout = repository_layout.bodyLayout(size, replaced.viewer.tree_width, replaced.viewer.tree_hidden);
@@ -4874,11 +4857,12 @@ test "repository mouse and header owners keep prior candidate until all-owner cl
             try std.testing.expect(replaced.selection_owner.activeSourceHeader() != null);
         } else {
             const geometry = replaced.sourceGeometry(size, replaced.currentSource().?);
-            const pressed_line = geometry.contentLineAt(
-                geometry.body_first_row,
+            const pressed_row = repository_source_layout.Layout.init(replaced.currentSource().?, replaced.viewer, geometry).contentRowAt(
+                geometry,
                 replaced.viewer.source_vertical_scroll,
-                replaced.currentSource().?,
+                geometry.body_first_row,
             ) orelse return error.ExpectedSourceLine;
+            const pressed_line = pressed_row.line;
             try std.testing.expectEqual(@as(usize, 4), pressed_line);
             _ = replaced.applyNavigation(allocator, .{ .mouse_source_press = .{
                 .col = geometry.text_col,
@@ -4891,7 +4875,7 @@ test "repository mouse and header owners keep prior candidate until all-owner cl
         try std.testing.expectEqual(retain_prior, replaced.completed_selection != null);
         if (retain_prior) try std.testing.expectEqualStrings("zero", replaced.completed_selection.?.text);
         const viewport_after = replaced.captureSourceViewportAnchor(replaced.currentSource().?);
-        try std.testing.expectEqual(viewport_before.semantic_source, viewport_after.semantic_source);
+        try std.testing.expectEqual(viewport_before.line, viewport_after.line);
     };
 }
 
@@ -6498,7 +6482,7 @@ test "repository page owns source focus navigation search and mouse geometry" {
     try std.testing.expectEqual(@as(usize, 2), state.viewer.source_cursor);
 
     state.viewer.source_cursor = 99;
-    state.viewer.source_vertical_scroll = 99;
+    state.viewer.source_vertical_scroll.line = 99;
     state.viewer.source_horizontal_scroll = 99;
     state.clampForBodySize(size);
     try std.testing.expectEqual(@as(usize, 3), state.viewer.source_cursor);
@@ -6536,29 +6520,29 @@ test "repository source comfort page routes wheel page search boundaries and mou
 
     state.viewer.focus = .source;
     state.viewer.source_cursor = 5;
-    state.viewer.source_vertical_scroll = 5;
+    state.viewer.source_vertical_scroll.line = 5;
     _ = state.applyNavigation(allocator, .mouse_source_wheel_down, size);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
 
     _ = state.applyNavigation(allocator, .wheel_down, size);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
-    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
 
     state.viewer.focus = .source;
     state.viewer.source_cursor = 5;
-    state.viewer.source_vertical_scroll = 5;
+    state.viewer.source_vertical_scroll.line = 5;
     _ = state.applyNavigation(allocator, .page_down, size);
     try std.testing.expectEqual(@as(usize, 8), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 7), state.viewer.source_vertical_scroll.line);
 
     state.viewer.source_cursor = 5;
-    state.viewer.source_vertical_scroll = 5;
+    state.viewer.source_vertical_scroll.line = 5;
     _ = state.applyNavigation(allocator, .half_page_down, size);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll.line);
     _ = state.applyNavigation(allocator, .half_page_up, size);
     try std.testing.expectEqual(@as(usize, 5), state.viewer.source_cursor);
 
@@ -6566,29 +6550,29 @@ test "repository source comfort page routes wheel page search boundaries and mou
     for ("needle") |byte| _ = state.applyNavigation(allocator, .{ .source_search_insert = byte }, size);
     _ = state.applyNavigation(allocator, .submit_source_search, size);
     try std.testing.expectEqual(@as(usize, 12), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 11), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 11), state.viewer.source_vertical_scroll.line);
 
     _ = state.applyNavigation(allocator, .source_first, size);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll.line);
     _ = state.applyNavigation(allocator, .source_last, size);
     try std.testing.expectEqual(@as(usize, 19), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 17), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 17), state.viewer.source_vertical_scroll.line);
 
     state.viewer.source_cursor = 8;
-    state.viewer.source_vertical_scroll = 5;
+    state.viewer.source_vertical_scroll.line = 5;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
         .col = geometry.text_col,
         .row = geometry.body_first_row,
     } }, size);
     try std.testing.expectEqual(@as(usize, 5), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll.line);
     _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{
         .col = geometry.text_col,
         .row = geometry.body_first_row + geometry.visible_source_rows - 1,
     } }, size);
     try std.testing.expectEqual(@as(usize, 7), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 5), state.viewer.source_vertical_scroll.line);
 }
 
 test "repository drag auto-scroll validates token and steps one projected row" {
@@ -6604,7 +6588,7 @@ test "repository drag auto-scroll validates token and steps one projected row" {
     // tab-and-wide-glyph fixture row after adding the visual spacer.
     const size: chasen.Size = .{ .width = 60, .height = 7 };
     const geometry = state.sourceGeometry(size, state.currentSource().?);
-    state.viewer.source_vertical_scroll = 5;
+    state.viewer.source_vertical_scroll.line = 5;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
         .col = geometry.text_col,
         .row = geometry.body_first_row,
@@ -6624,7 +6608,7 @@ test "repository drag auto-scroll validates token and steps one projected row" {
     } }, size);
     defer update.deinit(allocator);
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, update.auto_scroll.?);
-    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 6), state.viewer.source_vertical_scroll.line);
     const live = state.selection_owner.activeSource().?;
     try std.testing.expect(live.token.eql(token_before));
     try std.testing.expect(live.mode == .character);
@@ -6665,21 +6649,21 @@ test "repository drag auto-scroll validates token and steps one projected row" {
     // auto-scroll steps operate on source rows only and Copy contains source
     // text only, never the status label.
     try installFirstLineCandidateForTest(&state, allocator);
-    state.viewer.source_vertical_scroll = 0;
+    state.viewer.source_vertical_scroll.line = 0;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
         .col = geometry.gutter_col,
         .row = viewport.first_row,
     } }, size);
     const line_token = state.selection_owner.activeSource().?.token;
     try std.testing.expect(state.selection_owner.activeSource().?.mode == .line);
-    state.viewer.source_vertical_scroll = 2;
+    state.viewer.source_vertical_scroll.line = 2;
     var status_row = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
         .direction = .up,
         .endpoint = .{ .col = geometry.text_col, .row = repository_source_geometry.source_search_or_rule_row },
     } }, size);
     defer status_row.deinit(allocator);
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.moved, status_row.auto_scroll.?);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll.line);
 
     for (0..3) |_| {
         var repeated = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
@@ -6710,12 +6694,12 @@ test "repository drag auto-scroll validates token and steps one projected row" {
         else => return error.ExpectedSourceCopyCommand,
     }
 
-    state.viewer.source_vertical_scroll = 0;
+    state.viewer.source_vertical_scroll.line = 0;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{
         .col = geometry.text_col,
         .row = viewport.first_row,
     } }, size);
-    state.viewer.source_vertical_scroll = state.currentSource().?.rowCount() -| geometry.visible_source_rows;
+    state.viewer.source_vertical_scroll.line = state.currentSource().?.rowCount() -| geometry.visible_source_rows;
     const edge_cursor = state.viewer.source_cursor;
     const edge_selection = state.selection_owner;
     var edge = state.applyNavigation(allocator, .{ .mouse_source_auto_scroll_step = .{
@@ -6736,6 +6720,61 @@ test "repository drag auto-scroll validates token and steps one projected row" {
     defer stale.deinit(allocator);
     try std.testing.expectEqual(drag_auto_scroll.StepOutcome.stale_owner, stale.auto_scroll.?);
     try std.testing.expect(!state.activeMouseOwner());
+}
+
+test "repository wrap pointer copy uses original bytes across continuations and replacement" {
+    const allocator = std.testing.allocator;
+    var state = try selectionStateForTest("main.zig\x00other.zig\x00", "abcd界\tneedle e\u{301}👩‍💻END\nnext\n");
+    defer state.deinit(allocator);
+    state.viewer.tree_hidden = true;
+    const size: chasen.Size = .{ .width = 8, .height = 9 };
+    try std.testing.expect(!state.viewer.line_wrap);
+    _ = state.applyNavigation(allocator, .toggle_line_wrap, size);
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = 4, .row = 4 } }, size);
+    try std.testing.expectEqual(@as(usize, 4), state.liveSourceSelection().?.anchor.leading_byte);
+    _ = state.applyNavigation(allocator, .{ .mouse_owner_drag = .{ .col = 1, .row = 5 } }, size);
+    try std.testing.expectEqual(@as(usize, 8), state.liveSourceSelection().?.focus.leading_byte);
+    var release = state.applyNavigation(allocator, .{ .mouse_owner_release = .{ .col = 5, .row = 6 } }, size);
+    defer release.deinit(allocator);
+    try std.testing.expectEqualStrings("界\tneedle", state.completed_selection.?.text);
+    var copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, size);
+    defer copy.deinit(allocator);
+    try std.testing.expectEqualStrings("界\tneedle", copy.command.?.copy_source_selection.text);
+
+    const narrow: chasen.Size = .{ .width = 5, .height = 5 };
+    const top: repository_model.SourcePosition = .{ .intra = .{
+        .byte = 4,
+        .fingerprint = state.currentSource().?.fingerprint,
+    } };
+    state.viewer.source_vertical_scroll = top;
+    _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = 4, .row = 3 } }, narrow);
+    var replacement = state.applyNavigation(allocator, .{ .mouse_owner_release = .{ .col = 1, .row = 3 } }, narrow);
+    defer replacement.deinit(allocator);
+    try std.testing.expectEqualStrings("界", state.completed_selection.?.text);
+    const selected_anchor = state.captureSelectionViewportAnchor().?;
+    state.restoreSelectionViewportAnchor(selected_anchor, .{ .width = 6, .height = 5 });
+    try std.testing.expectEqualDeep(top, state.viewer.source_vertical_scroll);
+    var replacement_copy = state.applyNavigation(allocator, .{ .selection_action = .copy }, narrow);
+    defer replacement_copy.deinit(allocator);
+    try std.testing.expectEqualStrings("界", replacement_copy.command.?.copy_source_selection.text);
+    try std.testing.expectEqualDeep(top, state.viewer.source_vertical_scroll);
+    _ = state.applyNavigation(allocator, .{ .selection_action = .clear }, narrow);
+    try std.testing.expectEqualDeep(top, state.viewer.source_vertical_scroll);
+    _ = state.applyNavigation(allocator, .begin_keyboard_line_selection, narrow);
+    _ = state.applyNavigation(allocator, .mouse_source_wheel_down, narrow);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+    try std.testing.expectEqual(@as(usize, 0), state.liveSourceSelection().?.focus.line_index);
+    _ = state.applyNavigation(allocator, .toggle_line_wrap, narrow);
+    try std.testing.expect(state.activeKeyboardLineSelection());
+    try std.testing.expect(!state.viewer.line_wrap);
+    try std.testing.expect(state.viewer.source_vertical_scroll.intra == null);
+    _ = state.applyNavigation(allocator, .toggle_line_wrap, narrow);
+    state.clearLiveSelection();
+    _ = state.applyNavigation(allocator, .next_file, narrow);
+    try std.testing.expect(state.viewer.line_wrap);
+    try std.testing.expectEqualDeep(repository_model.SourcePosition{}, state.viewer.source_vertical_scroll);
+    state.repositoryChanged(allocator, 9, .{ .device = 10, .inode = 11 });
+    try std.testing.expect(!state.viewer.line_wrap);
 }
 
 test "repository selection live gesture fixes mode and resumes after leaving the pane" {
@@ -6822,12 +6861,12 @@ test "repository selection hit testing applies scroll once and follows line numb
     try std.testing.expectEqual(@as(usize, "ABCDEFG".len), state.selection_owner.activeSource().?.anchor.trailing_byte);
     state.cancelMouseOwner();
 
-    state.viewer.source_vertical_scroll = 1;
+    state.viewer.source_vertical_scroll.line = 1;
     _ = state.applyNavigation(allocator, .{ .mouse_source_press = .{ .col = geometry.text_col, .row = first_row } }, size);
     try std.testing.expectEqual(@as(usize, 1), state.selection_owner.activeSource().?.anchor.line_index);
     state.cancelMouseOwner();
 
-    state.viewer.source_vertical_scroll = 0;
+    state.viewer.source_vertical_scroll.line = 0;
     state.viewer.source_horizontal_scroll = 0;
     _ = state.applyNavigation(allocator, .toggle_line_numbers, size);
     geometry = state.sourceGeometry(size, document);
@@ -6865,7 +6904,12 @@ test "repository selection hit testing applies scroll once and follows line numb
         atomic.cancelMouseOwner();
     }
 
-    const saturated = RepositoryPageState.pointAtTextCell(atomic_document, 0, std.math.maxInt(usize), 1).?;
+    const atomic_row = repository_source_layout.Layout.init(atomic_document, atomic.viewer, atomic_geometry).contentRowAt(
+        atomic_geometry,
+        .{},
+        atomic_geometry.body_first_row,
+    ).?;
+    const saturated = RepositoryPageState.pointAtTextCell(atomic_row, std.math.maxInt(usize), 1).?;
     try std.testing.expectEqual(@as(usize, "a\t界e\u{301}👩‍💻z".len), saturated.leading_byte);
     try std.testing.expectEqual(saturated.leading_byte, saturated.trailing_byte);
 }
@@ -7096,12 +7140,12 @@ test "repository fixed status row shares wide narrow render geometry and dispatc
         repository_input.keyToMsg(Msg, state.inputContext(.{}), .{ .codepoint = chasen.Key.escape }).?,
     );
 
-    state.viewer.source_vertical_scroll = 1;
+    state.viewer.source_vertical_scroll.line = 1;
     var cleared = state.applyNavigation(allocator, .{ .selection_action = .clear }, narrow);
     defer cleared.deinit(allocator);
     try std.testing.expect(cleared.command == null);
     try std.testing.expect(state.completed_selection == null);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll.line);
 }
 
 test "repository selection copy authority mismatch clears without command" {
@@ -7127,13 +7171,13 @@ test "repository selection resize restores semantic presentation anchor" {
     var state = try selectionStateForTest("main.zig\x00", "one\ntwo\nthree\n");
     defer state.deinit(allocator);
     try installFirstLineCandidateForTest(&state, allocator);
-    state.viewer.source_vertical_scroll = 1;
+    state.viewer.source_vertical_scroll.line = 1;
     const anchor = state.captureSelectionViewportAnchor() orelse return error.ExpectedSelectionViewportAnchor;
 
     state.restoreSelectionViewportAnchor(anchor, .{ .width = 40, .height = 4 });
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll.line);
     state.restoreSelectionViewportAnchor(anchor, .{ .width = 120, .height = 32 });
-    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll.line);
     try std.testing.expect(state.completed_selection != null);
 }
 
@@ -7310,7 +7354,7 @@ test "repository selection reconciles accepted document and keeps other replacem
 
 test "repository document replacement restores semantic viewport across projection terminals" {
     const allocator = std.testing.allocator;
-    const original = "zero\none\ntwo\nthree\nfour\n";
+    const original = "zero\none\nabcdefghijklmnopqrstuv\nthree\nfour\n";
     var state = try selectionStateForTest("main.zig\x00", original);
     defer state.deinit(allocator);
     var drag = repository_selection.DragSelection.init(
@@ -7324,7 +7368,12 @@ test "repository document replacement restores semantic viewport across projecti
         state.currentSource().?,
         drag,
     );
-    state.viewer.source_vertical_scroll = 2;
+    state.viewer.line_wrap = true;
+    state.viewer.source_vertical_scroll = .{ .line = 2, .intra = .{
+        .byte = 10,
+        .fingerprint = state.currentSource().?.fingerprint,
+    } };
+    const anchor = state.viewer.source_vertical_scroll;
 
     state.document_generation = 8;
     state.pending_document_generation = 8;
@@ -7340,11 +7389,13 @@ test "repository document replacement restores semantic viewport across projecti
     defer exact.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &exact));
     try std.testing.expect(state.completed_selection != null);
-    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_vertical_scroll);
+    try std.testing.expect(state.viewer.line_wrap);
+    try std.testing.expectEqualDeep(anchor, state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_vertical_scroll.line);
 
     state.document_generation = 9;
     state.pending_document_generation = 9;
-    const changed_content = "ZERO\none\ntwo\nthree\nfour\n";
+    const changed_content = "ZERO\none\nabcdefghijklmnopqrstuv\nthree\nfour\n";
     const changed_bytes = try allocator.dupe(u8, changed_content);
     var changed: repository_tasks.DocumentFinished = .{
         .identity = .{ .origin = .repository, .repo_epoch = state.repo_epoch, .activation_id = state.activation_id },
@@ -7357,7 +7408,9 @@ test "repository document replacement restores semantic viewport across projecti
     defer changed.deinit(allocator);
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &changed));
     try std.testing.expect(state.completed_selection == null);
-    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_vertical_scroll);
+    try std.testing.expect(state.viewer.line_wrap);
+    try std.testing.expect(state.viewer.source_vertical_scroll.intra == null);
+    try std.testing.expectEqual(@as(usize, 2), state.viewer.source_vertical_scroll.line);
 }
 
 test "repository selection survives presentation changes while source search starts with a clear" {
@@ -7463,7 +7516,7 @@ test "repository source completion rejects stale identity and frees undelivered 
     defer state.deinit(allocator);
     state.selected_path = state.bundle.?.tree.firstFilePath();
     state.viewer.source_cursor = 20;
-    state.viewer.source_vertical_scroll = 10;
+    state.viewer.source_vertical_scroll.line = 10;
     state.viewer.source_horizontal_scroll = 30;
     try state.source_search.query.insertSlice("retained-on-stale");
     state.source_search.mode = true;
@@ -7513,7 +7566,7 @@ test "repository source completion rejects stale identity and frees undelivered 
         state.displayed_document.?.metadata.?.modified_at.nanoseconds,
     );
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
     try std.testing.expectEqual(@as(usize, 0), state.source_search.query.len);
     try std.testing.expect(!state.source_search.mode);
@@ -7752,7 +7805,7 @@ test "repository incoming viewport scroll preserves same-target source viewport"
     state.freshness = .fresh;
     state.viewer.focus = .source;
     state.viewer.source_cursor = 6;
-    state.viewer.source_vertical_scroll = 0;
+    state.viewer.source_vertical_scroll.line = 0;
     state.viewer.source_horizontal_scroll = 9;
     const identity = state.root_identity.?;
 
@@ -7771,7 +7824,7 @@ test "repository incoming viewport scroll preserves same-target source viewport"
     try std.testing.expect(state.incoming == .none);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 6), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 9), state.viewer.source_horizontal_scroll);
 }
 
@@ -8218,7 +8271,7 @@ test "repository body file navigation follows filtered tree order and resets onl
     state.viewer.focus = .source;
     state.viewer.tree_cursor = 0; // The root cursor does not replace the body target.
     state.viewer.source_cursor = 12;
-    state.viewer.source_vertical_scroll = 10;
+    state.viewer.source_vertical_scroll.line = 10;
     state.viewer.source_horizontal_scroll = 20;
     try state.source_search.query.insertSlice("needle");
     state.source_search.match = state.currentSource().?.findNext("needle", null);
@@ -8245,7 +8298,7 @@ test "repository body file navigation follows filtered tree order and resets onl
     try std.testing.expect(state.completed_selection == null);
     try std.testing.expectEqual(@as(usize, 0), state.source_search.query.len);
     try std.testing.expect(state.source_search.match == null);
-    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(@as(usize, 0), state.viewer.source_horizontal_scroll);
     try std.testing.expectEqual(repository_model.Focus.source, state.inputContext(.{}).focus);
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
@@ -8620,13 +8673,13 @@ test "repository transition resolves an already accepted source without a task" 
         try std.testing.expectEqual(source_address, @intFromPtr(state.currentSource().?));
         try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
         try std.testing.expectEqual(case.cursor, state.viewer.source_cursor);
-        try std.testing.expectEqual(case.cursor, state.viewer.source_vertical_scroll);
+        try std.testing.expectEqual(case.cursor, state.viewer.source_vertical_scroll.line);
         try std.testing.expect(!state.needs_document_revalidation);
     }
 
     state.viewer.focus = .tree;
     state.viewer.source_cursor = 1;
-    state.viewer.source_vertical_scroll = 1;
+    state.viewer.source_vertical_scroll.line = 1;
     var path_only = try page_link.RepositoryIncoming.initOwned(
         allocator,
         state.repo_epoch,
@@ -8638,7 +8691,7 @@ test "repository transition resolves an already accepted source without a task" 
     try std.testing.expect(state.incoming == .none);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll.line);
 }
 
 fn expectReactivatedIncomingDocumentForTest(
@@ -8655,7 +8708,7 @@ fn expectReactivatedIncomingDocumentForTest(
     state.freshness = .fresh;
     state.viewer.focus = .tree;
     state.viewer.source_cursor = 1;
-    state.viewer.source_vertical_scroll = 1;
+    state.viewer.source_vertical_scroll.line = 1;
 
     state.deactivate();
     var incoming = try page_link.RepositoryIncoming.initOwned(
@@ -8672,7 +8725,7 @@ fn expectReactivatedIncomingDocumentForTest(
     try std.testing.expect(!state.needs_document_revalidation);
     try std.testing.expectEqual(repository_model.Focus.tree, state.viewer.focus);
     try std.testing.expectEqual(@as(usize, 1), state.viewer.source_cursor);
-    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(@as(usize, 1), state.viewer.source_vertical_scroll.line);
 
     var manifest_request = try state.prepareRequest(allocator, root.path, &root.capability);
     defer manifest_request.deinit(allocator);
@@ -8710,7 +8763,7 @@ fn expectReactivatedIncomingDocumentForTest(
     if (expected_cursor) |cursor| {
         try std.testing.expect(state.incoming == .none);
         try std.testing.expectEqual(cursor, state.viewer.source_cursor);
-        try std.testing.expectEqual(cursor, state.viewer.source_vertical_scroll);
+        try std.testing.expectEqual(cursor, state.viewer.source_vertical_scroll.line);
         try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
         try std.testing.expectEqualStrings(replacement_source.?, state.currentSource().?.bytes);
     } else {
@@ -8781,7 +8834,7 @@ fn expectIncomingDocumentLineForTest(
     try std.testing.expectEqual(ApplyOutcome.changed, state.applyDocumentFinished(allocator, &finished));
     try std.testing.expect(state.incoming == .none);
     try std.testing.expectEqual(expected_cursor, state.viewer.source_cursor);
-    try std.testing.expectEqual(expected_cursor, state.viewer.source_vertical_scroll);
+    try std.testing.expectEqual(expected_cursor, state.viewer.source_vertical_scroll.line);
     try std.testing.expectEqual(repository_model.Focus.source, state.viewer.focus);
     try std.testing.expectEqual(!inactive_completion, state.active);
 }
