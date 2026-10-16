@@ -227,15 +227,15 @@ fn metadataForHandleDarwin(handle: std.posix.fd_t) !Metadata {
             };
         }
         switch (std.c._errno().*) {
-            @intFromEnum(std.c.E.INTR) => continue,
-            @intFromEnum(std.c.E.BADF) => return error.InvalidCapability,
+            @backingInt(std.c.E.INTR) => continue,
+            @backingInt(std.c.E.BADF) => return error.InvalidCapability,
             else => return error.MetadataUnavailable,
         }
     }
 }
 fn filesystemMetadataForHandleLinux(handle: std.posix.fd_t) !FilesystemMetadata {
     const linux = std.os.linux;
-    var buffer: [256]u8 align(@alignOf(usize)) = [_]u8{0} ** 256;
+    var buffer: [256]u8 align(@alignOf(usize)) = @as([256]u8, @splat(0));
     const rc = linux.syscall2(.fstatfs, @as(usize, @bitCast(@as(isize, handle))), @intFromPtr(&buffer));
     if (linux.errno(rc) != .SUCCESS) return error.FilesystemPolicyUnavailable;
     return .{ .linux = .{ .magic = @as(*align(1) const isize, @ptrCast(&buffer)).* } };

@@ -480,9 +480,7 @@ const DarwinWaitId = struct {
     extern "c" fn waitid(id_type: c_uint, id: u32, info: *std.c.siginfo_t, options: c_int) c_int;
 };
 
-const DarwinProcessInfo = if (builtin.os.tag == .macos) @cImport({
-    @cInclude("sys/sysctl.h");
-}) else struct {};
+const DarwinProcessInfo = if (builtin.os.tag == .macos) @import("native_c") else struct {};
 
 const ZeroizingAllocator = struct {
     child: std.mem.Allocator,
@@ -1675,7 +1673,7 @@ fn readTestPid(dir: std.Io.Dir, io: std.Io, name: []const u8) !std.posix.pid_t {
 }
 
 fn processExists(pid: std.posix.pid_t) !bool {
-    const signal_zero: std.posix.SIG = @enumFromInt(0);
+    const signal_zero: std.posix.SIG = @fromBackingInt(@intCast(0));
     std.posix.kill(pid, signal_zero) catch |err| switch (err) {
         error.ProcessNotFound => return false,
         error.PermissionDenied => return true,
@@ -1868,7 +1866,7 @@ test "process group macOS snapshots require complete terminal membership" {
                 else => .SUCCESS,
             };
             if (failure != .SUCCESS) {
-                std.c._errno().* = @intFromEnum(failure);
+                std.c._errno().* = @backingInt(failure);
                 return -1;
             }
             if (buffer == null) {

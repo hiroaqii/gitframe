@@ -1467,8 +1467,8 @@ test "repository source syntax uses neutral styles below the search overlay" {
     var spans = try source_syntax.build(allocator, &document, &candidates);
     defer spans.deinit(allocator);
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.syntax_comment)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.syntax_comment)] = .{ .rgb = .{ 4, 5, 6 } };
 
     var syntax_surface: chasen.testing.TestSurface = undefined;
     try syntax_surface.init(24, 6);
@@ -1604,13 +1604,13 @@ test "repository source cursor row composes semantic overlays and active-only ba
     var live = selection.DragSelection.init(token, .character, selection.pointFromBoundary(0, 12));
     live.update(selection.pointFromBoundary(0, 17));
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.foreground)] = .{ .rgb = .{ 21, 22, 23 } };
-    palette.colors[@intFromEnum(theme.Role.diff_line_number)] = .{ .rgb = .{ 31, 32, 33 } };
-    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 41, 42, 43 } };
-    palette.colors[@intFromEnum(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
-    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
-    palette.colors[@intFromEnum(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.foreground)] = .{ .rgb = .{ 21, 22, 23 } };
+    palette.colors[@backingInt(theme.Role.diff_line_number)] = .{ .rgb = .{ 31, 32, 33 } };
+    palette.colors[@backingInt(theme.Role.syntax_keyword)] = .{ .rgb = .{ 41, 42, 43 } };
+    palette.colors[@backingInt(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 51, 52, 53 } };
+    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
+    palette.colors[@backingInt(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
 
     var active: chasen.testing.TestSurface = undefined;
     try active.init(30, 5);
@@ -1689,7 +1689,7 @@ test "repository source cursor row composes semantic overlays and active-only ba
 
 test "repository source row style preserves intrinsic flags while gating cursor background" {
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     const intrinsic: chasen.TextStyle = .{
         .bold = true,
         .italic = true,
@@ -1721,8 +1721,8 @@ test "repository selection background composes after cursor syntax and search st
     var spans = try source_syntax.build(allocator, &document, &candidates);
     defer spans.deinit(allocator);
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
-    palette.colors[@intFromEnum(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
+    palette.colors[@backingInt(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
     const token: selection.RepositoryContentToken = .{
         .repo_epoch = 1,
         .root_identity = .{ .device = 2, .inode = 3 },
@@ -1860,8 +1860,8 @@ test "repository retained selection keeps source rows fixed and shares its backg
     var live = selection.DragSelection.init(token, .character, selection.pointFromBoundary(0, 1));
     live.update(selection.pointFromBoundary(0, 2));
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
-    palette.colors[@intFromEnum(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.diff_cursor)] = .{ .rgb = .{ 9, 8, 7 } };
+    palette.colors[@backingInt(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 7, 8, 9 } };
     var test_surface: chasen.testing.TestSurface = undefined;
     try test_surface.init(32, 7);
     defer test_surface.deinit();
@@ -3038,7 +3038,7 @@ test "repository filter discoverability header follows effective keymap and clip
     }
 
     var unbound = effective;
-    unbound.bindings[@intFromEnum(keymap.PublicAction.changed_file_filter)] = null;
+    unbound.bindings[@backingInt(keymap.PublicAction.changed_file_filter)] = null;
     try std.testing.expect(repository_input.keyToMsg(repository_page.Msg, state.inputContext(unbound), .{ .codepoint = 'z' }) == null);
     {
         var test_surface: chasen.testing.TestSurface = undefined;

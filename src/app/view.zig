@@ -713,7 +713,7 @@ fn projectFooterHints(
         .help,
         .secondary,
     };
-    var selected = [_]bool{false} ** footer_hint_capacity;
+    var selected = @as([footer_hint_capacity]bool, @splat(false));
     var selected_count: usize = 0;
     var used_width: usize = 0;
     const separator_width = chasen.text.displayWidth(opts.separator);
@@ -2762,7 +2762,8 @@ test "History picker footer keeps diff actions and range state without the local
     var history_state: history_page.HistoryPageState = .{ .load_state = .loaded };
     defer history_state.deinit(allocator);
     var history_records: [1]git_history.Record = undefined;
-    history_state.catalog.records = .{ .items = &history_records, .capacity = history_records.len };
+    history_state.catalog.records = .initBuffer(&history_records);
+    history_state.catalog.records.expandToCapacity();
     defer history_state.catalog.records = .empty;
 
     var context = harness.context();
@@ -3608,7 +3609,7 @@ test "remote error footer advertises copy and limits interactive action to push 
 
 test "branch switch error renders title footer and scrolled tail at 120x32" {
     const message = "error: local changes would be overwritten:\n" ++
-        "    a-long-file-name-for-checking-the-wrapped-branch-switch-error-details.txt\n" ** 40 ++
+        std.mem.asBytes(&@as([40]["    a-long-file-name-for-checking-the-wrapped-branch-switch-error-details.txt\n".len]u8, @splat("    a-long-file-name-for-checking-the-wrapped-branch-switch-error-details.txt\n".*))).* ++
         "Aborting";
     var app: ShellViewTestHarness = .{};
     var context = app.context();

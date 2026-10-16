@@ -105,6 +105,16 @@ pub fn build(b: *std.Build) void {
         }
     };
 
+    const native_c: ?*std.Build.Module = if (target.result.os.tag == .linux or target.result.os.tag == .macos)
+        b.addTranslateC(.{
+            .root_source_file = b.path("src/native.h"),
+            .target = target,
+            .optimize = optimize,
+        }).createModule()
+    else
+        null;
+    if (native_c) |native_mod| mod.addImport("native_c", native_mod);
+
     const exe = b.addExecutable(.{
         .name = "gitframe",
         .root_module = b.createModule(.{
@@ -125,9 +135,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run GitFrame");
     run_step.dependOn(&run_cmd.step);
@@ -176,6 +184,9 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    if (target.result.os.tag == .macos) {
+        diff_source_tests.root_module.addImport("native_c", native_c.?);
+    }
     const run_diff_source_tests = b.addRunArtifact(diff_source_tests);
 
     const diff_parser_tests = b.addTest(.{
@@ -342,7 +353,7 @@ pub fn build(b: *std.Build) void {
         });
         configureFlowSyntaxArtifact(projection_perf_exe, target, true);
         const run_projection_perf = b.addRunArtifact(projection_perf_exe);
-        if (b.args) |args| run_projection_perf.addArgs(args);
+        run_projection_perf.addPassthruArgs();
         projection_perf_step.dependOn(&run_projection_perf.step);
 
         const source_syntax_perf_exe = b.addExecutable(.{
@@ -360,7 +371,7 @@ pub fn build(b: *std.Build) void {
         });
         configureFlowSyntaxArtifact(source_syntax_perf_exe, target, true);
         const run_source_syntax_perf = b.addRunArtifact(source_syntax_perf_exe);
-        if (b.args) |args| run_source_syntax_perf.addArgs(args);
+        run_source_syntax_perf.addPassthruArgs();
         source_syntax_perf_step.dependOn(&run_source_syntax_perf.step);
 
         const source_syntax_capacity_exe = b.addExecutable(.{
@@ -378,7 +389,7 @@ pub fn build(b: *std.Build) void {
         });
         configureFlowSyntaxArtifact(source_syntax_capacity_exe, target, true);
         const run_source_syntax_capacity = b.addRunArtifact(source_syntax_capacity_exe);
-        if (b.args) |args| run_source_syntax_capacity.addArgs(args);
+        run_source_syntax_capacity.addPassthruArgs();
         source_syntax_capacity_step.dependOn(&run_source_syntax_capacity.step);
     } else {
         projection_perf_step.dependOn(&b.addFail(
@@ -410,7 +421,8 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     if (test_filters.len == 0) {
-        const startup_tests = b.addSystemCommand(&.{ "sh", b.pathFromRoot("scripts/startup-test.sh") });
+        const startup_tests = b.addSystemCommand(&.{"sh"});
+        startup_tests.addFileArg(b.path("scripts/startup-test.sh"));
         startup_tests.addArtifactArg(exe);
         test_step.dependOn(&startup_tests.step);
     }

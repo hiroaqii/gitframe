@@ -246,11 +246,11 @@ test "neutral durable filesystem operation errors never report completion" {
 }
 
 const StepTrace = struct {
-    counts: [9][2]usize = [_][2]usize{.{ 0, 0 }} ** 9,
+    counts: [9][2]usize = @splat(.{ 0, 0 }),
 
     fn observe(context: ?*anyopaque, step: Step) !void {
         const self: *@This() = @ptrCast(@alignCast(context.?));
-        self.counts[@intFromEnum(step.operation)][@intFromEnum(step.edge)] += 1;
+        self.counts[@backingInt(step.operation)][@backingInt(step.edge)] += 1;
     }
     fn observer(self: *@This()) Observer {
         return .{ .context = self, .observe_fn = observe };
@@ -261,8 +261,8 @@ const StepTrace = struct {
         return result;
     }
     fn expect(self: @This(), operation: Operation, before: usize, after: usize) !void {
-        try std.testing.expectEqual(before, self.counts[@intFromEnum(operation)][@intFromEnum(Edge.before)]);
-        try std.testing.expectEqual(after, self.counts[@intFromEnum(operation)][@intFromEnum(Edge.after)]);
+        try std.testing.expectEqual(before, self.counts[@backingInt(operation)][@backingInt(Edge.before)]);
+        try std.testing.expectEqual(after, self.counts[@backingInt(operation)][@backingInt(Edge.after)]);
     }
 };
 

@@ -11,7 +11,7 @@ const source_document = @import("../repository/source.zig");
 const source_spans = @import("source.zig");
 const token = @import("token.zig");
 
-pub const RoleHistogram = [@typeInfo(token.TokenRole).@"enum".fields.len]usize;
+pub const RoleHistogram = [@typeInfo(token.TokenRole).@"enum".field_names.len]usize;
 
 pub const CapacityReport = struct {
     source_bytes: usize,
@@ -65,7 +65,7 @@ pub fn inspectSourceCapacity(
     var candidates = try collectCandidates(allocator, io, document, path);
     defer candidates.deinit(allocator);
     var raw_roles: RoleHistogram = @splat(0);
-    for (candidates.items) |candidate| raw_roles[@intFromEnum(candidate.span.role)] += 1;
+    for (candidates.items) |candidate| raw_roles[@backingInt(candidate.span.role)] += 1;
 
     var limit_hit: ?source_spans.LimitKind = null;
     var spans = source_spans.buildWithLimitsReporting(
@@ -85,7 +85,7 @@ pub fn inspectSourceCapacity(
     defer spans.deinit(allocator);
 
     var retained_roles: RoleHistogram = @splat(0);
-    for (spans.spans) |span| retained_roles[@intFromEnum(span.role)] += 1;
+    for (spans.spans) |span| retained_roles[@backingInt(span.role)] += 1;
     return .{
         .source_bytes = document.bytes.len,
         .content_lines = document.contentLineCount(),
@@ -300,8 +300,8 @@ test "flow syntax capacity inspection reports raw and retained roles" {
     try std.testing.expectEqual(document.bytes.len, report.diagnostic_limits.spans);
     try std.testing.expectEqual(report.raw_candidates, histogramTotal(report.raw_roles));
     try std.testing.expectEqual(report.retained_spans, histogramTotal(report.retained_roles));
-    try std.testing.expect(report.retained_roles[@intFromEnum(token.TokenRole.keyword)] > 0);
-    try std.testing.expect(report.retained_roles[@intFromEnum(token.TokenRole.comment)] > 0);
+    try std.testing.expect(report.retained_roles[@backingInt(token.TokenRole.keyword)] > 0);
+    try std.testing.expect(report.retained_roles[@backingInt(token.TokenRole.comment)] > 0);
 }
 
 test "flow syntax capacity inspection treats empty source as accepted zero metadata" {

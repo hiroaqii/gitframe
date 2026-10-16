@@ -979,10 +979,10 @@ test "committed context copies accepted bases side paths gaps and exact y bytes"
     const app_load = @import("load.zig");
     const diff_selection = @import("../diff/selection.zig");
     const allocator = std.testing.allocator;
-    const before = try commit_diff.ObjectId.parse(.sha1, "1" ** 40);
-    const after = try commit_diff.ObjectId.parse(.sha1, "2" ** 40);
-    const base_tip = try commit_diff.ObjectId.parse(.sha1, "3" ** 40);
-    const root_after = try commit_diff.ObjectId.parse(.sha256, "a" ** 64);
+    const before = try commit_diff.ObjectId.parse(.sha1, &@as([40]u8, @splat('1')));
+    const after = try commit_diff.ObjectId.parse(.sha1, &@as([40]u8, @splat('2')));
+    const base_tip = try commit_diff.ObjectId.parse(.sha1, &@as([40]u8, @splat('3')));
+    const root_after = try commit_diff.ObjectId.parse(.sha256, &@as([64]u8, @splat('a')));
     const cases = [_]struct {
         identity: committed_diff.PresentationIdentity,
         page_id: page.Id,

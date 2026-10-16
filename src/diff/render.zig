@@ -2409,10 +2409,10 @@ test "fileStats counts added and removed hunk lines" {
 
 fn headerFocusTestPalette() theme.Palette {
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@intFromEnum(theme.Role.diff_metadata)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@backingInt(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.danger)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.diff_metadata)] = .{ .rgb = .{ 10, 11, 12 } };
     return palette;
 }
 
@@ -2903,7 +2903,7 @@ test "renderFile fills context gutter lead-in and line numbers with context back
     defer ts.deinit();
 
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.diff_context_bg)] = .{ .index = 8 };
+    palette.colors[@backingInt(theme.Role.diff_context_bg)] = .{ .index = 8 };
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
         .old_path = "src/main.zig",
@@ -2937,8 +2937,8 @@ test "renderFile colors staged current hunk header without dimming body" {
     try ts.init(80, 6);
     defer ts.deinit();
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 61, 62, 63 } };
-    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 71, 72, 73 } };
+    palette.colors[@backingInt(theme.Role.staged)] = .{ .rgb = .{ 61, 62, 63 } };
+    palette.colors[@backingInt(theme.Role.diff_hunk)] = .{ .rgb = .{ 71, 72, 73 } };
 
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
@@ -3011,8 +3011,8 @@ test "renderFile colors current header and guide from exact per-hunk stage state
     };
     const states = [_]HunkStageState{ .staged, .unstaged };
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.staged)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.diff_hunk)] = .{ .rgb = .{ 4, 5, 6 } };
 
     var staged: chasen.testing.TestSurface = undefined;
     try staged.init(80, 7);
@@ -3064,8 +3064,8 @@ test "whole-file and per-hunk staged authority converge on current hunk presenta
     };
     const staged_state = [_]HunkStageState{.staged};
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 21, 22, 23 } };
-    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 31, 32, 33 } };
+    palette.colors[@backingInt(theme.Role.staged)] = .{ .rgb = .{ 21, 22, 23 } };
+    palette.colors[@backingInt(theme.Role.diff_hunk)] = .{ .rgb = .{ 31, 32, 33 } };
 
     var whole_file: chasen.testing.TestSurface = undefined;
     try whole_file.init(80, 5);
@@ -3101,8 +3101,8 @@ test "renderFile applies unified syntax spans without removing diff background" 
     defer ts.deinit();
 
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.syntax_string)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.syntax_string)] = .{ .rgb = .{ 4, 5, 6 } };
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/src/main.zig b/src/main.zig",
         .old_path = "src/main.zig",
@@ -3432,10 +3432,10 @@ test "renderFile resolves reordered combined syntax in unified and side-by-side 
     };
     const syntax = diff_syntax_view.View.initCombined(&syntax_origins, &cached, &unstaged);
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.syntax_string)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@intFromEnum(theme.Role.syntax_type)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@intFromEnum(theme.Role.syntax_number)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@backingInt(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.syntax_string)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.syntax_type)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.syntax_number)] = .{ .rgb = .{ 10, 11, 12 } };
 
     var unified: chasen.testing.TestSurface = undefined;
     try unified.init(80, 9);
@@ -3938,8 +3938,8 @@ test "side-by-side staged hunk colors current chrome without dimming body" {
     defer ts.deinit();
 
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 41, 42, 43 } };
-    palette.colors[@intFromEnum(theme.Role.diff_hunk)] = .{ .rgb = .{ 51, 52, 53 } };
+    palette.colors[@backingInt(theme.Role.staged)] = .{ .rgb = .{ 41, 42, 43 } };
+    palette.colors[@backingInt(theme.Role.diff_hunk)] = .{ .rgb = .{ 51, 52, 53 } };
     const file: diff_parser.FileDiff = .{
         .header = "diff --git a/a b/a",
         .old_path = "a",
@@ -4820,12 +4820,12 @@ test "renderFile cursor marker uses absolute body offset and dims when pane is i
 
 fn reviewCursorTestPalette() theme.Palette {
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.diff_cursor)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@intFromEnum(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@intFromEnum(theme.Role.diff_context_bg)] = .{ .rgb = .{ 10, 11, 12 } };
-    palette.colors[@intFromEnum(theme.Role.diff_added_bg)] = .{ .rgb = .{ 13, 14, 15 } };
-    palette.colors[@intFromEnum(theme.Role.diff_removed_bg)] = .{ .rgb = .{ 16, 17, 18 } };
+    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.diff_cursor)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.pane_active_line_number)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.diff_context_bg)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@backingInt(theme.Role.diff_added_bg)] = .{ .rgb = .{ 13, 14, 15 } };
+    palette.colors[@backingInt(theme.Role.diff_removed_bg)] = .{ .rgb = .{ 16, 17, 18 } };
     return palette;
 }
 

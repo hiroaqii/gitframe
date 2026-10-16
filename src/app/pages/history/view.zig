@@ -1400,10 +1400,10 @@ test "History preview three pane renders focus structured detail and flat files"
     page_state.preview_state.current_key = page_state.preview_state.accepted.?.key;
 
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@backingInt(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.prompt)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.success)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.danger)] = .{ .rgb = .{ 10, 11, 12 } };
     var rendered: chasen.testing.TestSurface = undefined;
     try rendered.init(120, 27);
     defer rendered.deinit();
@@ -1530,7 +1530,7 @@ test "History preview three pane renders focus structured detail and flat files"
 
 test "History range hint stays readable and fixed above commits only while usable" {
     const oid = try git_history.ObjectId.parse(.sha1, "1111111111111111111111111111111111111111");
-    var records = [_]git_history.Record{.{
+    var records: [32]git_history.Record = @splat(.{
         .oid = oid,
         .parent_count = 0,
         .first_parent = .true_root,
@@ -1538,15 +1538,16 @@ test "History range hint stays readable and fixed above commits only while usabl
         .committer_unix = 0,
         .decorations = @constCast(""),
         .subject = @constCast("commit"),
-    }} ** 32;
+    });
     var page_state: history_page.HistoryPageState = .{
         .load_state = .loaded,
         .catalog = .{
             .snapshot = .{ .object_format = .sha1, .head = oid, .display = .detached },
-            .records = .{ .items = &records, .capacity = records.len },
+            .records = .initBuffer(&records),
             .continuation = oid,
         },
     };
+    page_state.catalog.records.expandToCapacity();
     const palette = theme.Palette.default();
     for ([_]struct {
         focus: history_page.interaction.Focus = .history,
@@ -1644,14 +1645,14 @@ test "History catalog renders selected rows at 80x24 and 120x32" {
     page_state.draft = .{ .range = 0 };
     page_state.catalog.cursor = 2;
     var palette = theme.Palette.default();
-    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 10, 11, 12 } };
-    palette.colors[@intFromEnum(theme.Role.foreground)] = .{ .rgb = .{ 13, 14, 15 } };
-    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 16, 17, 18 } };
-    palette.colors[@intFromEnum(theme.Role.history_date)] = .{ .rgb = .{ 19, 20, 21 } };
-    palette.colors[@intFromEnum(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 22, 23, 24 } };
+    palette.colors[@backingInt(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.muted)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@backingInt(theme.Role.info)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@backingInt(theme.Role.prompt)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@backingInt(theme.Role.foreground)] = .{ .rgb = .{ 13, 14, 15 } };
+    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 16, 17, 18 } };
+    palette.colors[@backingInt(theme.Role.history_date)] = .{ .rgb = .{ 19, 20, 21 } };
+    palette.colors[@backingInt(theme.Role.diff_selection_bg)] = .{ .rgb = .{ 22, 23, 24 } };
 
     for ([_]chasen.Size{
         .{ .width = 80, .height = 24 },

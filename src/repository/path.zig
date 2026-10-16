@@ -43,6 +43,6 @@ test "repository path rejects traversal and reserved components" {
 }
 
 test "repository path enforces bounded identity" {
-    const bytes = [_]u8{'a'} ** (max_bytes + 1);
+    const bytes = @as([max_bytes + 1]u8, @splat('a'));
     try std.testing.expectError(error.PathTooLong, validate(&bytes));
 }

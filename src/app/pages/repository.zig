@@ -8264,7 +8264,7 @@ test "repository body file navigation follows filtered tree order and resets onl
     const size: chasen.Size = .{ .width = 80, .height = 12 };
     var state = try selectionStateForTest(
         "alpha/start.zig\x00beta/nested/clean.zig\x00gamma/changed.zig\x00zeta/last.zig\x00",
-        "needle with a long source line for scrolling\n" ** 40,
+        std.mem.asBytes(&@as([40]["needle with a long source line for scrolling\n".len]u8, @splat("needle with a long source line for scrolling\n".*))),
     );
     defer state.deinit(allocator);
     try applyBundleStatusForTest(&state.bundle.?, " M alpha/start.zig\x00 M gamma/changed.zig\x00 M zeta/last.zig\x00");

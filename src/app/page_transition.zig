@@ -173,7 +173,7 @@ test "every blocker prevents transitions between independent pages" {
         .{ .active = .history, .target = .changes },
     };
 
-    try std.testing.expectEqual(std.meta.fields(Blocker).len, cases.len);
+    try std.testing.expectEqual(@typeInfo(Blocker).@"enum".field_names.len, cases.len);
     for (cases) |case| {
         for (directions) |direction| {
             try std.testing.expectEqual(

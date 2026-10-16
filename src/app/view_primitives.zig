@@ -59,7 +59,7 @@ test "input visibility keeps the cursor inside the viewport" {
             }
         }
     }
-    const long = [_]u8{'x'} ** (64 * 1024);
+    const long = @as([64 * 1024]u8, @splat('x'));
     try std.testing.expectEqual(long.len - 79, inputVisibleStart(&long, long.len, 80));
     try std.testing.expectEqual(@as(usize, 2), inputVisibleStart(&long, long.len, std.math.maxInt(u16)));
 }

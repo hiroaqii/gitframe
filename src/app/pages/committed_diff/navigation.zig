@@ -502,8 +502,8 @@ fn cloneSidebarIdentity(allocator: std.mem.Allocator, identity: context.SidebarI
 test "committed diff navigation separates read-only and mutable authority" {
     const view_diff = @typeInfo(@FieldType(View, "diff")).pointer;
     const controller_diff = @typeInfo(@FieldType(Controller, "diff")).pointer;
-    try std.testing.expect(view_diff.is_const);
-    try std.testing.expect(!controller_diff.is_const);
+    try std.testing.expect(view_diff.attrs.@"const");
+    try std.testing.expect(!controller_diff.attrs.@"const");
     try std.testing.expect(@FieldType(diff_surface.navigation.View, "surface") == diff_surface.ReadSurface);
     try std.testing.expect(@FieldType(diff_surface.navigation.Controller, "surface") == diff_surface.DiffSurface);
 }
