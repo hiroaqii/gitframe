@@ -35,14 +35,14 @@ pub const EditorConfig = struct {
     }
 };
 pub const ThemeConfig = struct {
-    overrides: [theme.role_count]?theme.ColorValue = @splat(null),
+    overrides: [theme.role_count]?theme.ColorValue = [_]?theme.ColorValue{null} ** theme.role_count,
 
     pub fn set(self: *ThemeConfig, role: theme.Role, value: theme.ColorValue) void {
-        self.overrides[@backingInt(role)] = value;
+        self.overrides[@intFromEnum(role)] = value;
     }
 
     pub fn get(self: ThemeConfig, role: theme.Role) ?theme.ColorValue {
-        return self.overrides[@backingInt(role)];
+        return self.overrides[@intFromEnum(role)];
     }
 };
 pub const KeymapConfig = keymap.Config;

@@ -2175,9 +2175,7 @@ test "remote failures preserve command phase and earlier updates" {
 
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var denied = runSensitiveRemoteCommand(std.testing.allocator, std.testing.io, tmp.dir, &environment, .{}, &.{ "/bin/sh", "-c", "printf 'Permission denied (publickey).' >&2; exit 1" });
+    var denied = runSensitiveRemoteCommand(std.testing.allocator, std.testing.io, std.Io.Dir.cwd(), &environment, .{}, &.{ "/bin/sh", "-c", "printf 'Permission denied (publickey).' >&2; exit 1" });
     defer denied.deinit();
     try std.testing.expectEqual(RemoteFailure.ssh_public_key, commandFailure(&denied, true, .may_update).?);
 }
@@ -2214,8 +2212,6 @@ fn requestRemoteCancellation(
 
 test "remote cancel contains a running TERM-ignoring helper process group" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try environment.put("PATH", "/usr/bin:/bin");
@@ -2235,7 +2231,7 @@ test "remote cancel contains a running TERM-ignoring helper process group" {
     var result = runSensitiveRemoteCommand(
         std.testing.allocator,
         std.testing.io,
-        tmp.dir,
+        std.Io.Dir.cwd(),
         &environment,
         .{ .cancellation = .{
             .canceled_generation = &canceled_generation,

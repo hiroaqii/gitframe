@@ -913,7 +913,7 @@ fn selectionMatchesCatalog(
 test "History row selection focuses the catalog and resets preview scrolling" {
     var records: [3]git_history.Record = undefined;
     var state: HistoryPageState = .{
-        .catalog = .{ .records = .initBuffer(&records) },
+        .catalog = .{ .records = .{ .items = &records, .capacity = records.len } },
         .interaction_state = .{
             .focus = .changed_files,
             .detail_anchor = .{ .block_index = 1, .source_byte_offset = 3 },
@@ -922,7 +922,6 @@ test "History row selection focuses the catalog and resets preview scrolling" {
         },
     };
 
-    state.catalog.records.expandToCapacity();
     state.applyInput(.{ .select_row = 2 }, 24);
 
     try std.testing.expectEqual(interaction.Focus.history, state.interaction_state.focus);

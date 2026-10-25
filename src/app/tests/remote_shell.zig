@@ -1013,7 +1013,7 @@ test "finishSwitchBranch failure owns full details and allows closing and reopen
     setDiffSearchQuery(&app, "needle");
 
     const details = "error: Your local changes would be overwritten by checkout:\n" ++
-        std.mem.asBytes(&@as([40]["    a-long-local-path-that-must-remain-readable-in-the-error-dialog.txt\n".len]u8, @splat("    a-long-local-path-that-must-remain-readable-in-the-error-dialog.txt\n".*))).* ++
+        "    a-long-local-path-that-must-remain-readable-in-the-error-dialog.txt\n" ** 40 ++
         "Aborting\n";
     app.pages.changes.search.query = app.pages.changes.search.input;
     const pending = beginAcceptedTestAction(&app, .switch_branch);

@@ -596,10 +596,10 @@ fn paletteWithOverride(role: theme.Role, color: theme.ColorValue) theme.Palette 
 
 test "changes pane title and white rule stay stable while search uses normal prompt weight" {
     var palette: theme.Palette = .default();
-    palette.colors[@backingInt(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@backingInt(theme.Role.info)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@backingInt(theme.Role.muted)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@backingInt(theme.Role.pane_command_fg)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.pane_command_fg)] = .{ .rgb = .{ 10, 11, 12 } };
 
     const title = sidebarTitleStyle(palette);
     const branch = sidebarBranchStyle(palette);
@@ -659,7 +659,7 @@ test "changes file search renders a bounded typed candidate window" {
     state.move(1);
 
     var palette: theme.Palette = .default();
-    palette.colors[@backingInt(theme.Role.prompt)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 1, 2, 3 } };
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(24, 4);
     defer ts.deinit();
@@ -777,9 +777,9 @@ test "sidebar renderer owns badges summaries selection styles and horizontal scr
         .viewer = .{ .focus = .sidebar },
     };
     var palette: theme.Palette = .default();
-    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@backingInt(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@backingInt(theme.Role.accent)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.accent)] = .{ .rgb = .{ 7, 8, 9 } };
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(34, 8);
     defer ts.deinit();
@@ -1066,10 +1066,10 @@ test "sidebar cursor background composes reviewed status mode and path semantics
         .fold = .none,
     };
     var palette: theme.Palette = .default();
-    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@backingInt(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@backingInt(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@backingInt(theme.Role.info)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.info)] = .{ .rgb = .{ 10, 11, 12 } };
 
     var active: chasen.testing.TestSurface = undefined;
     try active.init(40, 1);
@@ -1115,10 +1115,10 @@ test "sidebar cursor background composes reviewed status mode and path semantics
 
 test "sidebar row stage matrix keeps semantic foreground independent of cursor chrome" {
     var palette: theme.Palette = .default();
-    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@backingInt(theme.Role.staged)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@backingInt(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
-    palette.colors[@backingInt(theme.Role.danger)] = .{ .rgb = .{ 10, 11, 12 } };
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.staged)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.prompt)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 10, 11, 12 } };
 
     const cases = [_]struct {
         stage_presence: file_tree.StagePresence,
@@ -1167,7 +1167,7 @@ test "sidebar row stage matrix keeps semantic foreground independent of cursor c
 
 test "diff renderer owns header search marker gutter and input presentation" {
     var palette: theme.Palette = .default();
-    palette.colors[@backingInt(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.pane_cursor_bg)] = .{ .rgb = .{ 1, 2, 3 } };
     var page: changes_page.ChangesPageState = .{
         .load = test_support.loadState(test_support.loadedDiffOne()),
         .viewer = .{ .focus = .diff, .diff_cursor = .{ .hunk_header = 0 } },
@@ -1241,9 +1241,9 @@ test "changes display mode header key follows the effective keymap and input own
 
 test "status-only header keeps semantic statistics and metadata when inactive" {
     var palette: theme.Palette = .default();
-    palette.colors[@backingInt(theme.Role.success)] = .{ .rgb = .{ 1, 2, 3 } };
-    palette.colors[@backingInt(theme.Role.danger)] = .{ .rgb = .{ 4, 5, 6 } };
-    palette.colors[@backingInt(theme.Role.muted)] = .{ .rgb = .{ 7, 8, 9 } };
+    palette.colors[@intFromEnum(theme.Role.success)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@intFromEnum(theme.Role.danger)] = .{ .rgb = .{ 4, 5, 6 } };
+    palette.colors[@intFromEnum(theme.Role.muted)] = .{ .rgb = .{ 7, 8, 9 } };
 
     var active: chasen.testing.TestSurface = undefined;
     try active.init(40, 4);

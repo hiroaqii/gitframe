@@ -1395,7 +1395,7 @@ test "request clone owns paths and snapshots scalar presentation hint" {
     const allocator = std.testing.allocator;
     const root = root_capability.Identity{ .device = 7, .inode = 11 };
     const expected = ExpectedPresentation{
-        .fingerprint = .{ .digest = @as([32]u8, @splat(0x5a)) },
+        .fingerprint = .{ .digest = [_]u8{0x5a} ** 32 },
         .content_token = .init(41),
     };
     var request = try cloneRequestWithOptions(
@@ -1444,11 +1444,11 @@ test "request clone owns paths and snapshots scalar presentation hint" {
 
 test "eager retry basis is bounded to one live presentation identity" {
     const first: ExpectedPresentation = .{
-        .fingerprint = .{ .digest = @as([32]u8, @splat(0x11)) },
+        .fingerprint = .{ .digest = [_]u8{0x11} ** 32 },
         .content_token = .init(7),
     };
     const second: ExpectedPresentation = .{
-        .fingerprint = .{ .digest = @as([32]u8, @splat(0x22)) },
+        .fingerprint = .{ .digest = [_]u8{0x22} ** 32 },
         .content_token = .init(8),
     };
     const primary = ExpectedPresentation{

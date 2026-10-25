@@ -190,13 +190,9 @@ test "controlled Git environment removes inherited repository authority" {
 }
 
 test "bounded Git adapter preserves stdout and stderr overflow terminals" {
-    // Darwin's Zig 0.17 spawn path needs an opened directory, not Dir.cwd()'s
-    // AT_FDCWD pseudo-descriptor.
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     var environment = try LocalGitEnvironment.initFromParent(std.testing.allocator, null);
     defer environment.deinit();
-    const context: DirectoryContext = .{ .cwd = tmp.dir, .environment = &environment };
+    const context: DirectoryContext = .{ .cwd = std.Io.Dir.cwd(), .environment = &environment };
     const stdout_argv = [_][]const u8{ "sh", "-c", "printf abcdef" };
     var stdout = try runCapturedBounded(std.testing.allocator, std.testing.io, context, .{
         .argv = &stdout_argv,

@@ -211,7 +211,7 @@ fn compactDuplicates(entries: []Entry) usize {
 }
 
 test "repository change index classifies the complete documented XY groups" {
-    var expected = @as([256 * 256]u8, @splat(0));
+    var expected = [_]u8{0} ** (256 * 256);
     const mark = struct {
         fn one(table: []u8, raw: [2]u8, value: u8) void {
             table[@as(usize, raw[0]) * 256 + raw[1]] = value;

@@ -54,7 +54,7 @@ pub const State = struct {
         var replacement: State = .{
             .snapshot = snapshot,
             .total_count = page.total_count,
-            .records = .fromOwnedSlice(records),
+            .records = .{ .items = records, .capacity = records.len },
             .continuation = page.continuation,
             .capped = records.len >= git_history.catalog_limit,
         };
@@ -158,8 +158,7 @@ test "History catalog viewport includes only the load-more operation row" {
 
 test "History catalog navigation reuses Viewport keep-visible semantics" {
     var records: [10]git_history.Record = undefined;
-    var state: State = .{ .records = .initBuffer(&records) };
-    state.records.expandToCapacity();
+    var state: State = .{ .records = .{ .items = &records, .capacity = records.len } };
     try std.testing.expect(!state.canMovePrevious());
     try std.testing.expect(state.canMoveNext());
     state.pageDown(5);
@@ -184,8 +183,7 @@ test "History catalog navigation reuses Viewport keep-visible semantics" {
 
 test "History catalog selects one visible row by index" {
     var records: [10]git_history.Record = undefined;
-    var state: State = .{ .records = .initBuffer(&records) };
-    state.records.expandToCapacity();
+    var state: State = .{ .records = .{ .items = &records, .capacity = records.len } };
     state.select(6, 5);
     try std.testing.expectEqual(@as(usize, 6), state.cursor);
     try std.testing.expectEqual(@as(usize, 4), state.scroll);

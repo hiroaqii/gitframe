@@ -1,6 +1,6 @@
 # GitHub Releases
 
-The Release workflow builds with Zig 0.17.0 and `ReleaseSafe`:
+The Release workflow builds with Zig 0.16.0 and `ReleaseSafe`:
 
 | Asset platform | Build and test runner | Zig target | CPU |
 | --- | --- | --- | --- |

@@ -52,7 +52,7 @@ const Phase = enum {
     total,
 };
 
-const phase_count = @typeInfo(Phase).@"enum".field_names.len;
+const phase_count = @typeInfo(Phase).@"enum".fields.len;
 const Sample = [phase_count]u64;
 
 const Stopwatch = struct {
@@ -125,8 +125,8 @@ pub fn main(init: std.process.Init) !void {
         checksum,
     });
 
-    inline for (@typeInfo(Phase).@"enum".field_names, 0..) |field_name, phase_index| {
-        printSummary(field_name, samples[0..iterations], phase_index);
+    inline for (@typeInfo(Phase).@"enum".fields, 0..) |field, phase_index| {
+        printSummary(field.name, samples[0..iterations], phase_index);
     }
 }
 
@@ -155,7 +155,7 @@ const PairPhase = enum {
     eager_refresh_total,
 };
 
-const pair_phase_count = @typeInfo(PairPhase).@"enum".field_names.len;
+const pair_phase_count = @typeInfo(PairPhase).@"enum".fields.len;
 const PairSample = [pair_phase_count]u64;
 
 const ComponentPairInput = struct {
@@ -237,8 +237,8 @@ fn profileComponentPairCommand(init: std.process.Init, args: []const []const u8)
         checksum,
     });
 
-    inline for (@typeInfo(PairPhase).@"enum".field_names, 0..) |field_name, phase_index| {
-        printPairSummary(field_name, samples[0..iterations], phase_index);
+    inline for (@typeInfo(PairPhase).@"enum".fields, 0..) |field, phase_index| {
+        printPairSummary(field.name, samples[0..iterations], phase_index);
     }
 }
 
@@ -273,7 +273,7 @@ fn profileComponentPairOnce(
     var timer = Stopwatch.start(io);
     const after_cached = try parseComponent(arena_allocator, input.after_cached);
     const after_unstaged = try parseComponent(arena_allocator, input.after_unstaged);
-    sample[@backingInt(PairPhase.component_parse)] = timer.read();
+    sample[@intFromEnum(PairPhase.component_parse)] = timer.read();
 
     timer = Stopwatch.start(io);
     const after_projection = try diff_hunk_projection.build(
@@ -281,7 +281,7 @@ fn profileComponentPairOnce(
         try singleFile(after_cached),
         try singleFile(after_unstaged),
     );
-    sample[@backingInt(PairPhase.normalized_projection)] = timer.read();
+    sample[@intFromEnum(PairPhase.normalized_projection)] = timer.read();
 
     if (metadataEqual(before_projection.presentation.file.metadata, after_projection.presentation.file.metadata)) {
         return error.ComponentPairMetadataDidNotChange;
@@ -297,22 +297,22 @@ fn profileComponentPairOnce(
 
     timer = Stopwatch.start(io);
     const after_fingerprint = presentation_identity.fingerprint(after_projection.presentation.file);
-    sample[@backingInt(PairPhase.presentation_fingerprint)] = timer.read();
+    sample[@intFromEnum(PairPhase.presentation_fingerprint)] = timer.read();
     if (!before_fingerprint.eql(after_fingerprint)) {
         return error.ComponentPairFingerprintMismatch;
     }
 
     timer = Stopwatch.start(io);
     const equal = presentation_identity.exactEqual(before_projection.presentation.file, after_projection.presentation.file);
-    sample[@backingInt(PairPhase.presentation_equality)] = timer.read();
+    sample[@intFromEnum(PairPhase.presentation_equality)] = timer.read();
     if (!equal) return error.ComponentPairPresentationMismatch;
-    sample[@backingInt(PairPhase.exact_reuse_construction)] = reuse_timer.read();
+    sample[@intFromEnum(PairPhase.exact_reuse_construction)] = reuse_timer.read();
 
     timer = Stopwatch.start(io);
     try profileEagerComponentDecoration(arena_allocator, io, after_cached, checksum);
     try profileEagerComponentDecoration(arena_allocator, io, after_unstaged, checksum);
-    sample[@backingInt(PairPhase.eager_decoration)] = timer.read();
-    sample[@backingInt(PairPhase.eager_refresh_total)] = reuse_timer.read();
+    sample[@intFromEnum(PairPhase.eager_decoration)] = timer.read();
+    sample[@intFromEnum(PairPhase.eager_refresh_total)] = reuse_timer.read();
 
     shape.* = .{
         .before_cached_hunks = before_cached.totalHunks(),
@@ -424,16 +424,16 @@ fn profileOnce(
     var timer = Stopwatch.start(io);
     const copied = try arena_allocator.dupe(u8, bytes);
     const document = try diff_parser.parse(arena_allocator, copied);
-    sample[@backingInt(Phase.parse_document)] = timer.read();
+    sample[@intFromEnum(Phase.parse_document)] = timer.read();
 
     timer = Stopwatch.start(io);
     var spans = try provider.allocateEmptyForDocument(arena_allocator, document);
-    sample[@backingInt(Phase.span_storage)] = timer.read();
+    sample[@intFromEnum(Phase.span_storage)] = timer.read();
 
     timer = Stopwatch.start(io);
     const query_cache = try flow_syntax.QueryCache.create(io, arena_allocator, .{});
     defer query_cache.deinit();
-    sample[@backingInt(Phase.query_cache)] = timer.read();
+    sample[@intFromEnum(Phase.query_cache)] = timer.read();
 
     var run_shape: Shape = .{ .files = document.files.len };
     for (document.files, 0..) |file, file_index| {
@@ -459,7 +459,7 @@ fn profileOnce(
     const collapsed_hunks = try arena_allocator.alloc(bool, document.totalHunks());
     @memset(collapsed_hunks, false);
     const visible_nodes = try materializeVisibleNodes(arena_allocator, tree);
-    sample[@backingInt(Phase.tree_render_cache)] = timer.read();
+    sample[@intFromEnum(Phase.tree_render_cache)] = timer.read();
 
     timer = Stopwatch.start(io);
     _ = test_surface.arena.reset(.retain_capacity);
@@ -471,14 +471,14 @@ fn profileOnce(
             .syntax = .initDirect(&spans, 0),
         });
     }
-    sample[@backingInt(Phase.first_redraw)] = timer.read();
+    sample[@intFromEnum(Phase.first_redraw)] = timer.read();
 
     checksum.* +%= tree.nodes.len + collapsed_hunks.len + visible_nodes.len;
     if (document.files.len != 0) {
         checksum.* +%= rendered_line_cache.indexFor(0, .side_by_side).?.lineCount();
     }
     shape.* = run_shape;
-    sample[@backingInt(Phase.total)] = total_timer.read();
+    sample[@intFromEnum(Phase.total)] = total_timer.read();
     return sample;
 }
 
@@ -512,7 +512,7 @@ fn profileHunkSide(
 ) !void {
     var timer = Stopwatch.start(io);
     const fragment = try provider.buildFragment(allocator, hunk, key.side);
-    sample[@backingInt(Phase.fragment)] +%= timer.read();
+    sample[@intFromEnum(Phase.fragment)] +%= timer.read();
     defer fragment.deinit(allocator);
     if (fragment.text.len == 0 or fragment.lines.len == 0) return;
     shape.highlighted_sides += 1;
@@ -525,12 +525,12 @@ fn profileHunkSide(
         key.side,
         query_cache,
     );
-    sample[@backingInt(Phase.syntax_create)] +%= timer.read();
+    sample[@intFromEnum(Phase.syntax_create)] +%= timer.read();
     defer syntax.destroy();
 
     timer = Stopwatch.start(io);
     try syntax.refresh_full(fragment.text);
-    sample[@backingInt(Phase.syntax_refresh)] +%= timer.read();
+    sample[@intFromEnum(Phase.syntax_refresh)] +%= timer.read();
 
     timer = Stopwatch.start(io);
     try provider_flow_syntax.renderAndStoreHunkSideSpans(
@@ -540,7 +540,7 @@ fn profileHunkSide(
         fragment,
         key,
     );
-    sample[@backingInt(Phase.render_sanitize)] +%= timer.read();
+    sample[@intFromEnum(Phase.render_sanitize)] +%= timer.read();
 
     // Checksum accounting happens outside the timed region by reading the
     // stored spans back; the production helper carries no profiler-serving

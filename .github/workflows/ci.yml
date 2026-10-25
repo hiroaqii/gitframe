@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   test:
-    name: Zig 0.17.0 (${{ matrix.os }})
+    name: Zig 0.16.0 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -33,7 +33,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.16.0
 
       - name: Build
         run: zig build --summary all

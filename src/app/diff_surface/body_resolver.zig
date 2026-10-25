@@ -180,7 +180,7 @@ pub const BodyResolver = struct {
 };
 
 test "body resolver contract fixes policy and vtable vocabulary" {
-    const resolved_fields = @typeInfo(ResolvedTarget).@"struct".field_names;
+    const resolved_fields = std.meta.fields(ResolvedTarget);
     const expected_resolved = [_][]const u8{
         "kind",
         "line_count",
@@ -191,11 +191,11 @@ test "body resolver contract fixes policy and vtable vocabulary" {
         "folded_hunks_source",
     };
     try std.testing.expectEqual(expected_resolved.len, resolved_fields.len);
-    inline for (resolved_fields, expected_resolved) |field_name, expected| {
-        try std.testing.expectEqualStrings(expected, field_name);
+    inline for (resolved_fields, expected_resolved) |field, expected| {
+        try std.testing.expectEqualStrings(expected, field.name);
     }
 
-    const vtable_fields = @typeInfo(BodyResolver.VTable).@"struct".field_names;
+    const vtable_fields = std.meta.fields(BodyResolver.VTable);
     const expected_vtable = [_][]const u8{
         "resolvedTarget",
         "hunkStagePresentation",
@@ -210,8 +210,8 @@ test "body resolver contract fixes policy and vtable vocabulary" {
         "displayedDiffHeaderTarget",
     };
     try std.testing.expectEqual(expected_vtable.len, vtable_fields.len);
-    inline for (vtable_fields, expected_vtable) |field_name, expected| {
-        try std.testing.expectEqualStrings(expected, field_name);
+    inline for (vtable_fields, expected_vtable) |field, expected| {
+        try std.testing.expectEqualStrings(expected, field.name);
     }
 
     try std.testing.expectEqualStrings(

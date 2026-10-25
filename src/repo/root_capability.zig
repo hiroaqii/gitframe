@@ -137,8 +137,8 @@ fn identityForHandleDarwin(handle: std.posix.fd_t) !Identity {
             };
         }
         switch (std.c._errno().*) {
-            @backingInt(std.c.E.INTR) => continue,
-            @backingInt(std.c.E.BADF) => return error.InvalidRootCapability,
+            @intFromEnum(std.c.E.INTR) => continue,
+            @intFromEnum(std.c.E.BADF) => return error.InvalidRootCapability,
             else => return error.RootIdentityUnavailable,
         }
     }

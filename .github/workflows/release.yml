@@ -78,7 +78,7 @@ jobs:
           persist-credentials: false
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.16.0
       - name: Resolve release dependencies
         run: |
           # Configure the build to fetch required lazy dependencies without compiling.

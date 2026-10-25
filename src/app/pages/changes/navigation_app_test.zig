@@ -575,7 +575,7 @@ test "Changes drag auto-scroll advances input revision and captures pending rest
 test "wrap viewport reaches a tall line tail and keeps search and j k line based" {
     const allocator = std.testing.allocator;
     const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,4 +1,4 @@\n " ++
-        "needle" ++ @as([400]u8, @splat('x')) ++ "needle END\n needle next\n third\n fourth\n";
+        "needle" ++ "x" ** 400 ++ "needle END\n needle next\n third\n fourth\n";
     var bundle = try app_load.buildLoadedBundle(allocator, patch);
     var app: App = .{
         .allocator = allocator,
@@ -629,7 +629,7 @@ test "wrap viewport reaches a tall line tail and keeps search and j k line based
 
 test "wrap source anchor survives reflow and exact reload and drops on content change" {
     const allocator = std.testing.allocator;
-    const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-" ++ std.mem.asBytes(&@as([180]["old".len]u8, @splat("old".*))).* ++ "\n+short\n next\n";
+    const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-" ++ "old" ** 180 ++ "\n+short\n next\n";
     var bundle = try app_load.buildLoadedBundle(allocator, patch);
     var app: App = .{
         .allocator = allocator,
@@ -674,7 +674,7 @@ test "wrap source anchor survives reflow and exact reload and drops on content c
     var resolver = nav.contentResolverAdapter();
     var copied = (try nav.contentView(&resolver).currentLineCopyText(allocator)).?;
     defer copied.deinit(allocator);
-    try std.testing.expectEqualStrings("-" ++ std.mem.asBytes(&@as([180]["old".len]u8, @splat("old".*))).*, copied.text());
+    try std.testing.expectEqualStrings("-" ++ "old" ** 180, copied.text());
 
     var anchor = (try changesReload(&app).view().captureAnchor(allocator)).?;
     defer anchor.deinit(allocator);
@@ -683,7 +683,7 @@ test "wrap source anchor survives reflow and exact reload and drops on content c
     app.pages.changes.load = app_test_support.loadStateWithArena(exact.takeArena(), exact.loaded);
     try std.testing.expect(changesNavigation(&app).restoreReloadAnchor(allocator, changesNavigation(&app).activeLoadedDiff().?, &anchor));
     try std.testing.expectEqualDeep(saved, app.pages.changes.viewer.diff_scroll.wrapped.anchor);
-    var changed = try app_load.buildLoadedBundle(allocator, "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-" ++ std.mem.asBytes(&@as([180]["OLD".len]u8, @splat("OLD".*))).* ++ "\n+short\n next\n");
+    var changed = try app_load.buildLoadedBundle(allocator, "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-" ++ "OLD" ** 180 ++ "\n+short\n next\n");
     app.pages.changes.load.clearCurrent(allocator);
     app.pages.changes.load = app_test_support.loadStateWithArena(changed.takeArena(), changed.loaded);
     try std.testing.expect(changesNavigation(&app).restoreReloadAnchor(allocator, changesNavigation(&app).activeLoadedDiff().?, &anchor));

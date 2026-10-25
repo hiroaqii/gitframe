@@ -144,7 +144,7 @@ pub fn fingerprint(file: diff_parser.FileDiff) Fingerprint {
     writeU64(&hasher, .metadata_count, metadata.count());
     var metadata_iter = metadata.iterator();
     while (metadata_iter.next()) |fact| {
-        writeByte(&hasher, .metadata_kind, @backingInt(fact.kind));
+        writeByte(&hasher, .metadata_kind, @intFromEnum(fact.kind));
         writeBytes(&hasher, .metadata_value, fact.value);
     }
 
@@ -161,7 +161,7 @@ pub fn fingerprint(file: diff_parser.FileDiff) Fingerprint {
         writeU64(&hasher, .line_count, hunk.lines.len);
         for (hunk.lines) |line| {
             writeTag(&hasher, .line);
-            writeByte(&hasher, .line_kind, @backingInt(line.kind));
+            writeByte(&hasher, .line_kind, @intFromEnum(line.kind));
             writeBytes(&hasher, .line_text, line.text);
             writeOptionalU32(&hasher, .line_old_coordinate, line.old_line);
             writeOptionalU32(&hasher, .line_new_coordinate, line.new_line);
@@ -287,7 +287,7 @@ const HashTag = enum(u8) {
 };
 
 fn writeTag(hasher: *std.crypto.hash.Blake3, tag: HashTag) void {
-    hasher.update(&.{@backingInt(tag)});
+    hasher.update(&.{@intFromEnum(tag)});
 }
 
 fn writeByte(hasher: *std.crypto.hash.Blake3, tag: HashTag, value: u8) void {

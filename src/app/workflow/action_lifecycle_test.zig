@@ -57,7 +57,7 @@ test "action terminal coordinator accepts every exact launched action once" {
         .apply_stash,
         .drop_stash,
     };
-    try std.testing.expectEqual(@typeInfo(app_actions.ActionKind).@"enum".field_names.len, action_kinds.len);
+    try std.testing.expectEqual(@typeInfo(app_actions.ActionKind).@"enum".fields.len, action_kinds.len);
 
     var harness: Harness = .{};
     for (action_kinds) |kind| {

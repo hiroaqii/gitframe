@@ -24,7 +24,7 @@ pub const ObjectFormat = enum {
 
 /// Inline-owned canonical lowercase hexadecimal Git object ID.
 pub const ObjectId = struct {
-    bytes: [64]u8 = @as([64]u8, @splat(0)),
+    bytes: [64]u8 = [_]u8{0} ** 64,
     len: u8 = 0,
 
     pub fn parse(format: ObjectFormat, text: []const u8) error{InvalidObjectId}!ObjectId {

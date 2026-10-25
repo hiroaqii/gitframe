@@ -118,7 +118,7 @@ const CacheEntry = struct {
 
 const Cache = struct {
     /// Entries are contiguous and most-recent-first.
-    entries: [cache_entry_limit]?CacheEntry = @splat(null),
+    entries: [cache_entry_limit]?CacheEntry = .{null} ** cache_entry_limit,
     len: usize = 0,
     payload_bytes: usize = 0,
 

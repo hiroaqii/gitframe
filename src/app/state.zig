@@ -785,8 +785,8 @@ test "StatusMessage clears only ephemeral text" {
 
 test "StatusMessage clears only the matching source reload failure" {
     var status: StatusMessage = .{};
-    const first = @as([32]u8, @splat(1));
-    const second = @as([32]u8, @splat(2));
+    const first = [_]u8{1} ** 32;
+    const second = [_]u8{2} ** 32;
 
     status.setSourceReloadFailure(first, "source failed", .{});
     try std.testing.expect(!status.clearSourceReloadFailure(second));

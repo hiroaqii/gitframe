@@ -550,7 +550,7 @@ pub const LoadedDiffBundle = struct {
     loaded: LoadedDiff,
     fingerprint: content_fingerprint.Fingerprint = .{
         .byte_len = 0,
-        .digest = @as([32]u8, @splat(0)),
+        .digest = [_]u8{0} ** 32,
     },
 
     pub fn deinit(self: *LoadedDiffBundle) void {
@@ -2798,7 +2798,7 @@ test "combined worker uses one eager completion for fingerprint miss and hint-fr
     var mismatch_unstaged = try projection_component.ParsedComponent.parse(allocator, p2_unstaged_patch);
     defer mismatch_unstaged.deinit();
     var mismatch_request = try testCombinedProjectionRequest(allocator, 22, 9, .{
-        .fingerprint = .{ .digest = @as([32]u8, @splat(0xa5)) },
+        .fingerprint = .{ .digest = [_]u8{0xa5} ** 32 },
         .content_token = .init(20),
     });
     defer mismatch_request.deinit(allocator);
@@ -3690,7 +3690,7 @@ test "runCompareLoad clean committed projection preserves text binary add delete
         else => return error.ExpectedCompareLoad,
     };
 
-    var statuses = @as([5]bool, @splat(false));
+    var statuses = [_]bool{false} ** 5;
     for (loaded.loaded.document.files) |file| switch (diff_file.status(file)) {
         .modified => statuses[0] = true,
         .binary => statuses[1] = true,

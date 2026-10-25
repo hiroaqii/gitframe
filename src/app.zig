@@ -2161,7 +2161,7 @@ test "command line stale target reconciliation closes without execution" {
 test "command line root input reaches exact Repository jump and blocks mouse" {
     const allocator = std.testing.allocator;
     var app: App = .{};
-    try installCommandSourceForTest(&app, std.mem.asBytes(&@as([30]["0123456789abcdef\n".len]u8, @splat("0123456789abcdef\n".*))));
+    try installCommandSourceForTest(&app, "0123456789abcdef\n" ** 30);
     defer app.pages.repository.deinit(allocator);
 
     const open = app.handleEvent(.{ .key_press = .{ .codepoint = ':' } }) orelse
