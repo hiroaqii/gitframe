@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const git_command = @import("../git/command.zig");
 const git_read = @import("../git/read.zig");
 
@@ -113,6 +114,7 @@ pub const ParseArgsError = error{
 
 pub const LoadError = git_command.Error || error{
     ReadFailed,
+    NotRegularFile,
     MissingRepoRoot,
 };
 
@@ -227,15 +229,107 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, request: LoadRequest, cont
 }
 
 fn readPatchFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(git_read.max_diff_bytes));
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
+    // Follow external patch symlinks, but never wait for a FIFO writer during open.
+    const handle = try std.posix.openat(std.Io.Dir.cwd().handle, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+        .NOCTTY = true,
+    }, 0);
+    const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.NotRegularFile;
+    if (stat.size > git_read.max_diff_bytes) return error.StreamTooLong;
+
+    var buffer: [4096]u8 = undefined;
+    var reader = file.readerStreaming(io, &buffer);
+    // Keep the bound even if the file grows after stat; allow an exact-limit file.
+    const bytes = try reader.interface.allocRemaining(allocator, .limited64(git_read.max_diff_bytes + 1));
+    errdefer allocator.free(bytes);
+    if (bytes.len > git_read.max_diff_bytes) return error.StreamTooLong;
+    return bytes;
 }
 
 fn mapReadError(err: anyerror) LoadError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.StreamTooLong => error.StreamTooLong,
+        error.NotRegularFile => error.NotRegularFile,
         else => error.ReadFailed,
     };
+}
+
+test "patch file load preserves raw bytes and relative absolute symlink inputs" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = " patch\r\n\x00\xff\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.patch", .data = bytes });
+    try tmp.dir.symLink(io, "input.patch", "link.patch", .{});
+    const relative = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/input.patch", .{tmp.sub_path});
+    defer allocator.free(relative);
+    const absolute = try tmp.dir.realPathFileAlloc(io, "input.patch", allocator);
+    defer allocator.free(absolute);
+    const linked = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(absolute).?, "link.patch" });
+    defer allocator.free(linked);
+    for ([_][]const u8{ relative, absolute, linked }) |path| {
+        const result = try load(allocator, io, .{ .source = .{ .patch_file = path } }, .none);
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .ok);
+        try std.testing.expectEqualStrings(bytes, result.ok);
+    }
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, load(failing.allocator(), io, .{
+        .source = .{ .patch_file = absolute },
+    }, .none));
+}
+
+test "patch file load accepts empty and exact limit and rejects oversized files" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "size.patch", .{});
+    defer file.close(io);
+    const path = try tmp.dir.realPathFileAlloc(io, "size.patch", allocator);
+    defer allocator.free(path);
+    for ([_]usize{ 0, git_read.max_diff_bytes }) |size| {
+        try file.setLength(io, size);
+        const result = try load(allocator, io, .{ .source = .{ .patch_file = path } }, .none);
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .ok);
+        try std.testing.expectEqual(size, result.ok.len);
+    }
+    try file.setLength(io, git_read.max_diff_bytes + 1);
+    try std.testing.expectError(error.StreamTooLong, load(allocator, io, .{
+        .source = .{ .patch_file = path },
+    }, .none));
+}
+
+test "patch file load rejects nonregular descriptors and missing paths" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    for ([_][]const u8{ directory, "/dev/null" }) |path| {
+        try std.testing.expectError(error.NotRegularFile, load(allocator, io, .{
+            .source = .{ .patch_file = path },
+        }, .none));
+    }
+    const missing = try std.fs.path.join(allocator, &.{ directory, "missing.patch" });
+    defer allocator.free(missing);
+    try std.testing.expectError(error.ReadFailed, load(allocator, io, .{
+        .source = .{ .patch_file = missing },
+    }, .none));
 }
 
 test "parseArgs defaults to unstaged diff" {
