@@ -202,6 +202,8 @@ pub const Msg = union(enum) {
     file_search_previous,
     file_search_next,
     file_search_backspace,
+    file_search_move_left,
+    file_search_move_right,
     file_search_insert: u21,
     file_search_paste: []const u8,
     wheel_up,
@@ -1793,6 +1795,8 @@ pub const RepositoryPageState = struct {
                     .file_search_previous,
                     .file_search_next,
                     .file_search_backspace,
+                    .file_search_move_left,
+                    .file_search_move_right,
                     .file_search_insert,
                     .file_search_paste,
                     .mouse_source_press,
@@ -1995,6 +1999,8 @@ pub const RepositoryPageState = struct {
                 self.file_search.input.backspace();
                 self.refreshFileSearch();
             },
+            .file_search_move_left => self.file_search.input.moveLeft(),
+            .file_search_move_right => self.file_search.input.moveRight(),
             .file_search_insert => |codepoint| {
                 self.file_search.input.insert(codepoint) catch {
                     self.status.set("File search is too long", .{});
@@ -3809,6 +3815,36 @@ test "repository manifest replacement falls deleted directory cursor to visible 
         .repo_root => return error.ExpectedDirectoryAncestor,
         .manifest_node => |node_index| try std.testing.expectEqualStrings("a", state.bundle.?.tree.nodes[node_index].path),
     }
+}
+
+test "repository file search edits at the cursor and refreshes matching candidates" {
+    const allocator = std.testing.allocator;
+    var state: RepositoryPageState = .{
+        .bundle = try bundleForTest("test.zig\x00toast.zig\x00"),
+        .load_state = .loaded,
+    };
+    defer state.deinit(allocator);
+    const size: chasen.Size = .{ .width = 80, .height = 10 };
+    _ = state.applyNavigation(allocator, .enter_file_search, size);
+    for ("tst") |byte| _ = state.applyNavigation(allocator, .{ .file_search_insert = byte }, size);
+    _ = state.applyNavigation(allocator, .file_search_next, size);
+    try std.testing.expectEqual(@as(usize, 2), state.file_search.len);
+    try std.testing.expectEqual(@as(usize, 1), state.file_search.focused);
+
+    _ = state.applyNavigation(allocator, .file_search_move_left, size);
+    _ = state.applyNavigation(allocator, .file_search_move_left, size);
+    try std.testing.expectEqual(@as(usize, 1), state.file_search.input.cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.file_search.focused);
+    try std.testing.expectEqualStrings("tst", state.file_search.input.slice());
+
+    _ = state.applyNavigation(allocator, .{ .file_search_insert = 'e' }, size);
+    try std.testing.expectEqualStrings("test", state.file_search.input.slice());
+    try std.testing.expectEqual(@as(usize, 2), state.file_search.input.cursor);
+    try std.testing.expectEqual(@as(usize, 1), state.file_search.len);
+    try std.testing.expectEqualStrings("test.zig", state.bundle.?.tree.nodes[state.file_search.selectedNode().?].path);
+    _ = state.applyNavigation(allocator, .file_search_move_right, size);
+    try std.testing.expectEqual(@as(usize, 3), state.file_search.input.cursor);
+    try std.testing.expectEqualStrings("test", state.file_search.input.slice());
 }
 
 test "repository file search reveals collapsed ancestors before selecting result" {

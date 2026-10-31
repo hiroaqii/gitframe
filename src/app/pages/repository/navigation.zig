@@ -569,6 +569,37 @@ test "repository source comfort keeps reconciliation minimal and handles tiny vi
     try std.testing.expectEqual(@as(usize, 0), empty_viewer.source_vertical_scroll.line);
 }
 
+const FileSearchRank = enum {
+    exact,
+    filename_contiguous,
+    filename_fuzzy,
+    path_contiguous,
+    path_fuzzy,
+};
+
+fn fileSearchRank(path: []const u8, query: []const u8) ?FileSearchRank {
+    if (query.len == 0) return .exact;
+    const filename = std.fs.path.basename(path);
+    if (std.ascii.eqlIgnoreCase(filename, query) or std.ascii.eqlIgnoreCase(path, query)) return .exact;
+    if (std.ascii.findIgnoreCase(filename, query) != null) return .filename_contiguous;
+    if (fuzzyFileMatch(filename, query)) return .filename_fuzzy;
+    if (std.ascii.findIgnoreCase(path, query) != null) return .path_contiguous;
+    if (fuzzyFileMatch(path, query)) return .path_fuzzy;
+    return null;
+}
+
+fn fuzzyFileMatch(path: []const u8, query: []const u8) bool {
+    const query_view = std.unicode.Utf8View.init(query) catch return false;
+    var characters = query_view.iterator();
+    var remaining = path;
+    while (characters.nextCodepointSlice()) |character| {
+        // Match whole query characters, even when Git paths contain invalid UTF-8.
+        const index = std.ascii.findIgnoreCase(remaining, character) orelse return false;
+        remaining = remaining[index + character.len ..];
+    }
+    return true;
+}
+
 /// File search follows the active tree projection even though it scans raw
 /// nodes so collapsed descendants remain discoverable. Source search is
 /// intentionally different: it is scoped to the already selected document.
@@ -580,16 +611,26 @@ pub fn refreshFileSearch(
     state.resetResults();
     state.projection_available = true;
     const query = state.input.slice();
+    var ranks: [model.max_file_search_matches]FileSearchRank = undefined;
     for (tree.nodes, 0..) |node, node_index| {
         if (node.kind != .file) continue;
         if (visibility == .changed and node.file_change == null) continue;
-        if (query.len > 0 and std.mem.indexOf(u8, node.path, query) == null) continue;
+        const rank = fileSearchRank(node.path, query) orelse continue;
+        var position = state.len;
+        // Keep manifest order for equal ranks, including an empty query.
+        while (position > 0 and @intFromEnum(rank) < @intFromEnum(ranks[position - 1])) : (position -= 1) {}
         if (state.len == model.max_file_search_matches) {
             state.truncated = true;
-            break;
+            if (query.len == 0) break;
+            // A better candidate may occur after the first 512 matches.
+            if (position == state.len) continue;
+        } else {
+            state.len += 1;
         }
-        state.matches[state.len] = node_index;
-        state.len += 1;
+        std.mem.copyBackwards(usize, state.matches[position + 1 .. state.len], state.matches[position .. state.len - 1]);
+        std.mem.copyBackwards(FileSearchRank, ranks[position + 1 .. state.len], ranks[position .. state.len - 1]);
+        state.matches[position] = node_index;
+        ranks[position] = rank;
     }
     state.no_match = state.len == 0;
 }
@@ -632,7 +673,41 @@ test "repository repeated navigation uses precomputed width for admitted worst s
     try std.testing.expectEqual(@as(usize, 256), long_viewer.source_horizontal_scroll);
 }
 
-test "repository file search retains 512 matches and reports the 513th" {
+test "repository file search ranks case-insensitive fuzzy matches" {
+    const allocator = std.testing.allocator;
+    var manifest = try @import("../../../repository/manifest.zig").parseOwned(
+        allocator,
+        try allocator.dupe(u8, "a-ma-dir/unrelated.zig\x00b-dir/m_a.zig\x00c-dir/ma\x00d-dir/match.zig\x00m-other/a-branch/else.zig\x00src/main.zig\x00z-dir/MA\x00"),
+    );
+    defer manifest.deinit(allocator);
+    var tree = try repository_tree.Tree.build(allocator, &manifest);
+    defer tree.deinit(allocator);
+    var state: model.FileSearchState = .{ .mode = true };
+    try state.input.insertSlice("MA");
+    refreshFileSearch(&state, &tree, .all);
+    const expected = [_][]const u8{
+        "c-dir/ma",      "z-dir/MA",               "d-dir/match.zig",           "src/main.zig",
+        "b-dir/m_a.zig", "a-ma-dir/unrelated.zig", "m-other/a-branch/else.zig",
+    };
+    try std.testing.expectEqual(expected.len, state.len);
+    for (expected, state.matches[0..state.len]) |path, node_index| {
+        try std.testing.expectEqualStrings(path, tree.nodes[node_index].path);
+    }
+
+    state.input = .{};
+    try state.input.insertSlice("SMZ");
+    refreshFileSearch(&state, &tree, .all);
+    try std.testing.expectEqual(@as(usize, 1), state.len);
+    try std.testing.expectEqualStrings("src/main.zig", tree.nodes[state.selectedNode().?].path);
+
+    state.input = .{};
+    try state.input.insertSlice("ZMS");
+    refreshFileSearch(&state, &tree, .all);
+    try std.testing.expect(state.no_match);
+    try std.testing.expect(state.selectedNode() == null);
+}
+
+test "repository file search retains the best 512 matches and reports truncation" {
     const allocator = std.testing.allocator;
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(allocator);
@@ -640,7 +715,7 @@ test "repository file search retains 512 matches and reports the 513th" {
         const path = if (index < 512)
             try std.fmt.allocPrint(allocator, "match-{d}.zig", .{index})
         else
-            try allocator.dupe(u8, "other-512.zig");
+            try allocator.dupe(u8, "z/match-");
         defer allocator.free(path);
         try bytes.appendSlice(allocator, path);
         try bytes.append(allocator, 0);
@@ -650,10 +725,17 @@ test "repository file search retains 512 matches and reports the 513th" {
     var tree = try repository_tree.Tree.build(allocator, &manifest);
     defer tree.deinit(allocator);
     var state: model.FileSearchState = .{ .mode = true };
-    try state.input.insertSlice("match-");
+    try state.input.insertSlice(".zig");
     refreshFileSearch(&state, &tree, .all);
     try std.testing.expectEqual(model.max_file_search_matches, state.len);
     try std.testing.expect(!state.truncated);
+
+    state.input = .{};
+    try state.input.insertSlice("match-");
+    refreshFileSearch(&state, &tree, .all);
+    try std.testing.expectEqual(model.max_file_search_matches, state.len);
+    try std.testing.expect(state.truncated);
+    try std.testing.expectEqualStrings("z/match-", tree.nodes[state.selectedNode().?].path);
 
     state.input = .{};
     refreshFileSearch(&state, &tree, .all);
@@ -661,18 +743,18 @@ test "repository file search retains 512 matches and reports the 513th" {
     try std.testing.expect(state.truncated);
 
     state.input = .{};
-    try state.input.insertSlice("other-512.zig");
+    try state.input.insertSlice("z/match-");
     refreshFileSearch(&state, &tree, .all);
     try std.testing.expectEqual(@as(usize, 1), state.len);
     try std.testing.expect(!state.truncated);
-    try std.testing.expectEqualStrings("other-512.zig", tree.nodes[state.selectedNode().?].path);
+    try std.testing.expectEqualStrings("z/match-", tree.nodes[state.selectedNode().?].path);
 }
 
-test "repository file search compares invalid raw path bytes safely" {
+test "repository file search preserves Unicode characters and handles invalid raw path bytes" {
     const allocator = std.testing.allocator;
     var manifest = try @import("../../../repository/manifest.zig").parseOwned(
         allocator,
-        try allocator.dupe(u8, "bad-\xff.zig\x00target.zig\x00"),
+        try allocator.dupe(u8, "bad-\xff.zig\x00target.zig\x00café.zig\x00cafê©.zig\x00"),
     );
     defer manifest.deinit(allocator);
     var tree = try repository_tree.Tree.build(allocator, &manifest);
@@ -682,6 +764,12 @@ test "repository file search compares invalid raw path bytes safely" {
     refreshFileSearch(&state, &tree, .all);
     try std.testing.expectEqual(@as(usize, 1), state.len);
     try std.testing.expectEqualStrings("target.zig", tree.nodes[state.selectedNode().?].path);
+
+    state.input = .{};
+    try state.input.insertSlice("CFé");
+    refreshFileSearch(&state, &tree, .all);
+    try std.testing.expectEqual(@as(usize, 1), state.len);
+    try std.testing.expectEqualStrings("café.zig", tree.nodes[state.selectedNode().?].path);
 }
 
 test "repository changed file search ignores clean files and collapsed visibility" {
@@ -703,6 +791,7 @@ test "repository changed file search ignores clean files and collapsed visibilit
     try std.testing.expect(tree.toggleVisibleFor(0, .changed));
 
     var state: model.FileSearchState = .{ .mode = true };
+    try state.input.insertSlice("CZ");
     refreshFileSearch(&state, &tree, .changed);
     try std.testing.expectEqual(@as(usize, 1), state.len);
     try std.testing.expectEqualStrings("dir/changed.zig", tree.nodes[state.selectedNode().?].path);

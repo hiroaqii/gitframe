@@ -151,6 +151,8 @@ fn fileSearchKey(comptime Msg: type, key: chasen.Key) ?Msg {
     if (key.matches(chasen.Key.escape, .{})) return voidMsg(Msg, "cancel_file_search");
     if (key.matches(chasen.Key.enter, .{})) return voidMsg(Msg, "submit_file_search");
     if (key.matches(chasen.Key.backspace, .{})) return voidMsg(Msg, "file_search_backspace");
+    if (key.matches(chasen.Key.left, .{})) return voidMsg(Msg, "file_search_move_left");
+    if (key.matches(chasen.Key.right, .{})) return voidMsg(Msg, "file_search_move_right");
     if (key.matches(chasen.Key.up, .{})) return voidMsg(Msg, "file_search_previous");
     if (key.matches(chasen.Key.down, .{})) return voidMsg(Msg, "file_search_next");
     if (key_input.textInputCodepoint(key)) |codepoint| return payload(Msg, "file_search_insert", codepoint);
@@ -211,6 +213,8 @@ const TestMsg = union(enum) {
     cancel_file_search,
     submit_file_search,
     file_search_backspace,
+    file_search_move_left,
+    file_search_move_right,
     file_search_previous,
     file_search_next,
     file_search_insert: u21,
@@ -227,6 +231,8 @@ test "repository input routes focus search and file search independently" {
     try std.testing.expectEqual(TestMsg{ .file_search_insert = 'F' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'F' }).?);
     try std.testing.expectEqual(TestMsg{ .file_search_insert = 'B' }, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = 'B' }).?);
     try std.testing.expectEqual(TestMsg.file_search_next, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = chasen.Key.down }).?);
+    try std.testing.expectEqual(TestMsg.file_search_move_left, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = chasen.Key.left }).?);
+    try std.testing.expectEqual(TestMsg.file_search_move_right, keyToMsg(TestMsg, .{ .file_search_mode = true }, .{ .codepoint = chasen.Key.right }).?);
     try std.testing.expectEqualStrings("needle", pasteToMsg(TestMsg, .{ .source_search_mode = true }, "needle").?.source_search_paste);
 }
 

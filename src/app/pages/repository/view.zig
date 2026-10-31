@@ -884,8 +884,15 @@ pub fn drawFileSearch(
 ) !void {
     const size = surface.size();
     if (size.width == 0 or size.height == 0) return;
-    const prompt_text = try std.fmt.allocPrint(surface.frameAllocator(), "Find file: {s}", .{state.input.slice()});
-    draw.copyClippedTextAt(surface, 1, 0, prompt_text, palette.boldStyle(.prompt)) catch {};
+    const label = "Find file (fuzzy): ";
+    const prompt_style = palette.boldStyle(.prompt);
+    draw.copyClippedTextAt(surface, 1, 0, label, prompt_style) catch {};
+    const input_col: u16 = @min(size.width - 1, 1 + label.len);
+    var input_area = surface.child(.{ .col = input_col, .row = 0, .width = size.width - input_col, .height = 1 });
+    const text = state.input.slice();
+    const visible = text[view_primitives.inputVisibleStart(text, state.input.cursor, input_area.size().width)..];
+    draw.copyClippedTextAt(&input_area, 0, 0, visible, prompt_style) catch {};
+    view_primitives.showInputCursor(&input_area, 0, 0, text, state.input.cursor);
     if (size.height > 1) {
         const status = if (state.truncated)
             "512+ matches; refine search"
@@ -2009,6 +2016,22 @@ test "repository source syntax projection preserves tab and clipped-wide cells" 
     try std.testing.expectEqual(palette.color(.warning), wide_surface.surface.readCell(1, 0).?.style.fg);
 }
 
+test "repository file search shows the input cursor and scrolls long queries" {
+    var search: model.FileSearchState = .{ .mode = true };
+    try search.input.insertSlice("abcdefghij");
+    for ([_]usize{ 10, 2 }) |cursor| {
+        search.input.cursor = cursor;
+        var test_surface: chasen.testing.TestSurface = undefined;
+        try test_surface.init(24, 3);
+        defer test_surface.deinit();
+        try drawFileSearch(&test_surface.surface, null, &search, .default());
+        try std.testing.expect(test_surface.screen.cursor_vis);
+        try std.testing.expectEqual(@as(u16, 0), test_surface.screen.cursor.row);
+        try std.testing.expectEqual(@as(u16, if (cursor == 10) 23 else 22), test_surface.screen.cursor.col);
+        try test_surface.expectCellText(20, 0, if (cursor == 10) "h" else "a");
+    }
+}
+
 test "repository file search renders its bounded truncation message" {
     const allocator = std.testing.allocator;
     var manifest_document = try manifest.parseOwned(allocator, try allocator.dupe(u8, "one.zig\x00"));
@@ -2241,7 +2264,7 @@ test "repository hidden-tree file search keeps unavailable prompt cancellable" {
     try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
     const snapshot = try test_surface.snapshot(allocator);
     defer allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file: x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file (fuzzy): x") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "File list unavailable") != null);
 
     _ = state.applyNavigation(allocator, .cancel_file_search, size);
@@ -2662,7 +2685,7 @@ test "Repository branch yields row zero to full page owners" {
     try view(.{ .page_state = &state, .palette = .default() }, &test_surface.surface);
     const search_without_bundle = try test_surface.snapshot(allocator);
     defer allocator.free(search_without_bundle);
-    try std.testing.expect(std.mem.indexOf(u8, search_without_bundle, "Find file:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_without_bundle, "Find file (fuzzy):") != null);
     try std.testing.expect(std.mem.indexOf(u8, search_without_bundle, "branch-first") == null);
 
     state.file_search.mode = false;
@@ -2701,7 +2724,7 @@ test "Repository file search keeps tree chrome and hides with the tree" {
     const search_with_bundle = try test_surface.snapshot(allocator);
     defer allocator.free(search_with_bundle);
     try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "main ↑0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "Find file:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_with_bundle, "Find file (fuzzy):") != null);
 
     state.file_search.mode = false;
     state.viewer.tree_hidden = true;
@@ -2929,7 +2952,7 @@ test "repository source header page view keeps filesystem metadata outside commi
     {
         const snapshot = try test_surface.snapshot(allocator);
         defer allocator.free(snapshot);
-        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, snapshot, "Find file (fuzzy):") != null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "Ln 2/2") == null);
         try std.testing.expect(std.mem.indexOf(u8, snapshot, "2000-02-29") == null);
     }
