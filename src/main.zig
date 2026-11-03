@@ -236,8 +236,8 @@ fn printHelp(io: std.Io) !void {
         \\
         \\Options:
         \\  --range <range>   Show a commit range, for example main...HEAD
-        \\  --watch           Force-enable automatic reload
-        \\  --no-watch        Disable automatic reload
+        \\  --watch           Enable automatic reload in Changes and Repository
+        \\  --no-watch        Disable automatic reload in both tabs
         \\  --no-transition   Disable all transition animations
         \\  --stats-summary   Print runtime timing summary after exit
         \\  --version         Print version and exit
@@ -248,7 +248,8 @@ fn printHelp(io: std.Io) !void {
         \\  Update: https://github.com/hiroaqii/gitframe/blob/main/docs/guide.md#requirements
         \\
         \\Default:
-        \\  gitframe          Show staged and unstaged changes; reload every 3 seconds
+        \\  gitframe          Show staged and unstaged changes
+        \\                    Refresh the active Changes/Repository tab every 3 seconds
         \\
         \\Config:
         \\  [reload]

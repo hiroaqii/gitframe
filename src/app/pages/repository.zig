@@ -76,6 +76,7 @@ pub const DisplayedDocument = struct {
     /// is never refreshed independently from selected-document acceptance.
     metadata: ?selected_document.StableMetadata = null,
     syntax_spans: source_syntax.SourceSpans = .empty(),
+    syntax_unavailable: bool = false,
     change_decoration: ChangeDecoration = .terminal_plain,
 
     pub fn deinit(self: *DisplayedDocument, allocator: std.mem.Allocator) void {
@@ -151,6 +152,7 @@ pub const Msg = union(enum) {
     document_finished: repository_tasks.DocumentFinished,
     syntax_finished: repository_tasks.SyntaxFinished,
     change_map_finished: repository_tasks.ChangeMapFinished,
+    periodic_finished: repository_tasks.PeriodicFinished,
     move_up,
     move_down,
     toggle_directory,
@@ -222,6 +224,7 @@ pub const Msg = union(enum) {
             .document_finished => |*finished| finished.deinit(allocator),
             .syntax_finished => |*finished| finished.deinit(allocator),
             .change_map_finished => |*finished| finished.deinit(allocator),
+            .periodic_finished => |*finished| finished.deinit(allocator),
             else => {},
         }
         self.* = undefined;
@@ -294,6 +297,10 @@ pub const RepositoryPageState = struct {
     path_history: repository_path_history.State = .{},
     generation: u64 = 0,
     pending_generation: ?u64 = null,
+    /// Physical task ownership survives navigation/reload/repository changes.
+    /// Only that task's terminal releases the slot; its captured basis decides
+    /// separately whether the observation may still publish.
+    periodic: struct { generation: u64 = 0, pending: ?u64 = null } = .{},
     manifest_revision: u64 = 0,
     document_generation: u64 = 0,
     pending_document_generation: ?u64 = null,
@@ -1230,6 +1237,200 @@ pub const RepositoryPageState = struct {
         self.setReadStatus(.manifest, "Repository root could not be opened safely", .{});
     }
 
+    pub fn periodicReadBlocked(self: *const RepositoryPageState) bool {
+        return self.selection_owner != .none or self.source_search.mode or self.file_search.mode or
+            self.incoming.isPending() or self.pending_generation != null or
+            self.pending_document_generation != null or self.pending_syntax_generation != null or
+            self.pending_change_map_generation != null or self.branch.pending != null or
+            self.path_history.pending != null or self.needs_revalidation or
+            self.needs_document_revalidation or self.branch.needs_revalidation or
+            self.needs_syntax_request or self.needs_change_map_request or self.path_history.needs_revalidation;
+    }
+
+    pub fn preparePeriodicRequest(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        capability: *const root_capability.RootCapability,
+    ) !repository_tasks.PeriodicRequest {
+        std.debug.assert(self.periodic.pending == null);
+        const root_path = try allocator.dupe(u8, repo_root);
+        errdefer allocator.free(root_path);
+        var root = try capability.duplicate();
+        errdefer root.deinit();
+        const path = if (self.selected_path) |selected| try allocator.dupe(u8, selected) else null;
+        self.periodic.generation +%= 1;
+        if (self.periodic.generation == 0) self.periodic.generation = 1;
+        self.periodic.pending = self.periodic.generation;
+        return .{
+            .manifest = .{
+                .identity = self.requestIdentity(),
+                .generation = self.periodic.generation,
+                .root_path = root_path,
+                .root = root,
+                .expected_fingerprint = if (self.bundle) |bundle| bundle.document.fingerprint else null,
+                .expected_status_fingerprint = if (self.bundle) |bundle| bundle.status_fingerprint else null,
+            },
+            .manifest_generation = self.generation,
+            .document_generation = self.document_generation,
+            .manifest_revision = self.manifest_revision,
+            .path = path,
+        };
+    }
+
+    pub fn periodicStartFailed(self: *RepositoryPageState, generation: ?u64) void {
+        if (generation) |id| {
+            if (self.periodic.pending != id) return;
+            self.periodic.pending = null;
+        }
+        self.acceptFailure("Automatic repository read failed; use manual reload");
+        self.invalidateDisplayedDocumentAuthority();
+    }
+
+    pub fn applyPeriodicFinished(
+        self: *RepositoryPageState,
+        allocator: std.mem.Allocator,
+        finished: *repository_tasks.PeriodicFinished,
+        blocked: bool,
+        body_size: chasen.Size,
+    ) ApplyOutcome {
+        if (self.periodic.pending != finished.generation) return .discarded;
+        self.periodic.pending = null;
+        if (blocked or self.periodicReadBlocked() or
+            !std.meta.eql(self.requestIdentity(), finished.identity) or
+            finished.manifest_generation != self.generation or
+            finished.document_generation != self.document_generation or
+            finished.manifest_revision != self.manifest_revision or
+            !optionalPathEql(self.selected_path, finished.path)) return .discarded;
+        const root = self.root_identity orelse return .discarded;
+        if (!root.eql(finished.root_identity)) return .discarded;
+        if (finished.manifest_result == .failed_static) {
+            self.acceptFailure(finished.manifest_result.failed_static);
+            self.invalidateDisplayedDocumentAuthority();
+            return .failed;
+        }
+
+        const next_freshness: @TypeOf(self.freshness) = if (self.active) .fresh else .validating;
+        var changed = self.freshness != next_freshness;
+        const membership_changed = finished.manifest_result == .loaded;
+        const status_changed = membership_changed or finished.manifest_result == .status_changed;
+        switch (finished.manifest_result) {
+            .unchanged => {},
+            .loaded => |*incoming| {
+                const tree_scroll = self.viewer.tree_vertical_scroll;
+                self.replaceBundle(allocator, incoming, true) catch |err| {
+                    self.acceptFailure(@errorName(err));
+                    self.invalidateDisplayedDocumentAuthority();
+                    return .failed;
+                };
+                finished.manifest_result = .{ .unchanged = self.bundle.?.document.fingerprint };
+                self.manifest_revision +%= 1;
+                if (self.manifest_revision == 0) self.manifest_revision = 1;
+                self.viewer.tree_vertical_scroll = tree_scroll;
+                changed = true;
+            },
+            .status_changed => |*update| if (self.bundle) |*bundle| {
+                const was_available = bundle.status_available;
+                const tree_changed = switch (update.*) {
+                    .loaded => |*index| blk: {
+                        const different = bundle.tree.applyChangeIndex(index);
+                        bundle.status_fingerprint = index.fingerprint;
+                        bundle.status_available = true;
+                        break :blk different;
+                    },
+                    .unavailable => blk: {
+                        bundle.status_fingerprint = null;
+                        bundle.status_available = false;
+                        break :blk bundle.tree.clearChangeIndex();
+                    },
+                };
+                if (self.file_visibility == .changed) {
+                    changed = self.rebuildTreeProjection(self.selected_path, false, 0) or changed;
+                }
+                changed = tree_changed or was_available != bundle.status_available or changed;
+            },
+            .failed_static => unreachable,
+        }
+        self.freshness = if (self.active) .fresh else .validating;
+        changed = self.clearReadStatus(.manifest) or changed;
+
+        const branch_was_fresh = self.branch.freshness == .fresh;
+        const branch_outcome = self.branch.applyReadResult(.{ .repo_epoch = self.repo_epoch, .root_identity = root }, self.active, &finished.branch);
+        changed = branch_outcome == .changed or branch_outcome == .failed or
+            branch_was_fresh != (self.branch.freshness == .fresh) or changed;
+
+        if (!optionalPathEql(self.selected_path, finished.path)) {
+            self.invalidateSelectedDocument(allocator);
+            self.path_history.invalidate(allocator, self.selected_path != null);
+            self.clampForBodySize(body_size);
+            return .changed;
+        }
+        // The selected path now borrows the new tree, while the displayed path
+        // and completed selection own their storage independently.
+        if (self.displayed_document) |*displayed| displayed.manifest_revision = self.manifest_revision;
+        if (status_changed or branch_outcome == .changed or self.path_history.terminal == .unavailable) {
+            self.path_history.invalidate(allocator, self.selected_path != null);
+        }
+        if (finished.document) |*snapshot| {
+            if (snapshot.value == .unreadable or snapshot.value == .unsupported_platform) {
+                self.invalidateDisplayedDocumentAuthority();
+                self.setReadStatus(.document, "Automatic file read failed; use manual reload", .{});
+                return .failed;
+            }
+            const same = if (self.displayed_document) |*displayed|
+                periodicDocumentEqual(&displayed.value, &snapshot.value)
+            else
+                false;
+            if (same) {
+                const displayed = &self.displayed_document.?;
+                const authority: DisplayedDocument.Authority = if (self.active) .accepted else .revalidation_required;
+                changed = displayed.authority != authority or !std.meta.eql(displayed.metadata, snapshot.metadata) or changed;
+                displayed.authority = authority;
+                displayed.metadata = snapshot.metadata;
+                self.needs_syntax_request = displayed.syntax_unavailable and source_syntax_runtime.enabled;
+            } else {
+                const value = repository_tasks.DocumentValue.fromLoaded(allocator, &snapshot.value);
+                if (value == .inert and value.inert == .unreadable) {
+                    self.invalidateDisplayedDocumentAuthority();
+                    self.setReadStatus(.document, "Automatic file read failed; use manual reload", .{});
+                    return .failed;
+                }
+                const viewport = self.viewer.source_vertical_scroll;
+                self.clearCompletedSelection(allocator);
+                if (self.displayed_document) |*previous| previous.deinit(allocator);
+                self.source_revision +%= 1;
+                if (self.source_revision == 0) self.source_revision = 1;
+                self.displayed_document = .{
+                    .path = finished.path.?,
+                    .manifest_revision = self.manifest_revision,
+                    .source_revision = self.source_revision,
+                    .authority = if (self.active) .accepted else .revalidation_required,
+                    .value = value,
+                    .metadata = snapshot.metadata,
+                    .change_decoration = if (value == .source) .eligible else .terminal_plain,
+                };
+                finished.path = null;
+                self.source_search.clear();
+                self.needs_syntax_request = value == .source and source_syntax_runtime.enabled;
+                self.needs_change_map_request = value == .source;
+                self.reconcileNoSourceFocus();
+                self.clampForBodySize(body_size);
+                if (self.currentSource()) |source| self.restoreSourceViewportAnchor(viewport, source, self.sourceGeometry(body_size, source));
+                changed = true;
+            }
+            changed = self.clearReadStatus(.document) or changed;
+        }
+        if (self.displayed_document) |*displayed| {
+            if (displayed.value == .source and (status_changed or branch_outcome == .changed or displayed.change_decoration == .terminal_plain)) {
+                displayed.change_decoration.deinit(allocator);
+                displayed.change_decoration = .eligible;
+                self.needs_change_map_request = true;
+            }
+        }
+        if (membership_changed or status_changed) self.clampForBodySize(body_size);
+        return if (changed) .changed else .unchanged;
+    }
+
     pub fn applyFinished(
         self: *RepositoryPageState,
         allocator: std.mem.Allocator,
@@ -1320,7 +1521,7 @@ pub const RepositoryPageState = struct {
                 );
             },
             .loaded => |*incoming| {
-                self.replaceBundle(allocator, incoming) catch |err| {
+                self.replaceBundle(allocator, incoming, false) catch |err| {
                     self.acceptFailure(@errorName(err));
                     _ = self.terminalizeIncoming(.request_failed);
                     return .failed;
@@ -1495,10 +1696,14 @@ pub const RepositoryPageState = struct {
             .loaded => |spans| {
                 displayed.syntax_spans.deinit(allocator);
                 displayed.syntax_spans = spans;
+                displayed.syntax_unavailable = false;
                 finished.result = .unavailable;
                 return .changed;
             },
-            .unavailable => return .unchanged,
+            .unavailable => {
+                displayed.syntax_unavailable = true;
+                return .unchanged;
+            },
         }
     }
 
@@ -1548,7 +1753,7 @@ pub const RepositoryPageState = struct {
         }
     }
 
-    fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *repository_tasks.Bundle) !void {
+    fn replaceBundle(self: *RepositoryPageState, allocator: std.mem.Allocator, incoming: *repository_tasks.Bundle, preserve_completed: bool) !void {
         self.clearFileSearchDocumentAuthority();
         self.clearLiveSelection();
         std.debug.assert(!self.activeBorrowedSourceRange());
@@ -1584,9 +1789,10 @@ pub const RepositoryPageState = struct {
         else
             0;
 
-        // A newly accepted manifest does not yet provide a complete selected
-        // source fingerprint, so it cannot prove candidate identity.
-        self.clearCompletedSelection(allocator);
+        // Foreground manifest replacement has no selected-content proof.
+        // Periodic publication can retain the owned candidate until its raw
+        // document comparison, provided the selected path still matches.
+        if (!preserve_completed or !optionalPathEql(previous_selected, selected)) self.clearCompletedSelection(allocator);
         if (!optionalPathEql(previous_selected, selected)) self.body_file_navigation_focus = false;
         if (self.bundle) |*previous| previous.deinit(allocator);
         self.bundle = incoming.*;
@@ -2015,7 +2221,7 @@ pub const RepositoryPageState = struct {
                 };
                 self.refreshFileSearch();
             },
-            .request_push, .request_pull, .open_selected_file_in_editor, .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished => unreachable,
+            .request_push, .request_pull, .open_selected_file_in_editor, .manifest_finished, .branch_finished, .path_history_finished, .document_finished, .syntax_finished, .change_map_finished, .periodic_finished => unreachable,
         }
         if (!optionalPathEql(previous, self.selected_path)) {
             self.invalidateSelectedDocument(allocator);
@@ -3415,8 +3621,27 @@ fn navigationDismissesIncoming(msg: Msg) bool {
         .document_finished,
         .syntax_finished,
         .change_map_finished,
+        .periodic_finished,
         => false,
         else => true,
+    };
+}
+
+fn periodicDocumentEqual(displayed: *const repository_tasks.DocumentValue, observed: *const selected_document.Value) bool {
+    return switch (displayed.*) {
+        .source => |*source| switch (observed.*) {
+            .text => |text| source.fingerprint.eql(text.fingerprint) and std.mem.eql(u8, source.bytes, text.bytes),
+            else => false,
+        },
+        .inert => |inert| blk: {
+            if (std.meta.activeTag(inert) != std.meta.activeTag(observed.*)) break :blk false;
+            break :blk switch (inert) {
+                .symlink => |link| link.fingerprint.eql(observed.symlink.fingerprint) and std.mem.eql(u8, link.target, observed.symlink.target),
+                .oversized => |size| size == observed.oversized,
+                .text => false,
+                else => true,
+            };
+        },
     };
 }
 
@@ -3661,7 +3886,7 @@ test "repository manifest replacement refreshes active file search indices" {
 
     var incoming = try bundleForTest("new.zig\x00");
     errdefer incoming.deinit(allocator);
-    try state.replaceBundle(allocator, &incoming);
+    try state.replaceBundle(allocator, &incoming, false);
     try std.testing.expectEqual(@as(usize, 0), state.file_search.len);
     try std.testing.expect(state.file_search.no_match);
 }
@@ -3679,7 +3904,7 @@ test "repository All replacement restores typed directory cursor beside hidden s
 
     var incoming = try bundleForTest("dir/selected.zig\x00root.zig\x00");
     errdefer incoming.deinit(allocator);
-    try state.replaceBundle(allocator, &incoming);
+    try state.replaceBundle(allocator, &incoming, false);
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expectEqual(@as(usize, 1), state.viewer.tree_cursor);
     try std.testing.expectEqualStrings("dir/selected.zig", state.selected_path.?);
@@ -3701,7 +3926,7 @@ test "repository manifest replacement retains minimum tree and selected source" 
     var incoming = try bundleForTest("dir/selected.zig\x00root.zig\x00");
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(allocator);
-    try state.replaceBundle(allocator, &incoming);
+    try state.replaceBundle(allocator, &incoming, false);
     incoming_owned = false;
 
     try std.testing.expectEqual(@as(usize, 0), state.viewer.tree_cursor);
@@ -3806,7 +4031,7 @@ test "repository manifest replacement falls deleted directory cursor to visible 
     var incoming = try bundleForTest("a/kept.zig\x00");
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(allocator);
-    try state.replaceBundle(allocator, &incoming);
+    try state.replaceBundle(allocator, &incoming, false);
     incoming_owned = false;
 
     const target = state.tree_projection.targetAt(&state.bundle.?.tree, state.viewer.tree_cursor) orelse
@@ -5207,7 +5432,7 @@ test "repository source header bounds clone failure and retains exact unchanged 
     var replacement = try bundleForTest("main.zig\x00");
     var replacement_owned = true;
     defer if (replacement_owned) replacement.deinit(allocator);
-    try state.replaceBundle(allocator, &replacement);
+    try state.replaceBundle(allocator, &replacement, false);
     replacement_owned = false;
     try std.testing.expect(!state.activeMouseOwner());
 }
@@ -5399,7 +5624,7 @@ test "repository filter discoverability defaults new identity to All and preserv
     var replacement_owned = true;
     defer if (replacement_owned) replacement.deinit(allocator);
     try applyBundleStatusForTest(&replacement, " M next-change.zig\x00");
-    try state.replaceBundle(allocator, &replacement);
+    try state.replaceBundle(allocator, &replacement, false);
     replacement_owned = false;
     try std.testing.expectEqual(repository_tree.Visibility.all, state.file_visibility);
     try std.testing.expectEqual(@as(usize, 2), state.bundle.?.tree.visible_len);
@@ -5569,7 +5794,7 @@ test "repository replacement keeps changed mode anchor independent of manifest s
     var incoming = try bundleForTest("a-first.zig\x00changed.zig\x00new.zig\x00");
     errdefer incoming.deinit(allocator);
     try applyBundleStatusForTest(&incoming, " M changed.zig\x00?? new.zig\x00");
-    try state.replaceBundle(allocator, &incoming);
+    try state.replaceBundle(allocator, &incoming, false);
     try std.testing.expectEqual(repository_tree.Visibility.changed, state.file_visibility);
     try std.testing.expectEqualStrings("changed.zig", state.selected_path.?);
     try std.testing.expectEqualStrings("clean.zig", state.all_selection_anchor.?);
@@ -7003,7 +7228,7 @@ test "repository selection accepted manifest and document replacement cancel liv
     var incoming = try bundleForTest("main.zig\x00");
     var incoming_owned = true;
     defer if (incoming_owned) incoming.deinit(allocator);
-    try state.replaceBundle(allocator, &incoming);
+    try state.replaceBundle(allocator, &incoming, false);
     incoming_owned = false;
     try std.testing.expect(!state.activeMouseSourceRange());
     try std.testing.expect(state.liveSourceSelection() == null);
@@ -7376,7 +7601,7 @@ test "repository selection reconciles accepted document and keeps other replacem
         var incoming = try bundleForTest("other.zig\x00");
         var incoming_owned = true;
         defer if (incoming_owned) incoming.deinit(allocator);
-        try state.replaceBundle(allocator, &incoming);
+        try state.replaceBundle(allocator, &incoming, false);
         incoming_owned = false;
         try std.testing.expect(state.completed_selection == null);
     }
@@ -9889,4 +10114,120 @@ test "Repository remote admission requires its exact fresh branch snapshot" {
     state.branch.freshness = .fresh;
     state.active = false;
     try std.testing.expect(git_ops.pushTarget(state.remoteActionContext("/repo", 4, identity)) == .loading_branch_status);
+}
+
+fn periodicFinishedForTest(state: *RepositoryPageState, content: []const u8) !repository_tasks.PeriodicFinished {
+    const allocator = std.testing.allocator;
+    const path = try allocator.dupe(u8, state.selected_path.?);
+    errdefer allocator.free(path);
+    const bytes = try allocator.dupe(u8, content);
+    errdefer allocator.free(bytes);
+    var builder = git_branch_status.Builder.init(allocator);
+    errdefer builder.deinit();
+    try builder.setBranchHead("main");
+    state.periodic.generation += 1;
+    state.periodic.pending = state.periodic.generation;
+    return .{
+        .identity = state.requestIdentity(),
+        .root_identity = state.root_identity.?,
+        .generation = state.periodic.generation,
+        .manifest_generation = state.generation,
+        .document_generation = state.document_generation,
+        .manifest_revision = state.manifest_revision,
+        .path = path,
+        .manifest_result = .{ .unchanged = state.bundle.?.document.fingerprint },
+        .document = .{ .value = .{ .text = .{ .bytes = bytes, .fingerprint = .init(bytes) } } },
+        .branch = .{ .loaded = builder.finish() },
+    };
+}
+
+test "repository periodic publication preserves browsing and changes only the observed source" {
+    const allocator = std.testing.allocator;
+    const content = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+    const size: chasen.Size = .{ .width = 80, .height = 6 };
+    const Case = enum { unchanged, membership, content, failure, inactive };
+    for (std.enums.values(Case)) |case| {
+        var state = try selectionStateForTest("main.zig\x00", content);
+        defer state.deinit(allocator);
+        state.viewer.focus = .source;
+        state.viewer.source_cursor = 4;
+        state.viewer.source_vertical_scroll = .{ .line = 2 };
+        state.displayed_document.?.change_decoration = .{ .resolved = try repository_change_map.fromPatch(allocator, "", state.currentSource().?.contentLineCount()) };
+        state.branch.snapshot.identity = .{ .repo_epoch = state.repo_epoch, .root_identity = state.root_identity.? };
+        var builder = git_branch_status.Builder.init(allocator);
+        try builder.setBranchHead("main");
+        var branch_result: repository_branch.Result = .{ .loaded = builder.finish() };
+        defer branch_result.deinit();
+        _ = state.branch.applyReadResult(state.branch.snapshot.identity.?, true, &branch_result);
+        state.path_history = .{
+            .terminal = .known,
+            .accepted = .{
+                .identity = state.requestIdentity(),
+                .root_identity = state.root_identity.?,
+                .manifest_revision = state.manifest_revision,
+                .path = try allocator.dupe(u8, state.selected_path.?),
+                .known = .{ .head = .unborn, .fact = .uncommitted },
+            },
+        };
+        try installFirstLineCandidateForTest(&state, allocator);
+        const old_viewer = state.viewer;
+        const old_bytes = state.currentSource().?.bytes.ptr;
+        const old_tree = state.bundle.?.tree.nodes.ptr;
+        const old_selection = state.completed_selection.?.text.ptr;
+        var finished = try periodicFinishedForTest(&state, if (case == .content) "new\n" else content);
+        defer finished.deinit(allocator);
+        if (case == .membership) finished.manifest_result = .{ .loaded = try bundleForTest("main.zig\x00other.zig\x00") };
+        if (case == .failure) finished.manifest_result = .{ .failed_static = "read failed" };
+        if (case == .inactive) state.deactivate();
+        const outcome = state.applyPeriodicFinished(allocator, &finished, false, size);
+        try std.testing.expect(state.periodic.pending == null);
+        switch (case) {
+            .unchanged => {
+                try std.testing.expectEqual(ApplyOutcome.unchanged, outcome);
+                try std.testing.expectEqualDeep(old_viewer, state.viewer);
+                try std.testing.expectEqual(old_bytes, state.currentSource().?.bytes.ptr);
+                try std.testing.expectEqual(old_tree, state.bundle.?.tree.nodes.ptr);
+                try std.testing.expectEqual(old_selection, state.completed_selection.?.text.ptr);
+                try std.testing.expectEqual(@as(u64, 7), state.source_revision);
+                try std.testing.expect(!state.needs_syntax_request and !state.needs_change_map_request and !state.path_history.needs_revalidation);
+            },
+            .membership => {
+                try std.testing.expectEqual(ApplyOutcome.changed, outcome);
+                try std.testing.expectEqual(old_bytes, state.currentSource().?.bytes.ptr);
+                try std.testing.expectEqual(old_selection, state.completed_selection.?.text.ptr);
+                try std.testing.expectEqual(@as(u64, 7), state.source_revision);
+                try std.testing.expectEqual(old_viewer.source_cursor, state.viewer.source_cursor);
+                try std.testing.expectEqual(old_viewer.source_vertical_scroll, state.viewer.source_vertical_scroll);
+                try std.testing.expectEqualStrings("main.zig", state.selected_path.?);
+                try std.testing.expect(!state.needs_syntax_request);
+            },
+            .content => {
+                try std.testing.expectEqual(ApplyOutcome.changed, outcome);
+                try std.testing.expectEqualStrings("new\n", state.currentSource().?.bytes);
+                try std.testing.expectEqual(@as(u64, 8), state.source_revision);
+                try std.testing.expectEqual(@as(usize, 0), state.viewer.source_cursor);
+                try std.testing.expectEqual(@as(usize, 0), state.viewer.source_vertical_scroll.line);
+                try std.testing.expect(state.completed_selection == null);
+                try std.testing.expect(state.needs_change_map_request);
+                try std.testing.expectEqual(source_syntax_runtime.enabled, state.needs_syntax_request);
+            },
+            .failure => {
+                try std.testing.expectEqual(ApplyOutcome.failed, outcome);
+                try std.testing.expectEqual(old_bytes, state.currentSource().?.bytes.ptr);
+                try std.testing.expectEqual(old_selection, state.completed_selection.?.text.ptr);
+                try std.testing.expectEqual(DisplayedDocument.Authority.revalidation_required, state.displayed_document.?.authority);
+                var recovered = try periodicFinishedForTest(&state, content);
+                defer recovered.deinit(allocator);
+                try std.testing.expectEqual(ApplyOutcome.changed, state.applyPeriodicFinished(allocator, &recovered, false, size));
+                try std.testing.expectEqual(DisplayedDocument.Authority.accepted, state.displayed_document.?.authority);
+                try std.testing.expectEqual(old_bytes, state.currentSource().?.bytes.ptr);
+                try std.testing.expectEqual(@as(u64, 7), state.source_revision);
+            },
+            .inactive => {
+                try std.testing.expectEqual(old_bytes, state.currentSource().?.bytes.ptr);
+                try std.testing.expectEqual(DisplayedDocument.Authority.revalidation_required, state.displayed_document.?.authority);
+                try std.testing.expect(state.freshness == .validating and state.branch.freshness == .validating);
+            },
+        }
+    }
 }

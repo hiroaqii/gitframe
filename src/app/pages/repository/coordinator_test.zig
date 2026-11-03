@@ -776,3 +776,187 @@ const TestRepoPair = struct {
         self.* = undefined;
     }
 };
+
+fn drainRepositoryTasksForTest(app: *TestApp, ctx: *chasen.testing.TestCtx(TestApp.Msg)) !usize {
+    var count: usize = 0;
+    while (ctx.takeTask(0)) |taken| {
+        var task = taken;
+        defer task.deinit();
+        count += 1;
+        if (count > 16) return error.RepositoryTasksDidNotSettle;
+        try app.update(try task.run(), &ctx.ctx);
+        _ = try app.controller().startPending(&ctx.ctx);
+    }
+    return count;
+}
+
+test "Repository periodic task observes repeated edits atomic save membership and HEAD" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const policy = @import("../../auto_reload.zig").Policy.init(.enabled, .{});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try initializeRepositoryBranchAppRepoForTest(allocator, io, tmp.dir);
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var app: TestApp = .{ .allocator = allocator };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+    var ctx: chasen.testing.TestCtx(TestApp.Msg) = undefined;
+    ctx.init(allocator, io);
+    defer ctx.deinit();
+    app.pages.repository.needs_revalidation = true;
+    _ = try app.controller().startPending(&ctx.ctx);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    const state = &app.pages.repository;
+    const original = state.displayed_document.?.value.source.bytes.ptr;
+    const revision = state.source_revision;
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    try std.testing.expectEqual(@as(usize, 1), try drainRepositoryTasksForTest(&app, &ctx));
+    try std.testing.expectEqual(original, state.displayed_document.?.value.source.bytes.ptr);
+    try std.testing.expectEqual(revision, state.source_revision);
+
+    for ([_][]const u8{ "edit\n", "next\n" }) |content| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = content });
+        _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+        _ = try drainRepositoryTasksForTest(&app, &ctx);
+        try std.testing.expectEqualStrings(content, state.displayed_document.?.value.source.bytes);
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "replacement", .data = "atom\n" });
+    try tmp.dir.rename("replacement", tmp.dir, "tracked.txt", io);
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expectEqualStrings("atom\n", state.displayed_document.?.value.source.bytes);
+
+    const retained = state.displayed_document.?.value.source.bytes.ptr;
+    const retained_revision = state.source_revision;
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.txt", .data = "unrelated\n" });
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expect(state.bundle.?.tree.filePath("other.txt", .all) != null);
+    try std.testing.expectEqual(retained, state.displayed_document.?.value.source.bytes.ptr);
+    try tmp.dir.deleteFile(io, "other.txt");
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expect(state.bundle.?.tree.filePath("other.txt", .all) == null);
+
+    const old_oid = try allocator.dupe(u8, state.branch.snapshot.status.oid.?);
+    defer allocator.free(old_oid);
+    try runAppTestGit(allocator, io, &.{ "git", "switch", "-c", "other" }, tmp.dir);
+    try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "new head" }, tmp.dir);
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    try std.testing.expect((try drainRepositoryTasksForTest(&app, &ctx)) > 1);
+    try std.testing.expectEqualStrings("other", state.branch.snapshot.status.branchName().?);
+    try std.testing.expect(!std.mem.eql(u8, old_oid, state.branch.snapshot.status.oid.?));
+    try std.testing.expectEqual(retained, state.displayed_document.?.value.source.bytes.ptr);
+    try std.testing.expectEqual(retained_revision, state.source_revision);
+
+    const unstaged_status = state.bundle.?.status_fingerprint.?;
+    try runAppTestGit(allocator, io, &.{ "git", "add", "tracked.txt" }, tmp.dir);
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expect(!unstaged_status.eql(state.bundle.?.status_fingerprint.?));
+    try runAppTestGit(allocator, io, &.{ "git", "reset", "--", "tracked.txt" }, tmp.dir);
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expect(unstaged_status.eql(state.bundle.?.status_fingerprint.?));
+    try tmp.dir.deleteFile(io, "tracked.txt");
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expect(state.displayed_document.?.value.inert == .missing_or_changed);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "back\n" });
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expectEqualStrings("back\n", state.displayed_document.?.value.source.bytes);
+
+    try runAppTestGit(allocator, io, &.{ "git", "mv", "tracked.txt", "renamed.txt" }, tmp.dir);
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expectEqualStrings("renamed.txt", state.selected_path.?);
+    try std.testing.expectEqualStrings("back\n", state.displayed_document.?.value.source.bytes);
+
+    // A successful but undelivered observation owns raw bytes, manifest/status
+    // results, and branch data independently of task destruction and the page.
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    var undelivered_task = ctx.takeTask(0).?;
+    defer undelivered_task.deinit();
+    var message = try undelivered_task.run();
+    message.deinitUndelivered(allocator);
+}
+
+test "Repository periodic admission and stale terminals retain one physical task slot" {
+    const allocator = std.testing.allocator;
+    const policy = @import("../../auto_reload.zig").Policy.init(.enabled, .{});
+    const disabled = @import("../../auto_reload.zig").Policy.init(.disabled, .{});
+    var roots = try TestRepoPair.init();
+    defer roots.deinit();
+    var app: TestApp = .{ .allocator = allocator };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    try configureRepositoryBranchAppForTest(&app, allocator, roots.a);
+    app.pages.repository.branch.needs_revalidation = false;
+    var ctx: chasen.testing.TestCtx(TestApp.Msg) = undefined;
+    ctx.init(allocator, std.testing.io);
+    defer ctx.deinit();
+    const state = &app.pages.repository;
+    _ = app.controller().autoReloadTick(&ctx.ctx, &disabled);
+    state.source_search.mode = true;
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    state.source_search.mode = false;
+    var blocked = app.controller();
+    blocked.shell_blocked = true;
+    _ = blocked.autoReloadTick(&ctx.ctx, &policy);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
+
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    const generation = state.periodic.pending.?;
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pendingTaskCount());
+    var task = ctx.takeTask(0).?;
+    defer task.deinit();
+    // A user interaction beginning during the read discards even an error.
+    const before = state.freshness;
+    var outcome = blocked.update(&ctx.ctx, (try task.fail(error.ConcurrencyUnavailable)).repository);
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(repository_coordinator.Redraw.skip, outcome.redraw);
+    try std.testing.expectEqual(before, state.freshness);
+    try std.testing.expect(state.periodic.pending == null);
+
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    try std.testing.expect(state.periodic.pending.? != generation);
+    var old_task = ctx.takeTask(0).?;
+    defer old_task.deinit();
+    const old_id = state.periodic.pending.?;
+    state.requestReload(true, .manual);
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    try std.testing.expectEqual(old_id, state.periodic.pending.?);
+    state.repositoryChanged(allocator, state.repo_epoch + 1, state.root_identity);
+    try std.testing.expectEqual(old_id, state.periodic.pending.?);
+    try app.update(try old_task.fail(error.ConcurrencyUnavailable), &ctx.ctx);
+    try std.testing.expect(state.periodic.pending == null);
+    try std.testing.expectEqual(@as(usize, 0), ctx.pendingTaskCount());
+
+    state.repo_epoch = app.repo_session.repo_epoch;
+    state.needs_revalidation = false;
+    state.branch.needs_revalidation = false;
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    var failed_task = ctx.takeTask(0).?;
+    defer failed_task.deinit();
+    try app.update(try failed_task.fail(error.ConcurrencyUnavailable), &ctx.ctx);
+    try std.testing.expect(state.periodic.pending == null);
+    try std.testing.expect(state.freshness == .failed);
+
+    const Dummy = struct {
+        fn run(_: std.mem.Allocator, _: std.Io) std.Io.Cancelable!TestApp.Msg {
+            return .quit;
+        }
+        fn failed(_: chasen.TaskStartError) TestApp.Msg {
+            return .quit;
+        }
+    };
+    for (0..16) |_| _ = try ctx.ctx.task().spawn(.{ .run = Dummy.run, .failed = Dummy.failed });
+    try std.testing.expect(app.controller().autoReloadTick(&ctx.ctx, &policy));
+    try std.testing.expect(state.periodic.pending == null);
+    ctx.discardPendingTasks();
+}

@@ -275,20 +275,26 @@ pub const State = struct {
             return .discarded;
         }
 
+        return self.applyReadResult(.{
+            .repo_epoch = current_identity.repo_epoch,
+            .root_identity = current_root,
+        }, active, &finished.result);
+    }
+
+    /// The page has already admitted either an exact branch terminal or its
+    /// single periodic observation. Snapshot ownership stays here for both.
+    pub fn applyReadResult(self: *State, identity: SnapshotIdentity, active: bool, result: *Result) ApplyOutcome {
+        std.debug.assert(self.pending == null);
         self.needs_revalidation = false;
-        switch (finished.result) {
+        switch (result.*) {
             .failed => |failure| {
                 self.freshness = .{ .failed = failure };
                 return .failed;
             },
             .loaded => |*bundle| {
-                const snapshot_identity = SnapshotIdentity{
-                    .repo_epoch = current_identity.repo_epoch,
-                    .root_identity = current_root,
-                };
-                const changed = !self.snapshot.matches(snapshot_identity) or
+                const changed = !self.snapshot.matches(identity) or
                     !self.snapshot.status.eql(bundle.status);
-                if (changed) self.snapshot.replace(snapshot_identity, bundle);
+                if (changed) self.snapshot.replace(identity, bundle);
                 // An exact inactive completion may refresh retained data, but
                 // only the next activation's revalidation can make it fresh.
                 self.freshness = if (active) .fresh else .validating;

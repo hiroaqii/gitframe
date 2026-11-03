@@ -7,6 +7,7 @@
 const std = @import("std");
 const chasen = @import("chasen");
 const app_message = @import("../../message.zig");
+const auto_reload = @import("../../auto_reload.zig");
 const drag_auto_scroll = @import("../../drag_auto_scroll.zig");
 const effect_origin = @import("../../effect_origin.zig");
 const page = @import("../../page.zig");
@@ -23,6 +24,7 @@ const PathHistoryTask = repository_tasks.PathHistoryTask(app_message.Msg);
 const DocumentTask = repository_tasks.DocumentTask(app_message.Msg);
 const SyntaxTask = repository_tasks.SyntaxTask(app_message.Msg);
 const ChangeMapTask = repository_tasks.ChangeMapTask(app_message.Msg);
+const PeriodicTask = repository_tasks.PeriodicTask(app_message.Msg);
 
 pub const Redraw = enum {
     default,
@@ -66,6 +68,7 @@ pub const Controller = struct {
     repo: repo_session.View,
     body_size: chasen.Size,
     env_map: ?*std.process.Environ.Map,
+    shell_blocked: bool = false,
 
     pub fn update(
         self: Controller,
@@ -73,6 +76,12 @@ pub const Controller = struct {
         msg: repository_page.Msg,
     ) UpdateOutcome {
         switch (msg) {
+            .periodic_finished => |finished| {
+                var owned = finished;
+                defer owned.deinit(ctx.allocator());
+                const outcome = self.page_state.applyPeriodicFinished(ctx.allocator(), &owned, self.shell_blocked or self.repo.picker().model.mode, self.body_size);
+                return .{ .redraw = if (self.active_page != .repository or outcome == .discarded or outcome == .unchanged) .skip else .default };
+            },
             .request_push, .request_pull => {
                 if (self.active_page != .repository) return .{ .redraw = .skip };
                 return .{ .remote_action = if (msg == .request_push) .push else .pull };
@@ -185,6 +194,40 @@ pub const Controller = struct {
 
     pub fn requestReload(self: Controller, cause: repository_page.RepositoryPageState.ReloadCause) void {
         self.page_state.requestReload(self.repo.activeRoot() != null, cause);
+    }
+
+    /// Uses the same app-owned scheduling policy as Changes. Data ownership
+    /// and interaction/read admission remain Repository-specific.
+    pub fn autoReloadTick(self: Controller, ctx: *chasen.Ctx(app_message.Msg), policy: *const auto_reload.Policy) bool {
+        const blocked = self.shell_blocked or self.repo.picker().model.mode or
+            self.page_state.periodic.pending != null or self.page_state.periodicReadBlocked() or
+            self.page_state.repo_epoch != self.repo.epoch();
+        if (!policy.mayStart(self.active_page == .repository and self.page_state.active, blocked)) return false;
+        const root = self.repo.activeRoot() orelse return false;
+        const capability = self.repo.activeCapability() orelse return false;
+        var request = self.page_state.preparePeriodicRequest(ctx.allocator(), root, capability) catch {
+            self.page_state.periodicStartFailed(null);
+            return true;
+        };
+        const generation = request.manifest.generation;
+        var environment = git_command.LocalGitEnvironment.initFromParent(ctx.allocator(), self.env_map) catch {
+            request.deinit(ctx.allocator());
+            self.page_state.periodicStartFailed(generation);
+            return true;
+        };
+        const task = ctx.allocator().create(PeriodicTask) catch {
+            environment.deinit();
+            request.deinit(ctx.allocator());
+            self.page_state.periodicStartFailed(generation);
+            return true;
+        };
+        task.* = .{ .request = request, .environment = environment, .env_map = self.env_map };
+        _ = ctx.task().spawnOwned(task, .{ .run = PeriodicTask.run, .failed = PeriodicTask.failed, .cleanup = PeriodicTask.destroy }) catch {
+            task.destroy(ctx.allocator());
+            self.page_state.periodicStartFailed(generation);
+            return true;
+        };
+        return false;
     }
 
     /// Starts pending members in the established primary/auxiliary order.

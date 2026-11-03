@@ -215,6 +215,10 @@ pub const App = struct {
             .repo = self.repoSessionView(),
             .body_size = self.shellLayout().bodySize(),
             .env_map = self.env_map,
+            .shell_blocked = self.teardown_requested or self.commandLineView() != null or
+                self.actionLifecycleView().hasPending() or self.localWorkflowView().commitPanelOpen() or
+                self.overlay.kind != .none or self.remoteWorkflowView().hasForeground() or
+                self.shellEffectsView().hasEditorForeground(),
         };
     }
 
@@ -801,7 +805,8 @@ pub const App = struct {
             },
             .auto_reload_tick => switch (self.active_page) {
                 .changes => try self.changesRead().autoReloadTick(ctx),
-                .repository, .history, .compare => self.redraw_plan.requestSkip(),
+                .repository => if (!self.repositoryCoordinator().autoReloadTick(ctx, &self.reload_policy)) self.redraw_plan.requestSkip(),
+                .history, .compare => self.redraw_plan.requestSkip(),
             },
             .auto_reload_timer_failed => self.autoReloadTimerFailed(),
             .focus_lost => {

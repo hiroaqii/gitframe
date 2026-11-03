@@ -299,6 +299,12 @@ GitFrame after editing.
 
 ### Automatic refresh
 
+The active Changes or Repository tab refreshes automatically. Repository
+refreshes its file list, change indicators, selected file, and branch information
+while keeping your reading position and selections when the content is unchanged.
+Refresh waits while you are searching, selecting, or performing another operation.
+Switching back to a tab also refreshes it; `r` remains available for manual refresh.
+
 These are the defaults:
 
 ```toml

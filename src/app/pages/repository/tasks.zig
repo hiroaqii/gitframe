@@ -223,6 +223,100 @@ pub const DocumentFinished = struct {
     }
 };
 
+/// One background observation. Raw selected-file bytes remain unparsed until
+/// the page proves they differ from its retained source.
+pub const PeriodicRequest = struct {
+    manifest: Request,
+    manifest_generation: u64,
+    document_generation: u64,
+    manifest_revision: u64,
+    path: ?[]u8,
+
+    pub fn deinit(self: *PeriodicRequest, allocator: std.mem.Allocator) void {
+        self.manifest.deinit(allocator);
+        if (self.path) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+pub const PeriodicFinished = struct {
+    identity: page.RequestIdentity,
+    root_identity: root_capability.Identity,
+    generation: u64,
+    manifest_generation: u64,
+    document_generation: u64,
+    manifest_revision: u64,
+    path: ?[]u8,
+    manifest_result: TaskResult,
+    document: ?selected_document.Snapshot = null,
+    branch: repository_branch.Result = .{ .failed = .load_failed },
+
+    pub fn deinit(self: *PeriodicFinished, allocator: std.mem.Allocator) void {
+        if (self.path) |path| allocator.free(path);
+        self.manifest_result.deinit(allocator);
+        if (self.document) |*document| document.deinit(allocator);
+        self.branch.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn PeriodicTask(comptime AppMsg: type) type {
+    return struct {
+        request: PeriodicRequest,
+        environment: git_command.LocalGitEnvironment,
+        // Process initialization outlives accepted tasks, as for BranchTask.
+        env_map: ?*const std.process.Environ.Map,
+
+        pub fn run(task: *@This(), allocator: std.mem.Allocator, io: std.Io) std.Io.Cancelable!AppMsg {
+            const request = &task.request.manifest;
+            var result = task.finish(runManifestLoadChecked(
+                request.root_path,
+                request.root,
+                request.expected_fingerprint,
+                request.expected_status_fingerprint,
+                &task.environment,
+                allocator,
+                io,
+            ));
+            const finished = &result.repository.periodic_finished;
+            if (finished.manifest_result == .failed_static) return result;
+            if (finished.path) |path| finished.document = selected_document.load(request.root, path, allocator, io);
+            finished.branch = runRepositoryBranchLoadChecked(request.root_path, request.root, task.env_map, allocator, io);
+            if (!root_capability.pathMatches(request.root_path, request.root.identity)) {
+                finished.manifest_result.deinit(allocator);
+                finished.manifest_result = .{ .failed_static = "Repository root changed" };
+            }
+            return result;
+        }
+
+        pub fn failed(task: *@This(), failure: chasen.TaskStartError, _: std.mem.Allocator) AppMsg {
+            return task.finish(.{ .failed_static = actions.taskFailureMessage(failure) });
+        }
+
+        pub fn destroy(task: *@This(), allocator: std.mem.Allocator) void {
+            task.request.deinit(allocator);
+            task.environment.deinit();
+            allocator.destroy(task);
+        }
+
+        fn finish(task: *@This(), result: TaskResult) AppMsg {
+            const request = &task.request;
+            const finished: PeriodicFinished = .{
+                .identity = request.manifest.identity,
+                .root_identity = request.manifest.root.identity,
+                .generation = request.manifest.generation,
+                .manifest_generation = request.manifest_generation,
+                .document_generation = request.document_generation,
+                .manifest_revision = request.manifest_revision,
+                .path = request.path,
+                .manifest_result = result,
+            };
+            request.path = null;
+            return .{ .repository = .{ .periodic_finished = finished } };
+        }
+    };
+}
+
 pub fn ManifestTask(comptime AppMsg: type) type {
     return struct {
         request: Request,
@@ -544,7 +638,12 @@ pub fn SyntaxTask(comptime AppMsg: type) type {
                         snapshot.value = .unreadable;
                         defer source.deinit(allocator);
                         fingerprint = source.fingerprint;
-                        const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, source, task.request.path) catch null;
+                        const spans: ?source_syntax.SourceSpans = source_syntax_runtime.buildSourceSpans(allocator, io, source, task.request.path) catch |err| switch (err) {
+                            // Unsupported languages and bounded metadata fallback
+                            // are stable plain results, not retryable read failures.
+                            error.NotFound, error.SyntaxMetadataLimit => .empty(),
+                            else => null,
+                        };
                         if (spans) |owned| result = .{ .loaded = owned };
                     }
                 },
