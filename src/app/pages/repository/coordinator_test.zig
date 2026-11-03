@@ -885,6 +885,113 @@ test "Repository periodic task observes repeated edits atomic save membership an
     message.deinitUndelivered(allocator);
 }
 
+test "repository polling correction rejects a pre-push observation after branch refresh" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const policy = @import("../../auto_reload.zig").Policy.init(.enabled, .{});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try initializeRepositoryBranchAppRepoForTest(allocator, io, tmp.dir);
+    try runAppTestGit(allocator, io, &.{ "git", "init", "--bare", ".git/peer" }, tmp.dir);
+    try runAppTestGit(allocator, io, &.{ "git", "remote", "add", "origin", ".git/peer" }, tmp.dir);
+    try runAppTestGit(allocator, io, &.{ "git", "push", "-u", "origin", "main" }, tmp.dir);
+    try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "ahead" }, tmp.dir);
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    var app: TestApp = .{ .allocator = allocator };
+    defer app.pages.repository.deinit(allocator);
+    defer app.repo_session.repo_state.deinit(allocator);
+    try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+    var ctx: chasen.testing.TestCtx(TestApp.Msg) = undefined;
+    ctx.init(allocator, io);
+    defer ctx.deinit();
+    const state = &app.pages.repository;
+    state.needs_revalidation = true;
+    _ = try app.controller().startPending(&ctx.ctx);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expectEqual(@as(u32, 1), state.branch.snapshot.status.ahead_behind.?.ahead);
+
+    _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+    var old_task = ctx.takeTask(0).?;
+    defer old_task.deinit();
+    // Delay the worker's result before queue insertion, not an already queued
+    // message: newer branch work may legitimately reach the App first.
+    const old_message = try old_task.run();
+    try runAppTestGit(allocator, io, &.{ "git", "push", "origin", "main" }, tmp.dir);
+    state.invalidateRemoteBranch(true);
+    _ = try app.controller().startPending(&ctx.ctx);
+    _ = try drainRepositoryTasksForTest(&app, &ctx);
+    try std.testing.expectEqual(@as(u32, 0), state.branch.snapshot.status.ahead_behind.?.ahead);
+    try std.testing.expect(state.periodic.pending != null);
+    try app.update(old_message, &ctx.ctx);
+    try std.testing.expectEqual(@as(u32, 0), state.branch.snapshot.status.ahead_behind.?.ahead);
+    try std.testing.expect(state.branch.freshness == .fresh);
+    try std.testing.expect(state.periodic.pending == null);
+}
+
+test "repository polling correction revalidates effective attributes without source status or HEAD changes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const policy = @import("../../auto_reload.zig").Policy.init(.enabled, .{});
+    for ([_][]const u8{ ".gitattributes", ".git/info/attributes" }) |attribute_path| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try initializeRepositoryBranchAppRepoForTest(allocator, io, tmp.dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = ".gitattributes", .data = "# base\n" });
+        try runAppTestGit(allocator, io, &.{ "git", "add", ".gitattributes" }, tmp.dir);
+        try runAppTestGit(allocator, io, &.{ "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "attributes" }, tmp.dir);
+        try runAppTestGit(allocator, io, &.{ "git", "config", "filter.review.clean", "sed s/edit/filtered/" }, tmp.dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = attribute_path, .data = "tracked.txt -filter\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "tracked.txt", .data = "edit\n" });
+        const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(root_path);
+        var app: TestApp = .{ .allocator = allocator };
+        defer app.pages.repository.deinit(allocator);
+        defer app.repo_session.repo_state.deinit(allocator);
+        try configureRepositoryBranchAppForTest(&app, allocator, root_path);
+        var ctx: chasen.testing.TestCtx(TestApp.Msg) = undefined;
+        ctx.init(allocator, io);
+        defer ctx.deinit();
+        const state = &app.pages.repository;
+        state.needs_revalidation = true;
+        _ = try app.controller().startPending(&ctx.ctx);
+        _ = try drainRepositoryTasksForTest(&app, &ctx);
+        try app.update(.{ .repository = .move_down }, &ctx.ctx);
+        _ = try app.controller().startPending(&ctx.ctx);
+        _ = try drainRepositoryTasksForTest(&app, &ctx);
+        try std.testing.expectEqualStrings("tracked.txt", state.selected_path.?);
+        try std.testing.expect(state.displayed_document.?.change_decoration == .resolved);
+        const source = state.displayed_document.?.value.source.bytes.ptr;
+        const revision = state.source_revision;
+        const manifest_fingerprint = state.bundle.?.document.fingerprint;
+        const status_fingerprint = state.bundle.?.status_fingerprint.?;
+        const oid = try allocator.dupe(u8, state.branch.snapshot.status.oid.?);
+        defer allocator.free(oid);
+        const marks = state.displayed_document.?.change_decoration.resolved.rows.ptr;
+        _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+        try std.testing.expectEqual(@as(usize, 1), try drainRepositoryTasksForTest(&app, &ctx));
+        try std.testing.expectEqual(marks, state.displayed_document.?.change_decoration.resolved.rows.ptr);
+
+        try tmp.dir.writeFile(io, .{ .sub_path = attribute_path, .data = "tracked.txt filter=review\n" });
+        _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+        _ = try drainRepositoryTasksForTest(&app, &ctx);
+        try std.testing.expect(manifest_fingerprint.eql(state.bundle.?.document.fingerprint));
+        try std.testing.expect(status_fingerprint.eql(state.bundle.?.status_fingerprint.?));
+        try std.testing.expectEqualStrings(oid, state.branch.snapshot.status.oid.?);
+        try std.testing.expectEqual(source, state.displayed_document.?.value.source.bytes.ptr);
+        try std.testing.expectEqual(revision, state.source_revision);
+        try std.testing.expect(state.displayed_document.?.change_decoration == .terminal_plain);
+
+        try tmp.dir.writeFile(io, .{ .sub_path = attribute_path, .data = "tracked.txt -filter\n" });
+        _ = app.controller().autoReloadTick(&ctx.ctx, &policy);
+        _ = try drainRepositoryTasksForTest(&app, &ctx);
+        try std.testing.expect(state.displayed_document.?.change_decoration == .resolved);
+        try std.testing.expect(!state.displayed_document.?.change_decoration.resolved.isEmpty());
+        try std.testing.expectEqual(source, state.displayed_document.?.value.source.bytes.ptr);
+        try std.testing.expectEqual(revision, state.source_revision);
+    }
+}
+
 test "Repository periodic admission and stale terminals retain one physical task slot" {
     const allocator = std.testing.allocator;
     const policy = @import("../../auto_reload.zig").Policy.init(.enabled, .{});

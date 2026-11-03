@@ -2,6 +2,7 @@ const std = @import("std");
 const git_command = @import("command.zig");
 const process_runner = @import("../process/runner.zig");
 const repository_change_map = @import("../repository/change_map.zig");
+const content_fingerprint = @import("../content_fingerprint.zig");
 
 pub const RepositoryFileChangeLoadResult = union(enum) {
     /// The pinned HEAD tree has no blob for this path, or HEAD is unborn.
@@ -32,6 +33,10 @@ pub const RepositoryFileChangeRequest = struct {
     source_bytes: []const u8,
     /// Borrowed absolute user-private temp base selected by the App shell.
     temp_base_path: []const u8 = "/tmp",
+    /// Optional caller-owned scalar output. A successful tracked comparison
+    /// publishes the exact attribute basis checked inside that comparison.
+    /// null means the result did not depend on attributes (unborn/absent blob).
+    attribute_fingerprint_out: ?*?content_fingerprint.Fingerprint = null,
 };
 
 const repository_change_small_output_limit = 256 * 1024;
@@ -50,6 +55,23 @@ const AttributeState = struct {
     fn eql(self: AttributeState, other: AttributeState) bool {
         return self.filter == other.filter and self.working_tree_encoding == other.working_tree_encoding;
     }
+};
+
+/// Bounded effective attributes, including unsupported values. Polling uses
+/// this basis to invalidate a previously accepted optional decoration.
+pub fn loadRepositoryChangeAttributeFingerprint(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: git_command.DirectoryContext,
+    path: []const u8,
+) git_command.Error!?content_fingerprint.Fingerprint {
+    const attributes = try loadRepositoryChangeAttributes(allocator, io, context, path, null) orelse return null;
+    return attributes.fingerprint;
+}
+
+const AttributeObservation = struct {
+    fingerprint: content_fingerprint.Fingerprint,
+    safe: ?AttributeState,
 };
 
 const TreeBlob = struct {
@@ -97,6 +119,7 @@ fn loadGitRepositoryFileChangeWithHooks(
     request: RepositoryFileChangeRequest,
     hooks: ?*RepositoryChangeTestHooks,
 ) git_command.Error!RepositoryFileChangeLoadResult {
+    if (request.attribute_fingerprint_out) |out| out.* = null;
     const repository_context = git_command.DirectoryContext{ .cwd = request.cwd, .environment = request.environment };
 
     const head_result = try runRepositoryChangeCommand(allocator, io, repository_context, &.{
@@ -147,8 +170,9 @@ fn loadGitRepositoryFileChangeWithHooks(
     const blob = parseTreeBlob(entry_result.stdout, request.path) catch return .{ .failed_static = "Repository change basis unavailable" };
     if (blob == null) return .all_added;
 
-    const attributes_before = try loadSafeRepositoryChangeAttributes(allocator, io, repository_context, request.path, hooks) orelse
+    const attributes_before = try loadRepositoryChangeAttributes(allocator, io, repository_context, request.path, hooks) orelse
         return .{ .failed_static = "Repository change attributes unavailable" };
+    if (attributes_before.safe == null) return .{ .failed_static = "Repository change attributes unavailable" };
 
     const blob_result = try runRepositoryChangeCommand(allocator, io, repository_context, &.{
         "git",
@@ -198,11 +222,11 @@ fn loadGitRepositoryFileChangeWithHooks(
     }, &.{}, 16 * 1024 * 1024, hooks);
     errdefer diff_result.deinit(allocator);
 
-    const attributes_after = try loadSafeRepositoryChangeAttributes(allocator, io, repository_context, request.path, hooks) orelse {
+    const attributes_after = try loadRepositoryChangeAttributes(allocator, io, repository_context, request.path, hooks) orelse {
         diff_result.deinit(allocator);
         return .{ .failed_static = "Repository change attributes unavailable" };
     };
-    if (!attributes_before.eql(attributes_after)) {
+    if (attributes_after.safe == null or !attributes_before.safe.?.eql(attributes_after.safe.?)) {
         diff_result.deinit(allocator);
         return .{ .failed_static = "Repository change attributes changed" };
     }
@@ -235,6 +259,9 @@ fn loadGitRepositoryFileChangeWithHooks(
     if (!cleaned) {
         candidate.deinit(allocator);
         return .{ .failed_static = "Repository comparison cleanup failed" };
+    }
+    if (candidate != .failed_static) {
+        if (request.attribute_fingerprint_out) |out| out.* = attributes_before.fingerprint;
     }
     return candidate;
 }
@@ -316,13 +343,13 @@ fn parseTreeBlob(output: []const u8, expected_path: []const u8) !?TreeBlob {
     return .{ .oid = oid };
 }
 
-fn loadSafeRepositoryChangeAttributes(
+fn loadRepositoryChangeAttributes(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: git_command.DirectoryContext,
     path: []const u8,
     hooks: ?*RepositoryChangeTestHooks,
-) git_command.Error!?AttributeState {
+) git_command.Error!?AttributeObservation {
     const stdin = allocator.alloc(u8, path.len + 1) catch return error.OutOfMemory;
     defer allocator.free(stdin);
     @memcpy(stdin[0..path.len], path);
@@ -339,7 +366,7 @@ fn loadSafeRepositoryChangeAttributes(
     }, stdin, repository_change_small_output_limit, hooks);
     defer result.deinit(allocator);
     if (!termExited(result.term, 0)) return null;
-    return parseSafeAttributes(result.stdout, path);
+    return .{ .fingerprint = .init(result.stdout), .safe = parseSafeAttributes(result.stdout, path) };
 }
 
 fn parseSafeAttributes(output: []const u8, expected_path: []const u8) ?AttributeState {

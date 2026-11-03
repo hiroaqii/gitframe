@@ -78,6 +78,7 @@ pub const DisplayedDocument = struct {
     syntax_spans: source_syntax.SourceSpans = .empty(),
     syntax_unavailable: bool = false,
     change_decoration: ChangeDecoration = .terminal_plain,
+    change_attribute_fingerprint: ?content_fingerprint.Fingerprint = null,
 
     pub fn deinit(self: *DisplayedDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -1113,6 +1114,9 @@ pub const RepositoryPageState = struct {
     }
 
     pub fn invalidateRemoteBranch(self: *RepositoryPageState, has_repository: bool) void {
+        // Retire publication authority, but keep the physical slot until its
+        // terminal arrives. A branch-only refresh does not advance the manifest.
+        self.periodic.generation +%= 1;
         self.branch.pending = null;
         self.branch.requestReload(self.active, self.repo_epoch, if (has_repository) self.root_identity else null);
     }
@@ -1296,7 +1300,7 @@ pub const RepositoryPageState = struct {
     ) ApplyOutcome {
         if (self.periodic.pending != finished.generation) return .discarded;
         self.periodic.pending = null;
-        if (blocked or self.periodicReadBlocked() or
+        if (finished.generation != self.periodic.generation or blocked or self.periodicReadBlocked() or
             !std.meta.eql(self.requestIdentity(), finished.identity) or
             finished.manifest_generation != self.generation or
             finished.document_generation != self.document_generation or
@@ -1345,7 +1349,8 @@ pub const RepositoryPageState = struct {
                     },
                 };
                 if (self.file_visibility == .changed) {
-                    changed = self.rebuildTreeProjection(self.selected_path, false, 0) or changed;
+                    const layout = repository_layout.bodyLayout(body_size, self.viewer.tree_width, self.viewer.tree_hidden);
+                    changed = self.rebuildTreeProjection(self.selected_path, false, layout.treeRows(body_size.height)) or changed;
                 }
                 changed = tree_changed or was_available != bundle.status_available or changed;
             },
@@ -1421,10 +1426,30 @@ pub const RepositoryPageState = struct {
             changed = self.clearReadStatus(.document) or changed;
         }
         if (self.displayed_document) |*displayed| {
-            if (displayed.value == .source and (status_changed or branch_outcome == .changed or displayed.change_decoration == .terminal_plain)) {
-                displayed.change_decoration.deinit(allocator);
-                displayed.change_decoration = .eligible;
-                self.needs_change_map_request = true;
+            if (displayed.value == .source) {
+                if (finished.attribute_fingerprint) |attributes| {
+                    // A resolved map with no attribute basis is all-added for
+                    // an unborn HEAD/absent blob; attributes cannot change it.
+                    const attributes_changed = if (displayed.change_attribute_fingerprint) |previous|
+                        !previous.eql(attributes)
+                    else
+                        displayed.change_decoration != .resolved;
+                    if (attributes_changed or status_changed or branch_outcome == .changed or displayed.change_decoration == .terminal_plain) {
+                        displayed.change_decoration.deinit(allocator);
+                        displayed.change_decoration = .eligible;
+                        self.needs_change_map_request = true;
+                        changed = attributes_changed or changed;
+                    }
+                    displayed.change_attribute_fingerprint = attributes;
+                } else {
+                    // An unverified attribute basis cannot authorize old marks.
+                    // The next periodic observation retries this cheap read.
+                    changed = displayed.change_decoration != .terminal_plain or changed;
+                    displayed.change_decoration.deinit(allocator);
+                    displayed.change_decoration = .terminal_plain;
+                    displayed.change_attribute_fingerprint = null;
+                    self.needs_change_map_request = false;
+                }
             }
         }
         if (membership_changed or status_changed) self.clampForBodySize(body_size);
@@ -1739,6 +1764,7 @@ pub const RepositoryPageState = struct {
         }
         if (!displayed.change_decoration.isEligible()) return .discarded;
 
+        displayed.change_attribute_fingerprint = finished.attribute_fingerprint;
         displayed.change_decoration.deinit(allocator);
         switch (finished.result) {
             .loaded => |map| {
@@ -10138,14 +10164,55 @@ fn periodicFinishedForTest(state: *RepositoryPageState, content: []const u8) !re
         .manifest_result = .{ .unchanged = state.bundle.?.document.fingerprint },
         .document = .{ .value = .{ .text = .{ .bytes = bytes, .fingerprint = .init(bytes) } } },
         .branch = .{ .loaded = builder.finish() },
+        .attribute_fingerprint = .init("safe attributes"),
     };
+}
+
+test "repository polling correction preserves a navigated Changed viewport on unrelated status changes" {
+    const allocator = std.testing.allocator;
+    const paths = "f00\x00f01\x00f02\x00f03\x00f04\x00f05\x00f06\x00f07\x00f08\x00f09\x00f10\x00f11\x00f12\x00f13\x00f14\x00f15\x00";
+    const status = " M f00\x00 M f01\x00 M f02\x00 M f03\x00 M f04\x00 M f05\x00 M f06\x00 M f07\x00 M f08\x00 M f09\x00 M f10\x00 M f11\x00 M f12\x00 M f13\x00 M f14\x00 M f15\x00";
+    const size: chasen.Size = .{ .width = 80, .height = 7 };
+    var root = try TestRoot.init();
+    defer root.deinit();
+    var state = try selectionStateForTest(paths, "text\n");
+    defer state.deinit(allocator);
+    state.root_identity = root.capability.identity;
+    try applyBundleStatusForTest(&state.bundle.?, status);
+    var toggle = state.applyNavigation(allocator, .toggle_changed_filter, size);
+    toggle.deinit(allocator);
+    for (0..7) |_| {
+        var move = state.applyNavigation(allocator, .move_down, size);
+        move.deinit(allocator);
+    }
+    var request = try state.prepareDocumentRequest(allocator, &root.capability);
+    defer request.deinit(allocator);
+    var document = try fileSearchDocumentFinishedForTest(allocator, &request, "text\n");
+    defer document.deinit(allocator);
+    _ = state.applyDocumentFinished(allocator, &document);
+    state.needs_syntax_request = false;
+    state.needs_change_map_request = false;
+    state.path_history.needs_revalidation = false;
+    try std.testing.expectEqualStrings("f07", state.selected_path.?);
+    try std.testing.expectEqual(@as(usize, 8), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_vertical_scroll);
+    var finished = try periodicFinishedForTest(&state, "text\n");
+    defer finished.deinit(allocator);
+    // The last file remains in Changed, but its index/worktree status changes.
+    const updated = try allocator.dupe(u8, status);
+    updated[updated.len - 7] = 'M';
+    finished.manifest_result = .{ .status_changed = .{ .loaded = try repository_change_index.parseOwned(allocator, updated) } };
+    _ = state.applyPeriodicFinished(allocator, &finished, false, size);
+    try std.testing.expectEqualStrings("f07", state.selected_path.?);
+    try std.testing.expectEqual(@as(usize, 8), state.viewer.tree_cursor);
+    try std.testing.expectEqual(@as(usize, 4), state.viewer.tree_vertical_scroll);
 }
 
 test "repository periodic publication preserves browsing and changes only the observed source" {
     const allocator = std.testing.allocator;
     const content = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
     const size: chasen.Size = .{ .width = 80, .height = 6 };
-    const Case = enum { unchanged, membership, content, failure, inactive };
+    const Case = enum { unchanged, membership, content, failure, inactive, attribute_failure };
     for (std.enums.values(Case)) |case| {
         var state = try selectionStateForTest("main.zig\x00", content);
         defer state.deinit(allocator);
@@ -10153,6 +10220,7 @@ test "repository periodic publication preserves browsing and changes only the ob
         state.viewer.source_cursor = 4;
         state.viewer.source_vertical_scroll = .{ .line = 2 };
         state.displayed_document.?.change_decoration = .{ .resolved = try repository_change_map.fromPatch(allocator, "", state.currentSource().?.contentLineCount()) };
+        state.displayed_document.?.change_attribute_fingerprint = .init("safe attributes");
         state.branch.snapshot.identity = .{ .repo_epoch = state.repo_epoch, .root_identity = state.root_identity.? };
         var builder = git_branch_status.Builder.init(allocator);
         try builder.setBranchHead("main");
@@ -10179,6 +10247,7 @@ test "repository periodic publication preserves browsing and changes only the ob
         if (case == .membership) finished.manifest_result = .{ .loaded = try bundleForTest("main.zig\x00other.zig\x00") };
         if (case == .failure) finished.manifest_result = .{ .failed_static = "read failed" };
         if (case == .inactive) state.deactivate();
+        if (case == .attribute_failure) finished.attribute_fingerprint = null;
         const outcome = state.applyPeriodicFinished(allocator, &finished, false, size);
         try std.testing.expect(state.periodic.pending == null);
         switch (case) {
@@ -10227,6 +10296,16 @@ test "repository periodic publication preserves browsing and changes only the ob
                 try std.testing.expectEqual(old_bytes, state.currentSource().?.bytes.ptr);
                 try std.testing.expectEqual(DisplayedDocument.Authority.revalidation_required, state.displayed_document.?.authority);
                 try std.testing.expect(state.freshness == .validating and state.branch.freshness == .validating);
+            },
+            .attribute_failure => {
+                try std.testing.expectEqual(ApplyOutcome.changed, outcome);
+                try std.testing.expectEqual(old_bytes, state.currentSource().?.bytes.ptr);
+                try std.testing.expect(state.displayed_document.?.change_decoration == .terminal_plain);
+                try std.testing.expect(!state.needs_change_map_request);
+                var recovered = try periodicFinishedForTest(&state, content);
+                defer recovered.deinit(allocator);
+                _ = state.applyPeriodicFinished(allocator, &recovered, false, size);
+                try std.testing.expect(state.needs_change_map_request);
             },
         }
     }

@@ -137,6 +137,7 @@ pub const ChangeMapFinished = struct {
     fingerprint: content_fingerprint.Fingerprint,
     content_line_count: usize,
     result: ChangeMapResult,
+    attribute_fingerprint: ?content_fingerprint.Fingerprint = null,
 
     pub fn deinit(self: *ChangeMapFinished, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -250,6 +251,7 @@ pub const PeriodicFinished = struct {
     manifest_result: TaskResult,
     document: ?selected_document.Snapshot = null,
     branch: repository_branch.Result = .{ .failed = .load_failed },
+    attribute_fingerprint: ?content_fingerprint.Fingerprint = null,
 
     pub fn deinit(self: *PeriodicFinished, allocator: std.mem.Allocator) void {
         if (self.path) |path| allocator.free(path);
@@ -280,7 +282,17 @@ pub fn PeriodicTask(comptime AppMsg: type) type {
             ));
             const finished = &result.repository.periodic_finished;
             if (finished.manifest_result == .failed_static) return result;
-            if (finished.path) |path| finished.document = selected_document.load(request.root, path, allocator, io);
+            if (finished.path) |path| {
+                finished.document = selected_document.load(request.root, path, allocator, io);
+                if (finished.document.?.value == .text) {
+                    finished.attribute_fingerprint = git_repository_change.loadRepositoryChangeAttributeFingerprint(
+                        allocator,
+                        io,
+                        .{ .cwd = request.root.dir(), .environment = &task.environment },
+                        path,
+                    ) catch null;
+                }
+            }
             finished.branch = runRepositoryBranchLoadChecked(request.root_path, request.root, task.env_map, allocator, io);
             if (!root_capability.pathMatches(request.root_path, request.root.identity)) {
                 finished.manifest_result.deinit(allocator);
@@ -699,6 +711,7 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
             var fingerprint = task.request.expected_fingerprint;
             var content_line_count = task.request.expected_content_line_count;
             var result: ChangeMapResult = .unavailable;
+            var attribute_fingerprint: ?content_fingerprint.Fingerprint = null;
             var snapshot = selected_document.load(task.request.root, task.request.path, allocator, io);
             defer snapshot.deinit(allocator);
             var value = DocumentValue.fromLoaded(allocator, &snapshot.value);
@@ -718,6 +731,7 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
                             task.request.path,
                             source,
                             task.request.temp_base_path,
+                            &attribute_fingerprint,
                         );
                     }
                 },
@@ -734,6 +748,7 @@ pub fn ChangeMapTask(comptime AppMsg: type) type {
                 .fingerprint = fingerprint,
                 .content_line_count = content_line_count,
                 .result = result,
+                .attribute_fingerprint = attribute_fingerprint,
             };
             task.request.path = &.{};
             return .{ .repository = .{ .change_map_finished = finished } };
@@ -765,6 +780,7 @@ fn loadChangeMap(
     path: []const u8,
     source: *const source_document.Document,
     temp_base_path: []const u8,
+    attribute_fingerprint: *?content_fingerprint.Fingerprint,
 ) ChangeMapResult {
     const loaded = git_repository_change.loadRepositoryFileChange(allocator, io, .{
         .cwd = cwd,
@@ -772,6 +788,7 @@ fn loadChangeMap(
         .path = path,
         .source_bytes = source.bytes,
         .temp_base_path = temp_base_path,
+        .attribute_fingerprint_out = attribute_fingerprint,
     }) catch return .unavailable;
     defer loaded.deinit(allocator);
     const map = switch (loaded) {
