@@ -489,6 +489,7 @@ test "Changes mutation read fence drains old production reads without publicatio
     var roots = try TestRepoPair.init();
     defer roots.deinit();
     var app: App = .{
+        .reload_policy = .init(.enabled, .{}),
         .allocator = allocator,
         .active_page = .changes,
         .config = .{ .source = .unstaged },
@@ -497,7 +498,6 @@ test "Changes mutation read fence drains old production reads without publicatio
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}),
             .viewer = .{ .selected_target = .{ .diff_file = 0 } },
         } },
     };
@@ -519,7 +519,7 @@ test "Changes mutation read fence drains old production reads without publicatio
     const old_epoch = app.pages.changes.repository_read_authority.epoch;
     const body_ptr = changesNavigationView(&app).activeLoadedDiffConst().?.text.ptr;
 
-    const cycle_id = app.pages.changes.auto_reload.beginCycle() orelse
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()) orelse
         return error.ExpectedBackgroundCycle;
     var task_ctx: chasen.testing.TestCtx(App.Msg) = undefined;
     task_ctx.init(allocator, std.testing.io);
@@ -726,8 +726,9 @@ test "background branch completion during repository action is discarded and rel
     });
     try app.pages.changes.branch_status.replace("/repo", &current);
 
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .branch));
     const generation = app.pages.changes.branch_status_load.prepare(true);
     app.pages.changes.branch_status_load.begin(cycle_id, .{});
@@ -756,10 +757,10 @@ test "background branch completion during repository action is discarded and rel
 test "inactive page timer starts no Changes work" {
     var app: App = .{
         .active_page = .repository,
-        .pages = .{ .changes = .{ .auto_reload = .{
+        .reload_policy = .{
             .activation = .automatic,
             .interval_ns = 3 * std.time.ns_per_s,
-        } } },
+        },
     };
     var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
     ctx.init(std.testing.allocator, std.testing.io);
@@ -816,10 +817,10 @@ test "mutation read start gate blocks forced auto reload before cycle ownership"
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .unstaged },
-        .pages = .{ .changes = .{ .auto_reload = .{
+        .reload_policy = .{
             .activation = .forced,
             .interval_ns = 3 * std.time.ns_per_s,
-        } } },
+        },
     };
     _ = activateChanges(&app);
     const owner: app_actions.PendingAction = .{
@@ -893,10 +894,10 @@ test "closed read authority keeps watch tick drop semantics without queueing" {
     var app: App = .{
         .allocator = allocator,
         .config = .{ .source = .unstaged },
-        .pages = .{ .changes = .{ .auto_reload = .{
+        .reload_policy = .{
             .activation = .forced,
             .interval_ns = 3 * std.time.ns_per_s,
-        } } },
+        },
     };
     _ = activateChanges(&app);
     const owner: app_actions.PendingAction = .{
@@ -1900,8 +1901,9 @@ test "background status completion during repository action is discarded and rel
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M old.zig\x00");
     try app.pages.changes.git_status.replace("/repo", &current);
 
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .status));
     const generation = app.pages.changes.status_load.prepare(true);
     app.pages.changes.status_load.begin(cycle_id, .{});
@@ -1939,10 +1941,11 @@ test "background source completion during repository action is discarded and rel
     defer changesReload(&app).clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{});
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
     app.pages.changes.auto_reload.acceptSource(accepted);
     syncTestActivation(&app);
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const pending = beginAcceptedTestAction(&app, .stage_file);
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
@@ -1995,8 +1998,9 @@ test "deferred background source is discarded when a repository action starts" {
     defer changesReload(&app).clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
@@ -2036,8 +2040,9 @@ test "empty watch result defers during selection and focus loss applies it" {
     defer changesReload(&app).clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
     ctx.init(std.testing.allocator, std.testing.io);
@@ -2113,6 +2118,7 @@ pub fn canonicalPublicationTestApp(
     repo_root: []const u8,
 ) !App {
     var app: App = .{
+        .reload_policy = .init(.enabled, .{}),
         .allocator = allocator,
         .active_page = .changes,
         .config = .{ .source = .unstaged },
@@ -2121,7 +2127,6 @@ pub fn canonicalPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -2167,6 +2172,7 @@ fn canonicalPublicationPrimaryTestApp(
     repo_root: []const u8,
 ) !App {
     var app: App = .{
+        .reload_policy = .init(.enabled, .{}),
         .allocator = allocator,
         .active_page = .changes,
         .config = .{ .source = .unstaged },
@@ -2174,7 +2180,6 @@ fn canonicalPublicationPrimaryTestApp(
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, repo_root) },
         },
         .pages = .{ .changes = .{
-            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -2230,6 +2235,7 @@ fn ordinaryPrimaryPublicationTestApp(
     repo_root: []const u8,
 ) !App {
     var app: App = .{
+        .reload_policy = .init(.enabled, .{}),
         .allocator = allocator,
         .active_page = .changes,
         .config = .{ .source = .unstaged },
@@ -2238,7 +2244,6 @@ fn ordinaryPrimaryPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,

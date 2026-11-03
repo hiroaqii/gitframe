@@ -113,6 +113,7 @@ pub const PendingDiscoveryCommit = struct {
 
 pub const Controller = struct {
     page_state: *changes_page.ChangesPageState,
+    reload_policy: *const app_auto_reload.Policy,
     fence: action_fence.View,
     active_page: app_page.Id,
     repo: repo_session.View,
@@ -198,7 +199,7 @@ pub const Controller = struct {
 
     fn startRevalidation(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
         if (self.active_page != .changes) return;
-        var cycle_id = self.page_state.auto_reload.beginCycle();
+        var cycle_id = self.page_state.auto_reload.beginCycle(self.reload_policy.enabled());
         errdefer if (cycle_id) |id| self.page_state.auto_reload.discardEmptyCycle(id);
         const outcome = try self.startReload(ctx, .{
             .clear_visible_state = self.page_state.load.state == .idle,
@@ -946,36 +947,24 @@ pub const Controller = struct {
     }
 
     pub fn autoReloadTick(self: Controller, ctx: *chasen.Ctx(app_message.Msg)) !void {
-        if (self.active_page != .changes) {
-            self.redraw.requestSkip();
-            return;
-        }
-        if (!self.page_state.auto_reload.enabled()) return;
-        if (!self.fence.mayStartRepositoryRead()) {
-            self.redraw.requestSkip();
-            return;
-        }
-        if (self.repo.picker().model.mode or self.page_state.search.mode or self.page_state.file_search.mode or
+        const blocked = !self.fence.mayStartRepositoryRead() or
+            self.repo.picker().model.mode or self.page_state.search.mode or self.page_state.file_search.mode or
             self.shell_blockers.commit_panel or self.page_state.selection_owner.activeMouseSelection() or
-            self.shell_blockers.action_pending or self.fence.hasActionCursor())
-        {
-            self.redraw.requestSkip();
-            return;
-        }
-        if (self.page_state.auto_reload.background_cycle != null or self.page_state.load.hasPending() or
+            self.shell_blockers.action_pending or self.fence.hasActionCursor() or
+            self.page_state.auto_reload.background_cycle != null or self.page_state.load.hasPending() or
             self.page_state.load.state == .loading or self.page_state.status_load.isPending() or
-            self.page_state.branch_status_load.isPending() or self.page_state.changes_projection.hasPending())
-        {
+            self.page_state.branch_status_load.isPending() or self.page_state.changes_projection.hasPending();
+        if (!self.reload_policy.mayStart(self.active_page == .changes, blocked)) {
             self.redraw.requestSkip();
             return;
         }
 
         if (diff_source.sourceRequiresRepo(self.source) and self.repo.needsDiscovery()) {
-            if (self.page_state.auto_reload.activation != .forced) {
+            if (self.reload_policy.activation != .forced) {
                 self.redraw.requestSkip();
                 return;
             }
-            const cycle_id = self.page_state.auto_reload.beginCycle() orelse {
+            const cycle_id = self.page_state.auto_reload.beginCycle(self.reload_policy.enabled()) orelse {
                 self.redraw.requestSkip();
                 return;
             };
@@ -983,7 +972,7 @@ pub const Controller = struct {
             try self.startRepoDiscovery(ctx, cycle_id);
             self.page_state.auto_reload.discardEmptyCycle(cycle_id);
         } else {
-            const cycle_id = self.page_state.auto_reload.beginCycle() orelse {
+            const cycle_id = self.page_state.auto_reload.beginCycle(self.reload_policy.enabled()) orelse {
                 self.redraw.requestSkip();
                 return;
             };

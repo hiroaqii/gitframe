@@ -11,7 +11,6 @@ const authority = @import("../diff_surface/authority.zig");
 pub const repository_read_authority = @import("changes/repository_read_authority.zig");
 pub const file_search = @import("../diff_surface/file_search.zig");
 const content_selection = @import("../diff_surface/selection.zig");
-const config = @import("../../config.zig");
 const context = @import("../../context.zig");
 const diff_render = @import("../../diff/render.zig");
 const diff_search = @import("../../diff/search.zig");
@@ -233,14 +232,6 @@ pub const ChangesPageState = struct {
     selection_generation: u64 = 0,
     /// Non-zero semantic generation of the selected body's source-row map.
     selection_layout_revision: u64 = 1,
-
-    pub fn init(
-        self: *ChangesPageState,
-        cli: diff_source.AutoReloadOverride,
-        user: config.ReloadConfig,
-    ) void {
-        self.auto_reload = .init(cli, user);
-    }
 
     pub fn advanceSelectionLayoutRevision(self: *ChangesPageState) void {
         self.selection_layout_revision +%= 1;
@@ -480,12 +471,10 @@ test "selection layout revision is non-zero and skips zero on wrap" {
     try std.testing.expectEqual(@as(u64, 2), state.selection_layout_revision);
 }
 
-test "ChangesPageState initializes reload policy and owns lifecycle cleanup" {
+test "ChangesPageState owns lifecycle cleanup" {
     const allocator = std.testing.allocator;
     var state: ChangesPageState = .{};
     errdefer state.deinit(allocator);
-    state.init(.inherit, .{});
-    try std.testing.expect(state.auto_reload.enabled());
     try std.testing.expect(state.repository_read_authority.mayStartRepositoryRead());
 
     state.deferred_source_apply = .{

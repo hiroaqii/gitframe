@@ -242,7 +242,7 @@ test "timer spinner queued tick cannot animate a replacement action" {
 
 test "timer auto reload failure disables activation and preserves saved preference" {
     var app: App = .{ .allocator = std.testing.allocator };
-    app.pages.changes.auto_reload = auto_reload.State.init(.enabled, app.user_config.reload);
+    app.reload_policy = auto_reload.Policy.init(.enabled, app.user_config.reload);
     const saved = app.user_config.reload;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .concurrent_limit = .limited(0) });
     defer threaded.deinit();
@@ -252,10 +252,10 @@ test "timer auto reload failure disables activation and preserves saved preferen
     var driver: chasen.testing.TimerDriver(App.Msg) = undefined;
     try driver.init(&tc);
     defer driver.deinit();
-    try tc.ctx.timer().every(auto_reload.timer_id, app.pages.changes.auto_reload.interval_ns, .auto_reload, auto_reload.timerNotice);
+    try tc.ctx.timer().every(auto_reload.timer_id, app.reload_policy.interval_ns, .auto_reload, auto_reload.timerNotice);
     try driver.drain();
     try app.update((try driver.nextMessage()).?, &tc.ctx);
-    try std.testing.expect(!app.pages.changes.auto_reload.enabled());
+    try std.testing.expect(!app.reload_policy.enabled());
     try std.testing.expectEqual(saved, app.user_config.reload);
     try std.testing.expectEqualStrings("Automatic reload unavailable; use manual reload", app.status.text());
     try app.update(.auto_reload_tick, &tc.ctx);

@@ -2500,7 +2500,6 @@ test "footer falls back to pending kind when status is empty" {
 
 test "footer keeps action hints without terminal size or automatic reload labels" {
     var app: ShellViewTestHarness = .{ .terminal_size = .{ .width = 120, .height = 32 } };
-    app.changes.auto_reload = .{ .activation = .automatic, .interval_ns = 3 * std.time.ns_per_s };
 
     var ts: chasen.testing.TestSurface = undefined;
     try ts.init(120, 1);

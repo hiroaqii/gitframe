@@ -22,6 +22,35 @@ pub const Activation = enum {
     forced,
 };
 
+/// App-owned scheduling policy; page data and in-flight reads stay page-owned.
+pub const Policy = struct {
+    activation: Activation = .disabled,
+    interval_ns: u64 = 0,
+
+    pub fn init(cli: diff_source.AutoReloadOverride, user: config.ReloadConfig) Policy {
+        return .{
+            .activation = switch (cli) {
+                .enabled => .forced,
+                .disabled => .disabled,
+                .inherit => if (user.auto) .automatic else .disabled,
+            },
+            .interval_ns = @as(u64, user.interval_seconds) * std.time.ns_per_s,
+        };
+    }
+
+    pub fn enabled(self: Policy) bool {
+        return self.activation != .disabled;
+    }
+
+    pub fn mayStart(self: Policy, active: bool, blocked: bool) bool {
+        return self.enabled() and active and !blocked;
+    }
+
+    pub fn timerFailed(self: *Policy) void {
+        self.activation = .disabled;
+    }
+};
+
 pub const SourceFreshness = enum {
     fresh,
     stale_background_failure,
@@ -201,35 +230,13 @@ pub const AuxiliaryTracker = struct {
 };
 
 pub const State = struct {
-    activation: Activation = .disabled,
-    interval_ns: u64 = 0,
     accepted_source: ?AcceptedSource = null,
     background_cycle: ?BackgroundCycle = null,
     next_cycle_id: u64 = 0,
     last_failure: ?FailureIdentity = null,
 
-    pub fn init(cli: diff_source.AutoReloadOverride, user: config.ReloadConfig) State {
-        const activation: Activation = switch (cli) {
-            .enabled => .forced,
-            .disabled => .disabled,
-            .inherit => if (user.auto) .automatic else .disabled,
-        };
-        return .{
-            .activation = activation,
-            .interval_ns = @as(u64, user.interval_seconds) * std.time.ns_per_s,
-        };
-    }
-
-    pub fn enabled(self: State) bool {
-        return self.activation != .disabled;
-    }
-
-    pub fn timerFailed(self: *State) void {
-        self.activation = .disabled;
-    }
-
-    pub fn beginCycle(self: *State) ?u64 {
-        if (!self.enabled() or self.background_cycle != null) return null;
+    pub fn beginCycle(self: *State, enabled: bool) ?u64 {
+        if (!enabled or self.background_cycle != null) return null;
         self.next_cycle_id +%= 1;
         // Cycle id 0 is the no-cycle sentinel on owned terminals
         // (`cycle_id != 0` gates); a wrapped id must skip it or member
@@ -338,54 +345,54 @@ pub const State = struct {
 };
 
 test "policy resolution honors cli config" {
-    const defaults = State.init(.inherit, .{});
+    const defaults = Policy.init(.inherit, .{});
     try std.testing.expectEqual(Activation.automatic, defaults.activation);
     try std.testing.expectEqual(@as(u64, 3 * std.time.ns_per_s), defaults.interval_ns);
-    try std.testing.expectEqual(Activation.disabled, State.init(.inherit, .{ .auto = false }).activation);
-    try std.testing.expectEqual(Activation.forced, State.init(.enabled, .{ .auto = false }).activation);
-    try std.testing.expectEqual(Activation.disabled, State.init(.disabled, .{}).activation);
-    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), State.init(.inherit, .{ .interval_seconds = 1 }).interval_ns);
+    try std.testing.expectEqual(Activation.disabled, Policy.init(.inherit, .{ .auto = false }).activation);
+    try std.testing.expectEqual(Activation.forced, Policy.init(.enabled, .{ .auto = false }).activation);
+    try std.testing.expectEqual(Activation.disabled, Policy.init(.disabled, .{}).activation);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), Policy.init(.inherit, .{ .interval_seconds = 1 }).interval_ns);
 }
 
 test "background cycle id survives counter wrap without hitting the zero sentinel" {
-    var state = State.init(.inherit, .{});
+    var state: State = .{};
     state.next_cycle_id = std.math.maxInt(u64);
-    const id = state.beginCycle() orelse return error.ExpectedBackgroundCycle;
+    const id = state.beginCycle(true) orelse return error.ExpectedBackgroundCycle;
     try std.testing.expect(id != 0);
     try std.testing.expectEqual(@as(u64, 1), id);
     try std.testing.expectEqual(@as(u64, 1), state.background_cycle.?.id);
 }
 
 test "background cycle remains busy until every member finishes" {
-    var state = State.init(.inherit, .{});
-    const id = state.beginCycle().?;
+    var state: State = .{};
+    const id = state.beginCycle(true).?;
     try std.testing.expect(state.markMemberStarted(id, .source));
     try std.testing.expect(state.markMemberStarted(id, .status));
     try std.testing.expect(state.markMemberStarted(id, .branch));
     state.finishMember(id, .source);
     try std.testing.expect(state.background_cycle != null);
-    try std.testing.expect(state.beginCycle() == null);
+    try std.testing.expect(state.beginCycle(true) == null);
     state.finishMember(id, .status);
     try std.testing.expect(state.background_cycle != null);
-    try std.testing.expect(state.beginCycle() == null);
+    try std.testing.expect(state.beginCycle(true) == null);
     state.finishMember(id, .branch);
     try std.testing.expect(state.background_cycle == null);
 }
 
 test "deferred source apply keeps its background cycle busy" {
-    var state = State.init(.inherit, .{});
-    const id = state.beginCycle().?;
+    var state: State = .{};
+    const id = state.beginCycle(true).?;
     try std.testing.expect(state.markMemberStarted(id, .source));
     try std.testing.expect(state.moveMember(id, .source, .deferred_source_apply));
     try std.testing.expect(state.background_cycle.?.pending.deferred_source_apply);
-    try std.testing.expect(state.beginCycle() == null);
+    try std.testing.expect(state.beginCycle(true) == null);
     state.finishMember(id, .deferred_source_apply);
     try std.testing.expect(state.background_cycle == null);
 }
 
 test "mutation supersession is sticky until every cycle member drains" {
-    var state = State.init(.inherit, .{});
-    const id = state.beginCycle().?;
+    var state: State = .{};
+    const id = state.beginCycle(true).?;
     try std.testing.expect(state.markMemberStarted(id, .source));
     try std.testing.expect(state.markMemberStarted(id, .status));
     try std.testing.expect(state.markMemberStarted(id, .branch));
@@ -395,7 +402,7 @@ test "mutation supersession is sticky until every cycle member drains" {
     try std.testing.expectEqual(CycleAcceptance.superseded_by_mutation, state.background_cycle.?.acceptance);
     try std.testing.expect(!state.acceptsCycle(id));
     try std.testing.expect(state.acceptsCycle(null));
-    try std.testing.expect(state.beginCycle() == null);
+    try std.testing.expect(state.beginCycle(true) == null);
 
     state.finishMember(id, .source);
     try std.testing.expect(state.background_cycle != null);
@@ -404,7 +411,7 @@ test "mutation supersession is sticky until every cycle member drains" {
     state.finishMember(id, .status);
     try std.testing.expect(state.background_cycle == null);
 
-    const next = state.beginCycle().?;
+    const next = state.beginCycle(true).?;
     try std.testing.expect(next != id);
     try std.testing.expect(state.acceptsCycle(next));
     try std.testing.expect(state.markMemberStarted(next, .source));
@@ -416,8 +423,8 @@ test "mutation supersession is sticky until every cycle member drains" {
 }
 
 test "superseded cycle rejects late starts but permits ownership moves and drain" {
-    var state = State.init(.inherit, .{});
-    const id = state.beginCycle().?;
+    var state: State = .{};
+    const id = state.beginCycle(true).?;
     try std.testing.expect(state.markMemberStarted(id, .source));
     try std.testing.expect(state.markMemberStarted(id, .status));
     state.supersedeActiveCycleByMutation();
@@ -435,8 +442,8 @@ test "superseded cycle rejects late starts but permits ownership moves and drain
 }
 
 test "superseded cycle rejects ownership creation and merging while preserving drain" {
-    var state = State.init(.inherit, .{});
-    const missing_source_id = state.beginCycle().?;
+    var state: State = .{};
+    const missing_source_id = state.beginCycle(true).?;
     try std.testing.expect(state.markMemberStarted(missing_source_id, .status));
     state.supersedeActiveCycleByMutation();
 
@@ -446,7 +453,7 @@ test "superseded cycle rejects ownership creation and merging while preserving d
     state.finishMember(missing_source_id, .status);
     try std.testing.expect(state.background_cycle == null);
 
-    const occupied_target_id = state.beginCycle().?;
+    const occupied_target_id = state.beginCycle(true).?;
     try std.testing.expect(state.markMemberStarted(occupied_target_id, .source));
     try std.testing.expect(state.markMemberStarted(occupied_target_id, .status));
     state.supersedeActiveCycleByMutation();
@@ -459,23 +466,23 @@ test "superseded cycle rejects ownership creation and merging while preserving d
     state.finishMember(occupied_target_id, .status);
     try std.testing.expect(state.background_cycle == null);
 
-    try std.testing.expect(state.beginCycle() != null);
+    try std.testing.expect(state.beginCycle(true) != null);
 }
 
 test "empty mutation cycle and repository supersession release immediately" {
-    var state = State.init(.inherit, .{});
-    _ = state.beginCycle().?;
+    var state: State = .{};
+    _ = state.beginCycle(true).?;
     state.supersedeActiveCycleByMutation();
     try std.testing.expect(state.background_cycle == null);
 
-    const id = state.beginCycle().?;
+    const id = state.beginCycle(true).?;
     try std.testing.expect(state.markMemberStarted(id, .source));
     state.supersedeCycle();
     try std.testing.expect(state.background_cycle == null);
 }
 
 test "accepted source failure is deduplicated and unchanged success restores freshness" {
-    var state = State.init(.inherit, .{});
+    var state: State = .{};
     const fingerprint = content_fingerprint.Fingerprint.init("diff");
     state.acceptSource(fingerprint);
     try std.testing.expect(state.sourceIsFresh());
@@ -487,7 +494,7 @@ test "accepted source failure is deduplicated and unchanged success restores fre
 }
 
 test "missing accepted source fails closed for diff-derived actions" {
-    var state = State.init(.inherit, .{});
+    var state: State = .{};
     try std.testing.expect(!state.sourceIsActionable());
     state.acceptSource(content_fingerprint.Fingerprint.init(""));
     try std.testing.expect(state.sourceIsActionable());
@@ -496,7 +503,7 @@ test "missing accepted source fails closed for diff-derived actions" {
 }
 
 test "replacement invalidation preserves failure identity but fails closed" {
-    var state = State.init(.inherit, .{});
+    var state: State = .{};
     state.acceptSource(content_fingerprint.Fingerprint.init("old"));
     try std.testing.expect(state.markSourceFailure("transient"));
     const failure = state.last_failure.?;

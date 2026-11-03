@@ -5399,14 +5399,14 @@ test "repository read completion admission requires current open epoch and cycle
     var page: changes_page.ChangesPageState = .{};
     defer page.deinit(std.testing.allocator);
     page.repository_read_authority.epoch = .{ .value = 11 };
-    page.auto_reload = .init(.inherit, .{});
+    page.auto_reload = .{};
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
     try std.testing.expect(controller.acceptsRepositoryReadCompletion(.{ .value = 11 }, null));
     try std.testing.expect(!controller.acceptsRepositoryReadCompletion(.{ .value = 10 }, null));
 
-    const cycle_id = page.auto_reload.beginCycle().?;
+    const cycle_id = page.auto_reload.beginCycle(true).?;
     try std.testing.expect(page.auto_reload.markMemberStarted(cycle_id, .source));
     try std.testing.expect(controller.acceptsRepositoryReadCompletion(.{ .value = 11 }, cycle_id));
     page.auto_reload.supersedeActiveCycleByMutation();
@@ -5475,14 +5475,14 @@ test "mutation read fence closes one exact owner and preserves read drain owners
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer page.deinit(allocator);
-    page.auto_reload = .init(.inherit, .{});
+    page.auto_reload = .{};
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
     const identity = page.activation.currentIdentity().?;
     const root_identity: root_capability.Identity = .{ .device = 11, .inode = 17 };
     const old_epoch = page.repository_read_authority.epoch;
 
-    const cycle_id = page.auto_reload.beginCycle().?;
+    const cycle_id = page.auto_reload.beginCycle(true).?;
     var source_update = try controller.prepareSourceLoad(allocator, "/repo", .{
         .clear_visible_state = false,
         .kind = .watch,
@@ -5709,11 +5709,11 @@ test "mutation read fence retains deferred source until production apply drains 
         .viewer = .{ .selected_target = .{ .diff_file = 0 } },
     };
     defer page.deinit(allocator);
-    page.auto_reload = .init(.inherit, .{});
+    page.auto_reload = .{};
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
     const old_epoch = page.repository_read_authority.epoch;
-    const cycle_id = page.auto_reload.beginCycle().?;
+    const cycle_id = page.auto_reload.beginCycle(true).?;
 
     var update = try controller.prepareSourceLoad(allocator, "/repo", .{
         .clear_visible_state = false,
@@ -6077,8 +6077,8 @@ test "superseded repository read status terminal drains without publication" {
     defer page.deinit(allocator);
     var initial = try git_status.StatusBundle.parseOwned(allocator, "M  retained.zig\x00");
     try page.git_status.replace("/repo", &initial);
-    page.auto_reload = .init(.inherit, .{});
-    const cycle_id = page.auto_reload.beginCycle().?;
+    page.auto_reload = .{};
+    const cycle_id = page.auto_reload.beginCycle(true).?;
     var status_message = @import("../../state.zig").StatusMessage{};
     const controller = testController(&page, &status_message, .unstaged);
 
@@ -10606,8 +10606,8 @@ test "deferred source terminals consume blocked and accepted ownership" {
 
     var blocked_page: changes_page.ChangesPageState = .{};
     defer blocked_page.deinit(allocator);
-    blocked_page.auto_reload = .init(.inherit, .{});
-    const blocked_cycle = blocked_page.auto_reload.beginCycle().?;
+    blocked_page.auto_reload = .{};
+    const blocked_cycle = blocked_page.auto_reload.beginCycle(true).?;
     try std.testing.expect(blocked_page.auto_reload.markMemberStarted(blocked_cycle, .source));
     try std.testing.expect(blocked_page.auto_reload.moveMember(blocked_cycle, .source, .deferred_source_apply));
     blocked_page.load.generation = 1;
@@ -10632,8 +10632,8 @@ test "deferred source terminals consume blocked and accepted ownership" {
 
     var accepted_page: changes_page.ChangesPageState = .{};
     defer accepted_page.deinit(allocator);
-    accepted_page.auto_reload = .init(.inherit, .{});
-    const accepted_cycle = accepted_page.auto_reload.beginCycle().?;
+    accepted_page.auto_reload = .{};
+    const accepted_cycle = accepted_page.auto_reload.beginCycle(true).?;
     try std.testing.expect(accepted_page.auto_reload.markMemberStarted(accepted_cycle, .source));
     try std.testing.expect(accepted_page.auto_reload.moveMember(accepted_cycle, .source, .deferred_source_apply));
     accepted_page.load.generation = 2;
@@ -10657,7 +10657,7 @@ test "deferred source terminals consume blocked and accepted ownership" {
     try std.testing.expect(accepted_page.pending_reload == null);
     try std.testing.expect(accepted_page.auto_reload.background_cycle == null);
 
-    const failure_cycle = accepted_page.auto_reload.beginCycle().?;
+    const failure_cycle = accepted_page.auto_reload.beginCycle(true).?;
     try std.testing.expect(accepted_page.auto_reload.markMemberStarted(failure_cycle, .source));
     try std.testing.expect(accepted_page.auto_reload.moveMember(failure_cycle, .source, .deferred_source_apply));
     accepted_page.load.generation = 3;
@@ -10689,8 +10689,8 @@ test "superseded deferred source retires exact ownership without publication" {
         .loaded => |*session| session.loaded.text.ptr,
         else => unreachable,
     };
-    page.auto_reload = .init(.inherit, .{});
-    const cycle_id = page.auto_reload.beginCycle().?;
+    page.auto_reload = .{};
+    const cycle_id = page.auto_reload.beginCycle(true).?;
     try std.testing.expect(page.auto_reload.markMemberStarted(cycle_id, .source));
     try std.testing.expect(page.auto_reload.moveMember(cycle_id, .source, .deferred_source_apply));
     page.load.generation = 7;

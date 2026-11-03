@@ -135,6 +135,7 @@ pub const App = struct {
     overlay: app_state.OverlayState = .{},
     shell_effects_state: shell_effects.State = .{},
     drag_auto_scroll: drag_auto_scroll.State = .{},
+    reload_policy: auto_reload.Policy = .{},
     command_session: CommandSession = .inactive,
     screen_transition: screen_transition.State = .idle,
 
@@ -148,11 +149,11 @@ pub const App = struct {
     pub fn init(self: *App, ctx: *chasen.Ctx(Msg)) !void {
         self.allocator = ctx.allocator();
         self.local_workflow = workflow_local.LocalState.init(ctx.allocator());
-        self.pages.changes.init(self.config.auto_reload, self.user_config.reload);
+        self.reload_policy = .init(self.config.auto_reload, self.user_config.reload);
         _ = self.pageCoordinator().activateChanges();
         if (self.config.transitions) self.screen_transition.arm(self.transitionIdentity().?);
-        if (self.pages.changes.auto_reload.enabled()) {
-            ctx.timer().every(auto_reload.timer_id, self.pages.changes.auto_reload.interval_ns, .auto_reload, auto_reload.timerNotice) catch {
+        if (self.reload_policy.enabled()) {
+            ctx.timer().every(auto_reload.timer_id, self.reload_policy.interval_ns, .auto_reload, auto_reload.timerNotice) catch {
                 self.autoReloadTimerFailed();
             };
         }
@@ -164,7 +165,7 @@ pub const App = struct {
     }
 
     fn autoReloadTimerFailed(self: *App) void {
-        self.pages.changes.auto_reload.timerFailed();
+        self.reload_policy.timerFailed();
         self.status.set("Automatic reload unavailable; use manual reload", .{});
     }
 
@@ -501,6 +502,7 @@ pub const App = struct {
         const body_size = self.shellLayout().bodySize();
         return .{
             .page_state = &self.pages.changes,
+            .reload_policy = &self.reload_policy,
             .fence = self.changesActionFence().view(),
             .active_page = self.active_page,
             .repo = self.repoSessionView(),
@@ -797,7 +799,10 @@ pub const App = struct {
                 .history => self.historyCoordinator().refresh(self.allocator orelse ctx.allocator()),
                 .compare => try self.compareCoordinator().refresh(ctx),
             },
-            .auto_reload_tick => try self.changesRead().autoReloadTick(ctx),
+            .auto_reload_tick => switch (self.active_page) {
+                .changes => try self.changesRead().autoReloadTick(ctx),
+                .repository, .history, .compare => self.redraw_plan.requestSkip(),
+            },
             .auto_reload_timer_failed => self.autoReloadTimerFailed(),
             .focus_lost => {
                 self.drag_auto_scroll.clear();

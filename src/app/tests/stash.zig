@@ -133,7 +133,7 @@ test "stash confirmation survives auto reload, revalidates targets and refreshes
     app.pages.changes.branch_status.status.head = original_head;
     app.pages.changes.branch_status.status.oid = "advanced on the same branch";
     app.pages.changes.load.state = .{ .empty = .no_changes };
-    app.pages.changes.auto_reload = .{ .activation = .forced, .interval_ns = 3 * std.time.ns_per_s };
+    app.reload_policy = .{ .activation = .forced, .interval_ns = 3 * std.time.ns_per_s };
     try app.update(.{ .stash = .tab }, &ctx.ctx);
     try app.update(.{ .stash = .{ .paste = "kept through reload" } }, &ctx.ctx);
     try app.update(.auto_reload_tick, &ctx.ctx);

@@ -124,6 +124,7 @@ const ReadHarness = struct {
     repo_session: repo_session.State = .{},
     pages: ReadPages = .{},
     config: ReadConfig = .{},
+    reload_policy: app_auto_reload.Policy = .{},
     allocator: ?std.mem.Allocator = std.testing.allocator,
     env_map: ?*std.process.Environ.Map = null,
     terminal_size: chasen.Size = .{ .width = 0, .height = 0 },
@@ -207,6 +208,7 @@ const ReadHarness = struct {
     fn changesRead(self: *ReadHarness) changes_read.Controller {
         return .{
             .page_state = &self.pages.changes,
+            .reload_policy = &self.reload_policy,
             .fence = self.changesActionFence().view(),
             .active_page = self.active_page,
             .repo = self.repoSessionView(),
@@ -558,6 +560,7 @@ fn canonicalPublicationTestApp(
     repo_root: []const u8,
 ) !ReadHarness {
     var app: ReadHarness = .{
+        .reload_policy = .init(.enabled, .{}),
         .allocator = allocator,
         .active_page = .changes,
         .config = .{ .source = .unstaged },
@@ -566,7 +569,6 @@ fn canonicalPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -612,6 +614,7 @@ fn canonicalPublicationPrimaryTestApp(
     repo_root: []const u8,
 ) !ReadHarness {
     var app: ReadHarness = .{
+        .reload_policy = .init(.enabled, .{}),
         .allocator = allocator,
         .active_page = .changes,
         .config = .{ .source = .unstaged },
@@ -619,7 +622,6 @@ fn canonicalPublicationPrimaryTestApp(
             .repo_state = .{ .discovery = try testSingleRepoDiscovery(allocator, repo_root) },
         },
         .pages = .{ .changes = .{
-            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -675,6 +677,7 @@ fn ordinaryPrimaryPublicationTestApp(
     repo_root: []const u8,
 ) !ReadHarness {
     var app: ReadHarness = .{
+        .reload_policy = .init(.enabled, .{}),
         .allocator = allocator,
         .active_page = .changes,
         .config = .{ .source = .unstaged },
@@ -683,7 +686,6 @@ fn ordinaryPrimaryPublicationTestApp(
         },
         .pages = .{ .changes = .{
             .load = app_test_support.loadState(app_test_support.loadedDiffOne()),
-            .auto_reload = .init(.enabled, .{}),
             .viewer = .{
                 .selected_target = .{ .diff_file = 0 },
                 .selected_node = 0,
@@ -2567,8 +2569,9 @@ test "Changes page header identical branch recovery redraws fresh terminal" {
     try app.pages.changes.branch_status.replace("/repo", &current);
     const root_ptr = app.pages.changes.branch_status.repo_root.?.ptr;
 
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .branch));
     const generation = app.pages.changes.branch_status_load.prepare(true);
     app.pages.changes.branch_status_load.begin(cycle_id, .{});
@@ -4344,8 +4347,9 @@ test "fresh empty status consumes pending display restore at raw terminal" {
         .request = displayed_request,
         .value = .{ .combined_hunks = try testCombinedHunkBundle(std.testing.allocator) },
     } };
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expectEqual(@as(u64, 1), cycle_id);
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .status));
 
@@ -5170,8 +5174,9 @@ test "background status failure retains display snapshot and marks action freshn
     var current = try git_status.StatusBundle.parseOwned(std.testing.allocator, " M src/a.zig\x00");
     try app.pages.changes.git_status.replace("/repo", &current);
 
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .status));
     const generation = app.pages.changes.status_load.prepare(true);
     app.pages.changes.status_load.begin(cycle_id, .{});
@@ -5224,7 +5229,8 @@ test "finishDiffLoad frees stale loaded bundle" {
 
 test "auto reload tick skips while auxiliary cycle members or mouse selection are pending" {
     var app: ReadHarness = .{};
-    app.pages.changes.auto_reload = .init(.inherit, .{});
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
     app.pages.changes.status_load.pending = .{ .generation = 1, .origin = .background, .background_cycle_id = 1 };
     var status_ctx: chasen.testing.TestCtx(ReadHarness.Msg) = undefined;
     status_ctx.init(std.testing.allocator, std.testing.io);
@@ -5856,8 +5862,9 @@ test "changed watch result arriving during mouse selection defers apply until re
     defer app.changesReload().clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.testing.TestCtx(ReadHarness.Msg) = undefined;
@@ -5909,8 +5916,9 @@ test "deferred changed watch captures navigation when selection ends" {
     defer app.changesReload().clearLoadedDiff(app.allocator);
     app.pages.changes.load.generation = 2;
     app.pages.changes.load.pending = .{ .diff_load = 2 };
-    app.pages.changes.auto_reload = .init(.inherit, .{});
-    const cycle_id = app.pages.changes.auto_reload.beginCycle().?;
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
+    const cycle_id = app.pages.changes.auto_reload.beginCycle(app.reload_policy.enabled()).?;
     try std.testing.expect(app.pages.changes.auto_reload.markMemberStarted(cycle_id, .source));
     const bundle = try app_load.buildLoadedBundle(std.testing.allocator, app_test_support.diff_one);
     var ctx: chasen.testing.TestCtx(ReadHarness.Msg) = undefined;

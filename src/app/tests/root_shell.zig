@@ -2186,7 +2186,8 @@ test "focus loss terminates selection without a deferred result" {
         .config = .{ .source = .{ .patch_file = "change.patch" } },
     };
     _ = activateChanges(&app);
-    app.pages.changes.auto_reload = .init(.inherit, .{});
+    app.pages.changes.auto_reload = .{};
+    app.reload_policy = .init(.inherit, .{});
     var ctx: chasen.testing.TestCtx(App.Msg) = undefined;
     ctx.init(std.testing.allocator, std.testing.io);
     defer ctx.deinit();

@@ -115,6 +115,7 @@ const LocalHarness = struct {
     repo_session: repo_session.State = .{},
     pages: LocalPages = .{},
     config: LocalConfig = .{},
+    reload_policy: app_auto_reload.Policy = .{},
     allocator: ?std.mem.Allocator = std.testing.allocator,
     terminal_size: chasen.Size = .{ .width = 100, .height = 20 },
     redraw_plan: RedrawPlan = .{},
@@ -217,6 +218,7 @@ const LocalHarness = struct {
     fn changesRead(self: *LocalHarness) changes_read.Controller {
         return .{
             .page_state = &self.pages.changes,
+            .reload_policy = &self.reload_policy,
             .fence = self.changesActionFence().view(),
             .active_page = self.active_page,
             .repo = self.repoSessionView(),
