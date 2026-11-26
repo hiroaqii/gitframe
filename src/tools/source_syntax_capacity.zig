@@ -74,9 +74,9 @@ fn printReport(path: []const u8, report: source_adapter.CapacityReport) void {
         source_spans.max_retained_bytes,
         @tagName(report.production_decision),
     });
-    inline for (@typeInfo(token.TokenRole).@"enum".fields, 0..) |field, index| {
+    inline for (@typeInfo(token.TokenRole).@"enum".field_names, 0..) |field_name, index| {
         std.debug.print("    {s}: {d} / {d}\n", .{
-            field.name,
+            field_name,
             report.raw_roles[index],
             report.retained_roles[index],
         });

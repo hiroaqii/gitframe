@@ -37,8 +37,8 @@ fn refAllDecls(comptime namespace: type) void {
     // Keep this shallow on purpose: recursive decl walking expands through
     // mutually-referential core types and hits comptime branch limits. The
     // exported check function below covers the important runtime paths.
-    for (@typeInfo(namespace).@"struct".decls) |decl| {
-        _ = @field(namespace, decl.name);
+    for (@typeInfo(namespace).@"struct".decl_names) |decl_name| {
+        _ = @field(namespace, decl_name);
     }
 }
 

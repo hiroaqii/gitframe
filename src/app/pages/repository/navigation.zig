@@ -274,7 +274,7 @@ fn sourceDocumentWithRowsForTest(allocator: std.mem.Allocator, rows: usize) !sou
 
 test "repository wrap navigation reaches tall line tail and reveals same-line occurrences" {
     const allocator = std.testing.allocator;
-    const line = "x" ** 40 ++ "needle" ++ "y" ** 40 ++ "needleEND";
+    const line = @as([40]u8, @splat('x')) ++ "needle" ++ @as([40]u8, @splat('y')) ++ "needleEND";
     const bytes = try allocator.dupe(u8, line ++ "\nnext\n");
     var document = try source.Document.initOwnedOrFree(allocator, bytes, .init(bytes));
     defer document.deinit(allocator);
@@ -483,7 +483,7 @@ test "repository source line jump centers real rows and preserves horizontal scr
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(
         u8,
-        "0123456789abcdef\n" ** 20,
+        std.mem.asBytes(&@as([20]["0123456789abcdef\n".len]u8, @splat("0123456789abcdef\n".*))),
     );
     var document = try source.Document.initOwnedOrFree(allocator, bytes, .init(bytes));
     defer document.deinit(allocator);
@@ -618,7 +618,7 @@ pub fn refreshFileSearch(
         const rank = fileSearchRank(node.path, query) orelse continue;
         var position = state.len;
         // Keep manifest order for equal ranks, including an empty query.
-        while (position > 0 and @intFromEnum(rank) < @intFromEnum(ranks[position - 1])) : (position -= 1) {}
+        while (position > 0 and @backingInt(rank) < @backingInt(ranks[position - 1])) : (position -= 1) {}
         if (state.len == model.max_file_search_matches) {
             state.truncated = true;
             if (query.len == 0) break;

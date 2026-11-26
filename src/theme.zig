@@ -45,7 +45,7 @@ pub const Role = enum {
     diff_selection_bg,
 };
 
-pub const role_count = @typeInfo(Role).@"enum".fields.len;
+pub const role_count = @typeInfo(Role).@"enum".field_names.len;
 
 pub const ColorValue = union(enum) {
     named: NamedColor,
@@ -159,8 +159,8 @@ pub const Palette = struct {
 
     pub fn fromConfig(config: anytype) Palette {
         var palette = Palette.default();
-        inline for (@typeInfo(Role).@"enum".fields) |field| {
-            const role: Role = @enumFromInt(field.value);
+        inline for (@typeInfo(Role).@"enum".field_names) |field_name| {
+            const role: Role = @field(Role, field_name);
             if (!isDerivedRole(role)) {
                 if (config.get(role)) |value| {
                     palette.set(role, value.toChasen());
@@ -169,8 +169,8 @@ pub const Palette = struct {
         }
         palette.deriveSyntaxRoles();
         palette.deriveDiffRoles();
-        inline for (@typeInfo(Role).@"enum".fields) |field| {
-            const role: Role = @enumFromInt(field.value);
+        inline for (@typeInfo(Role).@"enum".field_names) |field_name| {
+            const role: Role = @field(Role, field_name);
             if (isDerivedRole(role)) {
                 if (config.get(role)) |value| {
                     palette.set(role, value.toChasen());
@@ -248,8 +248,8 @@ fn isDerivedRole(role: Role) bool {
 }
 
 pub fn roleFromKey(key: []const u8) ?Role {
-    inline for (@typeInfo(Role).@"enum".fields) |field| {
-        if (std.mem.eql(u8, key, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Role).@"enum".field_names) |field_name| {
+        if (std.mem.eql(u8, key, field_name)) return @field(Role, field_name);
     }
     return null;
 }
@@ -281,8 +281,8 @@ fn parseIndexColor(value: []const u8) ?ColorValue {
 }
 
 fn namedColorFromString(value: []const u8) ?NamedColor {
-    inline for (@typeInfo(NamedColor).@"enum".fields) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(NamedColor).@"enum".field_names) |field_name| {
+        if (std.mem.eql(u8, value, field_name)) return @field(NamedColor, field_name);
     }
     if (std.mem.eql(u8, value, "bright-red")) return .bright_red;
     if (std.mem.eql(u8, value, "bright-green")) return .bright_green;
@@ -295,7 +295,7 @@ fn namedColorFromString(value: []const u8) ?NamedColor {
 }
 
 fn roleIndex(role: Role) usize {
-    return @intFromEnum(role);
+    return @backingInt(role);
 }
 
 test "parseColorValue accepts named, hex, and indexed values" {

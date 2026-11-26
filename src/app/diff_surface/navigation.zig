@@ -1436,7 +1436,7 @@ pub const BodyView = struct {
     pub fn selectionViewportBasis(self: BodyView) selection_action.ViewportBasis {
         return .{
             .layout_revision = self.view.surface.selection_layout_revision.*,
-            .mapping_variant = @intFromEnum(self.view.effectiveDisplayMode()),
+            .mapping_variant = @backingInt(self.view.effectiveDisplayMode()),
             .source_rows = self.sourceDiffLineCount(),
             .presentation_rows = self.presentationDiffLineCount(),
         };

@@ -56,7 +56,7 @@ test "token roles map only colored syntax to dedicated theme roles" {
 
 test "syntax style replaces only foreground from dedicated role" {
     var palette: theme.Palette = .default();
-    palette.colors[@intFromEnum(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
+    palette.colors[@backingInt(theme.Role.syntax_keyword)] = .{ .rgb = .{ 1, 2, 3 } };
     const base: chasen.TextStyle = .{
         .bold = true,
         .italic = true,

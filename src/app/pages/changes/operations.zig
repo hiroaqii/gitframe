@@ -961,7 +961,7 @@ test "Changes raw hunk bytes reach and leave the Git index without collateral ch
         wrap: bool = false,
     };
     const cases = [_]Case{
-        .{ .old = "old" ** 180 ++ "\n", .new = "new\n", .wrap = true },
+        .{ .old = std.mem.asBytes(&@as([180]["old".len]u8, @splat("old".*))).* ++ "\n", .new = "new\n", .wrap = true },
         .{ .old = "old\r\n", .new = "new\r\n" },
         .{ .old = "same\r\nold\n", .new = "same\r\nnew\r\n" },
         .{ .old = "old", .new = "new" },

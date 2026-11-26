@@ -1295,9 +1295,9 @@ test "repository path history parsers reject ambiguous state and malformed times
     try std.testing.expect(parseHistoryRecord(oid ++ "\x0042\x00extra") == null);
     try std.testing.expect(parseHistoryRecord("bad\x0042") == null);
 
-    const fields = @typeInfo(RepositoryPathHistoryKnown).@"struct".fields;
+    const fields = @typeInfo(RepositoryPathHistoryKnown).@"struct".field_types;
     try std.testing.expectEqual(@as(usize, 2), fields.len);
-    try std.testing.expect(fields[0].type == HeadBasis);
+    try std.testing.expect(fields[0] == HeadBasis);
 }
 
 test "repository path history accepts recent shallow commit and rejects shallow boundary" {

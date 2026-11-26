@@ -45,7 +45,7 @@ pub const PublicAction = enum {
     copy_current_hunk,
 };
 
-pub const action_count = @typeInfo(PublicAction).@"enum".fields.len;
+pub const action_count = @typeInfo(PublicAction).@"enum".field_names.len;
 
 pub const NamedKey = enum {
     enter,
@@ -105,14 +105,14 @@ pub const KeySpec = union(enum) {
 };
 
 pub const Config = struct {
-    overrides: [action_count]?KeySpec = [_]?KeySpec{null} ** action_count,
+    overrides: [action_count]?KeySpec = @splat(null),
 
     pub fn set(self: *Config, action: PublicAction, spec: KeySpec) void {
-        self.overrides[@intFromEnum(action)] = spec;
+        self.overrides[@backingInt(action)] = spec;
     }
 
     pub fn get(self: Config, action: PublicAction) ?KeySpec {
-        return self.overrides[@intFromEnum(action)];
+        return self.overrides[@backingInt(action)];
     }
 };
 
@@ -124,20 +124,20 @@ pub const Effective = struct {
 
     pub fn fromConfig(config: Config) Effective {
         var result: Effective = .{};
-        inline for (@typeInfo(PublicAction).@"enum".fields) |field| {
-            const action: PublicAction = @enumFromInt(field.value);
-            if (config.get(action)) |override_spec| result.bindings[@intFromEnum(action)] = override_spec;
+        inline for (@typeInfo(PublicAction).@"enum".field_names) |field_name| {
+            const action: PublicAction = @field(PublicAction, field_name);
+            if (config.get(action)) |override_spec| result.bindings[@backingInt(action)] = override_spec;
         }
         return result;
     }
 
     pub fn spec(self: Effective, action: PublicAction) ?KeySpec {
-        return self.bindings[@intFromEnum(action)];
+        return self.bindings[@backingInt(action)];
     }
 
     pub fn actionForKey(self: Effective, key: chasen.Key) ?PublicAction {
-        inline for (@typeInfo(PublicAction).@"enum".fields) |field| {
-            const action: PublicAction = @enumFromInt(field.value);
+        inline for (@typeInfo(PublicAction).@"enum".field_names) |field_name| {
+            const action: PublicAction = @field(PublicAction, field_name);
             if (self.spec(action)) |binding| {
                 if (binding.matches(key)) return action;
             }
@@ -152,8 +152,8 @@ pub const Effective = struct {
 };
 
 pub fn actionFromKey(key: []const u8) ?PublicAction {
-    inline for (@typeInfo(PublicAction).@"enum".fields) |field| {
-        if (std.mem.eql(u8, key, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(PublicAction).@"enum".field_names) |field_name| {
+        if (std.mem.eql(u8, key, field_name)) return @field(PublicAction, field_name);
     }
     return null;
 }
@@ -204,13 +204,13 @@ pub fn parseKeySpec(value: []const u8) ?KeySpec {
 pub fn validateConfig(config: Config) bool {
     const effective = Effective.fromConfig(config);
 
-    inline for (@typeInfo(PublicAction).@"enum".fields, 0..) |left_field, left_index| {
-        const left_action: PublicAction = @enumFromInt(left_field.value);
+    inline for (@typeInfo(PublicAction).@"enum".field_names, 0..) |left_name, left_index| {
+        const left_action: PublicAction = @field(PublicAction, left_name);
         if (effective.spec(left_action)) |left_spec| {
             if (isReserved(left_spec)) return false;
 
-            inline for (@typeInfo(PublicAction).@"enum".fields[(left_index + 1)..]) |right_field| {
-                const right_action: PublicAction = @enumFromInt(right_field.value);
+            inline for (@typeInfo(PublicAction).@"enum".field_names[(left_index + 1)..]) |right_name| {
+                const right_action: PublicAction = @field(PublicAction, right_name);
                 if (effective.spec(right_action)) |right_spec| {
                     if (left_spec.eql(right_spec) and !allowedDuplicate(left_action, right_action)) return false;
                 }
@@ -240,9 +240,9 @@ const default_specs = buildDefaultSpecs();
 
 fn buildDefaultSpecs() [action_count]?KeySpec {
     var specs: [action_count]?KeySpec = undefined;
-    inline for (@typeInfo(PublicAction).@"enum".fields) |field| {
-        const action: PublicAction = @enumFromInt(field.value);
-        specs[@intFromEnum(action)] = defaultSpec(action);
+    inline for (@typeInfo(PublicAction).@"enum".field_names) |field_name| {
+        const action: PublicAction = @field(PublicAction, field_name);
+        specs[@backingInt(action)] = defaultSpec(action);
     }
     return specs;
 }
@@ -327,8 +327,8 @@ fn isReserved(spec: KeySpec) bool {
 }
 
 fn namedFromText(value: []const u8) ?NamedKey {
-    inline for (@typeInfo(NamedKey).@"enum".fields) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(NamedKey).@"enum".field_names) |field_name| {
+        if (std.mem.eql(u8, value, field_name)) return @field(NamedKey, field_name);
     }
     if (std.mem.eql(u8, value, "escape")) return .esc;
     if (std.mem.eql(u8, value, "pgup")) return .page_up;

@@ -327,19 +327,21 @@ test {
     _ = update;
     _ = view;
 
-    const mutable_fields = std.meta.fields(DiffSurface);
-    const read_fields = std.meta.fields(ReadSurface);
-    try std.testing.expectEqual(mutable_fields.len, read_fields.len);
-    inline for (mutable_fields, read_fields) |mutable_field, read_field| {
-        try std.testing.expectEqualStrings(mutable_field.name, read_field.name);
-        if (@typeInfo(mutable_field.type) == .pointer) {
-            const mutable_pointer = @typeInfo(mutable_field.type).pointer;
-            const read_pointer = @typeInfo(read_field.type).pointer;
-            try std.testing.expect(!mutable_pointer.is_const);
-            try std.testing.expect(read_pointer.is_const);
+    const mutable_info = @typeInfo(DiffSurface).@"struct";
+    const read_info = @typeInfo(ReadSurface).@"struct";
+    try std.testing.expectEqual(mutable_info.field_names.len, read_info.field_names.len);
+    inline for (mutable_info.field_names, read_info.field_names, 0..) |mutable_name, read_name, index| {
+        try std.testing.expectEqualStrings(mutable_name, read_name);
+        const mutable_type = mutable_info.field_types[index];
+        const read_type = read_info.field_types[index];
+        if (@typeInfo(mutable_type) == .pointer) {
+            const mutable_pointer = @typeInfo(mutable_type).pointer;
+            const read_pointer = @typeInfo(read_type).pointer;
+            try std.testing.expect(!mutable_pointer.attrs.@"const");
+            try std.testing.expect(read_pointer.attrs.@"const");
             try std.testing.expect(mutable_pointer.child == read_pointer.child);
         } else {
-            try std.testing.expect(mutable_field.type == read_field.type);
+            try std.testing.expect(mutable_type == read_type);
         }
     }
 }

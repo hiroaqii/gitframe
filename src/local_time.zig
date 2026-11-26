@@ -4,9 +4,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("time.h");
-});
+const c = if (builtin.os.tag == .linux or builtin.os.tag == .macos) @import("native_c") else struct {};
 
 pub const maximum_display_unix_second: i64 = 253_402_300_799; // 9999-12-31 23:59:59Z
 

@@ -2,19 +2,19 @@
     .name = .gitframe,
     .version = "0.1.11",
     .fingerprint = 0x424bfbfaa0066315, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .chasen = .{
-            .url = "git+https://github.com/hiroaqii/chasen.git#741f85cfd9a4f08ecfaa544d781c8e1040c46a0d",
-            .hash = "chasen-0.1.4-lvlHSQM8CgB11Ql05hXQcP0HtDxYSBuLGIQ7NAYrNR0v",
+            .url = "git+https://github.com/hiroaqii/chasen.git#31e34e37377f6b8f4214973efd858889cbb167c8",
+            .hash = "chasen-0.1.5-lvlHSV0SDACerJuV-KL9pv0o9XTKMi-XQU6DqWVVSeKI",
         },
         .chasen_ui = .{
-            .url = "git+https://github.com/hiroaqii/chasen-ui.git#84a9dae83739e322e354cb4e82ba8e8341854a38",
-            .hash = "chasen_ui-0.1.4-ATsSa2hWCgC76tSFmUWpiBbP082Ecd5CWP-E83QJHaG2",
+            .url = "git+https://github.com/hiroaqii/chasen-ui.git#05c70aed43599b63f1f28c605845cb72ef862582",
+            .hash = "chasen_ui-0.1.5-ATsSa3hWCgC3MNjHPQn5LIQx09Q1EQUyTQTY6tKBkTEk",
         },
         .flow_syntax = .{
-            .url = "git+https://github.com/neurocyte/flow-syntax?ref=zig-0.16#4a44180376ec28e7bb4ed56c5b6fe24292c74930",
-            .hash = "flow_syntax-0.7.2-X8jOofSXAQBcUBUOAnot6C9tuAVlF0Q4cM1IcUBFJ00p",
+            .url = "git+https://github.com/neurocyte/flow-syntax?ref=master#6a34d9c3ee42c226a56833f6484831097d10062e",
+            .hash = "flow_syntax-0.7.2-X8jOoSD5AQDvb35G1fEpPHWTLmXpA3eQarGcYujbr03F",
             .lazy = true,
         },
     },

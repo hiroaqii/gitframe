@@ -15,10 +15,10 @@ For supported platforms and installation with Homebrew or mise, see the
 
 ## From source
 
-Install Zig **0.16.0** and Git **2.45.1 or newer** on Linux or macOS. Download **Source code
-(tar.gz)** or **Source code (zip)** from the
-[latest release](https://github.com/hiroaqii/gitframe/releases/latest),
-extract the archive, and open a terminal in the extracted directory.
+Use Git **2.45.1 or newer** on Linux or macOS. To build a release, download its
+source archive and open a terminal in the extracted directory. Install the Zig
+version listed in that archive's `build.zig.zon` (`.minimum_zig_version`).
+This checkout uses Zig **0.17.1**. [GitFrame releases](https://github.com/hiroaqii/gitframe/releases/latest)
 
 Choose one of the following builds.
 
@@ -409,7 +409,7 @@ reproduce it.
 
 ## Development
 
-Install Zig **0.16.0** and Git **2.45.1 or newer**, then clone the repository:
+Install Zig **0.17.1** and Git **2.45.1 or newer**, then clone the repository:
 
 ```sh
 git clone https://github.com/hiroaqii/gitframe.git
