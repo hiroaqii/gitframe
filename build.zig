@@ -25,6 +25,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const chasen_mod = chasen_dep.module("chasen");
+    if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos and !target.query.isNative()) {
+        // Explicit macOS targets need the SDK paths for Chasen's frameworks and their libraries.
+        // The selected Xcode SDK can change between build configurations.
+        b.graph.poisonCache();
+        const sdk = std.mem.trimEnd(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), "\r\n");
+        chasen_mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+        chasen_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+    }
     const chasen_ui_mod = chasen_ui_dep.module("chasen_ui");
     // Keep Chasen types shared across GitFrame and its Chasen UI consumer.
     chasen_ui_mod.addImport("chasen", chasen_mod);
